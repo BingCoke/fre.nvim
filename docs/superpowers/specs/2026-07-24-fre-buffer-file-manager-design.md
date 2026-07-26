@@ -36,7 +36,7 @@ Fre must provide:
 4. Direct buffer edits for create, copy, move, rename, and delete.
 5. A two-phase `prepare()` and `execute(plan)` mutation API with a simple single-use Execution handle.
 6. A confirmation summary and immediate cancellable progress float for the default `:write` action.
-7. Best-effort cancellation of asynchronous preflight and mutation work, followed by immediate terminal reconciliation.
+7. Best-effort cancellation of active mutation work, with reconciliation owned by the default write workflow.
 8. Correct move scheduling, including cycles such as `a -> b` and `b -> a`.
 9. Local filesystem watching for root and active expanded directories.
 10. Instance GC by hidden TTL and per-group maximum instance count.
@@ -102,15 +102,11 @@ An expanded directory whose complete ancestor chain is also expanded. Only activ
 
 ### Plan
 
-A plain Lua table containing logical filesystem operations and human-readable confirmation lines.
-
-### Physical execution step
-
-An internal low-level operation used by the executor. Temporary moves used to break cycles are physical steps and never appear in the logical plan or confirmation summary.
+A plain caller-constructible Lua table containing exact ordered filesystem operations and user-facing display lines. `prepare()` is the default compiler, not a provenance requirement.
 
 ### Execution
 
-A single-use handle returned by `instance:execute()` after synchronous Plan schema validation. It exposes cancellation and copied status snapshots while one asynchronous execution progresses to a terminal state.
+A single-use handle returned by `instance:execute()`. It exposes cancellation and copied status while supplied operations execute in array order.
 
 ## 5. Core Design Rules
 
@@ -120,18 +116,17 @@ A single-use handle returned by `instance:execute()` after synchronous Plan sche
 4. Window operations remain available while the buffer is modified.
 5. Node trees, node IDs, extmarks, and watchers are never shared between instances.
 6. Inheritance copies path-based state at instance creation and never creates live coupling.
-7. Every directory sorts only its direct children.
-8. The flattened view is a DFS projection of already sorted sibling lists.
-9. Configured columns are real buffer text before the path, remain read-only in the first implementation, and can be selected or yanked with ordinary Vim operations.
-10. Watch events never overwrite a modified buffer.
-11. Filesystem conflicts are detected naturally by execution failures, not by a stale-buffer lock.
-12. Modified instances are not protected from explicit destruction or GC.
-13. `execute(plan)` does not verify that a plan came from the most recent `prepare()` call.
-14. Neovim's actual windows are the source of truth for instance visibility.
-15. Pure-Lua Plan schema validation is synchronous; every filesystem preflight and mutation call made by execution is callback-form `vim.uv`.
-16. One scheduling request is outstanding per active Execution generation, including terminal candidate refresh, so cancellation and partial-state accounting remain explicit.
-17. Direct `execute()` is presentation-free; only `actions.write` owns the default progress UI.
-18. Errors are surfaced as Vim errors; rare failures do not justify a large recovery subsystem.
+7. Every directory sorts only its direct children; the flattened view is their DFS projection.
+8. Configured columns are real read-only buffer text and remain available to ordinary selection and yank.
+9. Every successful projection records the exact stable IDs it rendered; only that baseline participates in delete detection.
+10. Watch events never overwrite modified, hidden, or write-locked buffers and instead retain `needs_refresh`.
+11. `prepare()` owns operation choice, ordering, move-cycle lowering, and display.
+12. `execute(plan)` trusts caller data, performs supplied operations in order, and owns no presentation or reconciliation.
+13. `actions.write` owns readiness, locking, confirmation, progress presentation, and filesystem reconciliation.
+14. Directory actions remain one Plan operation; move is exactly one rename with no implicit fallback.
+15. Automatic GC protects visible and modified instances; explicit destruction may force-discard when execution is terminal.
+16. Neovim's actual windows are the source of truth for instance visibility.
+17. Filesystem conflicts and partial effects surface naturally during execution; Fre does not roll them back.
 
 ## 6. Top-level Public API
 
@@ -193,7 +188,8 @@ instance:reveal(path)
 instance:set_hidden_file(value)
 instance:toggle_hidden_file()
 instance:set_sort(sort_fn)
-instance:refresh()
+instance:refresh(opts)
+instance:when_ready(callback)
 
 instance:get_pos(path)
 instance:get_entry(row)
@@ -215,7 +211,8 @@ Rules:
 - A valid local or live foreign marker returns its source snapshot Entry regardless of the retained edited destination path. Duplicate marker occurrences return the same semantic Entry values in independently copied tables.
 - A malformed, reserved, or unknown marker; destroyed foreign source; invalid source node; descriptor parse failure; semantic read-only change; or kind/trailing-slash mismatch raises a row-specific Vim error.
 - `ActionContext.entry` is exactly `instance:get_entry(ActionContext.row)`.
-- Async methods report delayed errors through the standard Fre error reporter and their documented handlers.
+- `when_ready(callback)` observes the current initial-load attempt and calls `callback(err)` exactly once. It queues while creating and schedules an immediate callback from ready or load-failed state. `User FreReady` carries the same success or failure with the instance ID and buffer number.
+- `refresh(opts)` accepts optional `force` and `on_complete` fields under the exact Section 27 contract; asynchronous completion is delivered as `on_complete(err)` exactly once.
 - `reveal(path)` never opens or toggles a window.
 - `set_sort()` stores the new comparator and calls normal refresh.
 - `destroy()` forcefully discards modified content only when no Execution is active. It synchronously raises a direct Vim error and changes nothing if this instance has an Execution in any nonterminal state.
@@ -226,7 +223,7 @@ Programmatic execution composes handlers with the single-use handle:
 ```lua
 local execution = instance:execute(plan, {
   on_progress = function(progress)
-    consume(progress.phase, progress.completed, progress.total)
+    consume(progress.current, progress.completed, progress.total)
   end,
   on_complete = function(err, result)
     finish(err, result.status)
@@ -355,7 +352,7 @@ Configuration merging is field-specific:
 - Effective `use_mapping_default` is the final setup/new boolean. Effective `mapping` contains only the snapshotted user override maps. Buffer mapping installation derives a separate installed map exactly once: start from the internal built-in base only when that boolean is true, then overlay the user maps by mode and LHS. When false, install only the user maps.
 - `default_file_explorer` is a setup-only Manager boolean and is forbidden in `new()`. It never appears in effective instance configuration.
 
-The first `setup(opts)` starts from the exact built-ins in Section 8, applies the rules above, validates the result, atomically stores defaults for future instances, and permanently records the effective `default_file_explorer` value for this Neovim process. Every later `setup(opts)` silently discards its `default_file_explorer` field before validation and retains the first value; all other fields still reset from exact built-ins, validate, and atomically replace future-instance defaults normally. Existing instances retain their snapshotted effective configurations. The Manager replaces its capacity map with the new `setup.gc.groups` map, including the built-in `default` group when omitted, then performs normal capacity enforcement once; visible instances remain protected.
+The first `setup(opts)` starts from the exact built-ins in Section 8, applies the rules above, validates the result, atomically stores defaults for future instances, and permanently records the effective `default_file_explorer` value for this Neovim process. Every later `setup(opts)` silently discards its `default_file_explorer` field before validation and retains the first value; all other fields still reset from exact built-ins. Before committing, Manager rejects any candidate `gc.groups` map that omits a group referenced by a live instance. A valid setup atomically replaces future-instance defaults and capacities, then enforces capacity once while protecting visible and modified instances. Existing instances retain their snapshotted effective configurations.
 
 `new(opts)` starts from the current setup defaults, applies the same field-specific rules, resolves the new-only `root` and `inherit` fields, validates the result, and snapshots the effective configuration. It rejects `default_file_explorer` as a setup-only field. `instance.config.mapping` therefore exposes only copied user override maps, never installed built-ins. Mutable setup or caller tables are never shared with the instance, buffer mappings, or later setup/new calls.
 
@@ -432,8 +429,12 @@ Synchronous validation or instance-construction failure occurs before the window
 An instance moves through these lifecycle states:
 
 ```text
-creating -> live-hidden <-> live-visible -> destroying -> destroyed
+creating -> ready-hidden <-> ready-visible -> destroying -> destroyed
+         -> load-failed -> creating
+         -> load-failed -> destroying -> destroyed
 ```
+
+The `load-failed -> creating` transition is an explicit `instance:refresh()` retry. `execute(plan)` is independent of readiness because a caller Plan is self-contained.
 
 ### Creating
 
@@ -450,14 +451,15 @@ creating -> live-hidden <-> live-visible -> destroying -> destroyed
 9. Start the asynchronous initial load, which resolves `real_root`, requires that it exists as a directory, and only then lists and watches it.
 10. Begin expansion-state restoration when a predecessor exists.
 11. Treat the instance as hidden until a window displays the buffer.
-12. Enforce group capacity after registration.
+12. Enforce group capacity after registration while excluding this newly registering instance from that pass.
 
-The constructor returns the instance before the asynchronous real-root resolution and directory loads complete. The buffer can display a loading state if opened immediately. Resolution, non-directory, and load failures use the existing initial-load Vim error path; they are never synchronous constructor filesystem exceptions.
-Until that asynchronous initial readiness work has resolved `real_root` and completed the required root load, a direct `execute()` call synchronously raises the lifecycle/readiness Vim error before creating an Execution, locking the buffer, or starting any filesystem I/O. This guard does not move filesystem work into the constructor.
+The constructor returns before asynchronous real-root resolution and root loading finish. The buffer displays a non-protocol loading row while creating. Success commits the first projection and baseline, transitions to ready-hidden or ready-visible, calls current `when_ready` observers with `nil`, and emits `User FreReady`.
+
+Failure displays a non-protocol error row, transitions to `load-failed`, calls observers with the direct error, and emits the same event carrying that error. The instance remains registered, openable, hideable, retryable, and destructible. While creating or load-failed, projection lookups and mutations (`get_entry`, `get_pos`, prepare, write, expand/collapse, reveal, sorting/filtering, and ordinary refresh other than retry) report readiness errors. Identity fields, `open`, `hidden`, `toggle`, `when_ready`, retry refresh, `execute(plan)`, and `destroy` remain available.
 
 ### Destroying
 
-`destroy()` is the single cleanup path used by explicit destruction, TTL GC, and group-capacity GC. Its first precondition is that this instance has no active Execution in any nonterminal state. If that precondition fails, `destroy()` synchronously raises a direct Vim error and changes nothing: it does not terminalize the Execution, defer destruction, pin GC, or create detached state. Normal displayed-buffer GC protection makes automatic collision unlikely; an abnormal GC call reaches the same error.
+`destroy()` is the single cleanup path used by explicit destruction, TTL GC, and group-capacity GC. Its first precondition is that this instance has no active Execution in any nonterminal state. If that precondition fails, `destroy()` synchronously raises a direct Vim error and changes nothing: it does not terminalize the Execution, defer destruction, pin GC, or create detached state. Automatic GC also filters visible and modified instances before calling this path.
 
 When the precondition passes, destruction performs:
 
@@ -470,7 +472,7 @@ When the precondition passes, destruction performs:
 7. Drop node, metadata, mapping, layout, and pending-expansion state.
 8. Mark the instance destroyed.
 
-A late non-Execution async callback checks lifecycle and its captured generation, performs only required resource cleanup, and exits without touching Neovim state. Forced unsaved-edit destruction remains intentional whenever no Execution is active.
+A late non-Execution async callback checks lifecycle and its captured generation, performs only required resource cleanup, and exits without touching Neovim state. Forced unsaved-edit destruction is available only through explicit `destroy()` when no Execution is active.
 
 ## 11. Node Tree Model
 
@@ -518,7 +520,7 @@ instance.nodes_by_id[id] = node
 instance.nodes_by_path[absolute_path] = node
 ```
 
-Fre does not maintain a second live index for arbitrary edited path text. `get_pos(path)` uses `nodes_by_path`, then treats the node's row extmark only as a fast hint for locating the exact local namespaced marker. If the hinted row is not that marker, it scans current buffer rows for that exact marker and rebinds as specified in Section 14. Its keys remain snapshot paths while the buffer is modified. A narrow transient map may coordinate Fre's own programmatic directory-prefix rewrites, but it is not a public lookup index and does not mutate the filesystem snapshot tree.
+Fre does not maintain a second live index for arbitrary edited path text. `get_pos(path)` uses `nodes_by_path`, then treats the node's row extmark only as a fast hint for locating the exact local namespaced marker. If the hinted row is not that marker, it scans current buffer rows for that exact marker and rebinds as specified in Section 14. Its keys remain snapshot paths while the buffer is modified.
 
 ## 12. Directory Loading and Reconciliation
 
@@ -568,7 +570,7 @@ Sorting rules:
 
 - A directory sorts only its direct children.
 - The root sorts its own direct children.
-- Loading, watch refresh, successful or canceled terminal execution refresh, and explicit `refresh()` sort as part of their normal work.
+- Loading, watch refresh, write reconciliation, and explicit `refresh()` sort as part of their normal work.
 - The flattened view never runs a global sort.
 - A custom comparator is responsible for providing a valid strict ordering.
 - Comparator failures surface as Vim errors.
@@ -643,7 +645,7 @@ Each unmodified projection render follows the same table-layout model:
 
 Rendered column text must be valid UTF-8, remain on one line, and contain no C0 control or DEL byte. Fre does not truncate column text. Widths are derived anew from the complete visible projection; descriptors do not configure permanent widths. The width vector is rendering and patch state only: the view retains it solely to decide how much of an unmodified projection can be patched. Physical fields remain ordinary real buffer text separated by ordinary ASCII spaces; there is no hidden path delimiter or other layout metadata.
 
-`buffer.lua` owns the one shared physical-row decoder; this does not add another architecture layer. The decoder resolves marker/source identity, delegates configured field grammar to `columns.lua`, and returns marker/source resolution data, parsed semantic field values, actual consumed byte ranges, the normalized path, and its exact retained byte range. Cursor logic, descendant-prefix rewriting, and `mutation/prepare.lua` all call this decoder. `prepare.lua` owns occurrence interpretation and Plan construction, not a duplicate row parser.
+`buffer.lua` owns the one shared physical-row decoder; this does not add another architecture layer. The decoder resolves marker/source identity, delegates configured field grammar to `columns.lua`, and returns marker/source resolution data, parsed semantic field values, actual consumed byte ranges, the normalized path, and its exact retained byte range. Cursor logic and `mutation/prepare.lua` call this decoder. `prepare.lua` owns occurrence interpretation and Plan construction, not a duplicate row parser.
 
 After resolving a marker to a local or foreign source node, the decoder selects that source instance's descriptors and invokes them sequentially:
 
@@ -660,7 +662,7 @@ The parse contract is exact:
 - The framework rejects a thrown error, nil result, unchanged or longer suffix, a result that is not a literal byte suffix of the input, or any other no-progress/malformed return. Each descriptor's half-open byte range records the bytes it actually consumed, even when that differs from rendered visual ownership.
 - Each descriptor supplies `equals(entry, parsed_value, ctx)`. A semantic mismatch or callback error means the read-only field no longer matches the referenced source-node snapshot and produces a row-specific prepare error.
 
-Built-in parsers use self-delimiting grammars for icons, permissions, and configured time formats. A custom renderer may contain ordinary spaces only when its paired parser can consume that grammar deterministically. Parsing does not infer a hidden delimiter, rerender bytes to discover a boundary, consult any current or historical width vector, or repair malformed fields. A missing or invalid separator required by a descriptor's grammar is a parse error. Parseable edits confined to alignment or separator whitespace are not independently detected as read-only metadata changes; successful execute plus refresh normalizes them by rerendering.
+Built-in parsers use self-delimiting grammars for icons, permissions, and configured time formats. A custom renderer may contain ordinary spaces only when its paired parser can consume that grammar deterministically. Parsing does not infer a hidden delimiter, rerender bytes to discover a boundary, consult any current or historical width vector, or repair malformed fields. A missing or invalid separator required by a descriptor's grammar is a parse error. Parseable edits confined to alignment or separator whitespace are not independently detected as read-only metadata changes; successful write reconciliation normalizes them by rerendering.
 
 After the final descriptor returns, the decoder applies `vim.trim()` semantics to the entire literal remaining suffix and uses the retained bytes as the root-relative path. It performs the same operation on the complete text of every new unmarked row. The exact path range is the half-open physical-row byte span `[start_byte, end_byte)` retained after removing boundary whitespace: `start_byte` advances past trimmed leading bytes and `end_byte` retreats before trimmed trailing bytes. Last-column padding and its required separator are already part of the descriptor's actual consumed range. When no columns are configured, the marker is followed directly by the path suffix and the same retained-range calculation applies. If trimming retains no bytes, the normalized path is empty and its range is the zero-width insertion boundary `[line_byte_length, line_byte_length)` at end-of-line so the row can be repaired before prepare rejects an empty path. Leading and trailing path whitespace is therefore not round-trippable: it is silently ignored and removed after a successful write and refresh. Internal spaces remain literal. This is an explicit accepted trade-off matching Oil's effective behavior.
 
@@ -686,7 +688,7 @@ If a row begins with Fre's reserved prefix but its marker or column fields canno
 
 The return value is `{ row, col }`, with a 1-based row and 0-based UTF-8 byte column directly passable to `nvim_win_set_cursor()`. `col` is the selected row decoder's exact first retained path byte after the real columns and `vim.trim()` boundary normalization. When trimming retains an empty path, `col` is the end-of-line zero-width repair boundary.
 
-It also returns `nil` when the snapshot path is absent or its node is collapsed or otherwise not visible. Unsaved renamed paths are not lookup keys until successful execute and refresh. A decode error on the selected row, including malformed marker, descriptor grammar, semantic fields, or retained path grammar, raises a Vim error identifying that row.
+It also returns `nil` when the snapshot path is absent or its node is collapsed or otherwise not visible. Unsaved renamed paths are not lookup keys until successful write reconciliation. A decode error on the selected row, including malformed marker, descriptor grammar, semantic fields, or retained path grammar, raises a Vim error identifying that row.
 
 The fallback runs only when `get_pos()` or an already-required internal lookup explicitly needs this contract. Fre adds no `TextChanged` bookkeeping, changed-range marker registry, or live edited-path index. A full refresh recreates canonical row extmarks.
 
@@ -698,27 +700,24 @@ Fre does not remap the complete Vim operator language or automatically repair de
 - Undo and redo preserve physical marker semantics. A later `get_pos()` validates its hint and deterministically rebinds after either operation when needed.
 - Visual and characterwise yanks can select real column text.
 - Editing only the final path preserves identity.
-- Editing a read-only column's semantic value while retaining the marker causes `prepare()` and `get_entry()` to error; parseable alignment or separator whitespace alone is normalized by successful execution and refresh.
+- Editing a read-only column's semantic value while retaining the marker causes `prepare()` and `get_entry()` to error; parseable alignment or separator whitespace alone is normalized by successful write reconciliation.
 - Commands such as `cc` or `d0` that completely remove the marker are interpreted as delete plus create, and the default confirmation displays both operations.
 - A partially damaged marker produces a row-specific error rather than automatic recovery.
 
 ### Programmatic buffer changes
 
-Fre suppresses its own bookkeeping while applying projection patches or directory-prefix rewrites. It never edits a modified row merely to repair marker or column text.
+Fre suppresses its own bookkeeping while applying projection patches. It never edits a modified row merely to repair marker, column, or descendant path text.
 
-After a programmatic view refresh:
+After a successful programmatic projection commit:
 
-- The buffer remains `nomodified`.
-- The cursor and window view are restored where possible.
+- The buffer remains or becomes `nomodified` according to the refresh/reconciliation caller.
+- The cursor and each window view are restored where possible.
 - Raw columns are rendered for the complete visible projection and a new dynamic width vector is computed.
-- If the width vector is unchanged, only affected rows need replacement; if any width grows or shrinks, every visible row is rerendered so padding remains aligned.
-- Stable marker text, real columns, highlights, and internal row lookup extmarks are regenerated from reused node IDs.
+- If the width vector is unchanged, only affected rows need replacement; if any width changes, every visible row is rerendered so padding remains aligned.
+- Stable markers, columns, highlights, and lookup extmarks are regenerated from reused node IDs.
+- View records the exact projected local stable-ID baseline.
 
-After a programmatic descendant-prefix rewrite caused by a user directory rename:
-
-- The buffer remains modified.
-- The decoder's exact retained path range is the only replaced span; rewriting begins at its first retained byte, never at the raw post-column suffix start, so marker, columns, descriptor-consumed whitespace, and trimmed boundary whitespace remain unchanged.
-- The filesystem tree snapshot remains unchanged until execution succeeds.
+Fre never performs an automatic descendant-prefix rewrite after a directory row edit. The buffer remains exactly the user's draft until prepare and the subsequent write workflow reconcile it.
 
 ## 15. Buffer-local Metadata and Options
 
@@ -799,7 +798,7 @@ Consequences:
 - Columns participate in line parsing and byte-range calculation.
 - Editing column bytes marks the buffer modified.
 - The first implementation rejects semantic metadata changes and descriptor grammar failures during `prepare()` rather than executing metadata mutations; parseable alignment or separator whitespace is not a semantic change.
-- Refresh rerenders columns only while the buffer is unmodified, during the successful empty-Plan write refresh, or during successful or canceled terminal execution refresh.
+- Refresh rerenders columns only while the buffer is unmodified or through the private locked write-reconciliation path.
 - An unchanged dynamic width vector permits affected-row replacement; a changed vector requires complete visible-row rerendering.
 - Custom render/parse/equality behavior must be deterministic and satisfy the progress-making literal-suffix contract.
 - Custom columns can use node metadata and instance context.
@@ -957,56 +956,15 @@ Inheritance is a creation-time snapshot. Later expand/collapse operations in eit
 
 ## 21. Modified-buffer and Execution Interaction Policy
 
-Fre deliberately uses the simple H1 policy. The editable buffer remains the only unsaved draft.
+The editable buffer is the only unsaved draft. While `modified` is true, expand, collapse, toggle-expand, `refresh()` without force, sort, hidden-file/filter changes, and reveal that would change projection fail. `instance:refresh({ force = true })`, window operations, selection of existing snapshot entries, `get_entry`, `get_pos`, explicit force-discard destroy, and `prepare()` remain available. Automatic GC is not available for a modified instance.
 
-The following operations fail with a Vim error while `vim.bo[bufnr].modified` is true:
+`actions.write` requires a normally editable buffer. Before prepare it snapshots only the prior `modifiable` value, makes the buffer nonmodifiable, and owns the write lock through confirmation, execution, reconciliation, and unlock. During that lock, text edits, another write, projection changes, refresh, destroy, and another Execution are rejected; navigation, lookup, window operations, and selection remain available.
 
-- `expand()`.
-- `collapse()`.
-- `toggle_expand()`.
-- `refresh()`.
-- `set_sort()`.
-- `set_hidden_file()`.
-- `toggle_hidden_file()`.
-- `reveal()` when the target is not already visible.
+Direct `execute(plan)` does not acquire the write lock, snapshot buffer text, or change `modifiable`. It is single-flight only with respect to another active Execution.
 
-The following remain available because they do not rewrite the Fre buffer:
+Selection uses the source snapshot Entry rather than retained edited destination text. An unsaved renamed or duplicated marked row opens its existing `Entry.absolute_path`; an unmarked new row has no Entry and cannot be selected.
 
-- `open()`.
-- `hidden()`.
-- Window-level `toggle()`.
-- Opening an existing file through an action.
-- Creating another instance from an existing directory path.
-- `get_entry()` and `get_pos()`.
-- Explicit `destroy()` when no Execution is active.
-- GC destruction when no Execution is active.
-
-From the start of asynchronous execution preflight through terminal reconciliation, the source Fre buffer has `modifiable = false`. Navigation, `open()`, `hidden()`, window-level `toggle()`, selection/open actions, `get_entry()`, and `get_pos()` remain usable. Text edits, `:write`, another `execute()`, `prepare()`, `destroy()`, `expand()`, `collapse()`, `toggle_expand()`, `reveal()`, `refresh()`, `set_sort()`, hidden-file/filter changes, and any other projection change raise direct Vim errors while the execution lock is active.
-
-Before locking, `execute()` snapshots the exact pre-execution buffer text, `modified`, and `modifiable` values. A normal successful or canceled terminal refresh leaves the buffer `nomodified` and restores the configured/pre-execution `modifiable` value rather than blindly setting it to true. Failure, including terminal refresh failure, restores the exact three-value snapshot before unlocking.
-
-`actions.write` requires a normally editable Fre buffer. If the effective configuration made it nonmodifiable, the action raises a direct Vim error before calling `execute()`.
-
-Selection uses the source snapshot Entry, not the edited retained destination path. An unsaved renamed or copied marked row opens its existing `Entry.absolute_path`. A new unmarked row has no Entry, so every select-family action raises a direct Vim error and never executes pending edits implicitly.
-
-### Directory rename coordination
-
-A directory row rename is detected by stable identity. After `InsertLeave`, or after a normal-mode text change, Fre uses the shared physical-row decoder and its exact retained path ranges to rewrite the path prefix of visible descendant rows when the directory row has a parseable new directory path.
-
-Example:
-
-```text
-src/        -> lib/
-src/a.ts    -> lib/a.ts
-src/x/      -> lib/x/
-src/x/b.ts  -> lib/x/b.ts
-```
-
-This rewrite is part of the user's text edit and preserves `modified = true`. It does not update the filesystem tree snapshot.
-
-If the directory row is temporarily malformed, descendant rewriting waits; `prepare()` later reports any unresolved parse error.
-
-Deleting a directory row does not require immediate deletion of descendant text rows. Plan normalization makes the parent directory delete shadow redundant descendant operations.
+Editing a directory row never rewrites visible descendant rows. Prepare resolves carried descendants from stable identities and ancestor operations. Removing a directory row does not require removing its visible descendant rows; parent shadowing is resolved during prepare.
 
 ## 22. Window Layout Primitives
 
@@ -1041,16 +999,13 @@ Resolution order for an omitted layout:
 1. The last layout used by this instance in the current tab.
 2. The instance's effective layout configuration, which already captured setup at creation.
 
-If the instance is already visible in the current tab:
-
-- Matching layout: reuse and optionally focus the existing window.
-- Different layout: close that view and recreate it with the same buffer in the requested layout.
+If one or more windows in the current tab already display the instance, `open()` chooses the current window when it already shows the buffer; otherwise it chooses the valid displaying window with the lowest window ID. A matching layout reuses that window. A different layout closes only the chosen view and recreates it with the same buffer; other views remain.
 
 The instance stores only last-layout preference by tab. It does not maintain a duplicate global window graph.
 
 ### `instance:hidden()`
 
-Closes the current tab's window displaying this instance. It does not delete the buffer or instance.
+Closes every current-tab window displaying this instance, in ascending window-ID order. It does not delete the buffer or instance.
 
 ### `instance:toggle(layout?)`
 
@@ -1246,16 +1201,7 @@ Mappings are buffer-local and receive Fre's action context. The exact built-in n
 
 ## 26. Watch Model
 
-Fre watches only local directories represented by the root or an active expanded directory.
-
-Each active directory node owns its own `uv_fs_event_t` handle.
-
-Reasons for per-directory watching:
-
-- It matches the node refresh boundary.
-- It avoids platform-dependent recursive watch semantics.
-- Collapse can release an entire inactive branch's watcher resources.
-- A change refreshes one sibling list rather than the complete tree.
+Fre watches only local directories represented by the root or an active expanded directory. Each active directory node owns its own `uv_fs_event_t` handle. This matches the node refresh boundary, avoids platform-dependent recursive watch semantics, lets collapse release an inactive branch, and refreshes only one sibling list for an ordinary event.
 
 ### Watch callback
 
@@ -1263,133 +1209,73 @@ A watcher callback:
 
 1. Verifies that the instance and node are still live.
 2. Debounces repeated events for that node.
-3. Ignores the event if the buffer is modified.
-4. Ignores the event if an Execution owns the instance mutation lock. Such an event may be lost; Fre stores no pending state.
-5. Otherwise schedules refresh of that directory node.
+3. Sets `instance.needs_refresh = true` when the buffer is modified, the instance is hidden, or `actions.write` owns the mutation lock.
+4. Otherwise schedules an atomic refresh of that directory node.
 
-The callback does not depend on the event filename because platform support is inconsistent. It rescans the node's direct children.
+The callback does not depend on the event filename because platform support is inconsistent. Watch errors are reported once, stop the affected watcher, and set `needs_refresh`. A later explicit refresh or visibility-triggered refresh recreates required watchers.
 
-Watch errors are reported once for the affected node and stop that watcher. A later explicit refresh, visibility-triggered rescan, or re-expansion can recreate it.
+`needs_refresh` is a coarse recovery signal, not a three-way merge journal. It records only that the current projection may be stale. A successful full refresh or write reconciliation clears it; failed refresh leaves it set.
 
-### Hidden instances
+### Hidden and visible instances
 
-An unmodified hidden instance can still refresh its hidden buffer. Fre does not need an Oil-style `dirty` flag because the buffer already exists and can be patched without a window.
-
-A modified hidden instance ignores watch events exactly like a visible modified instance.
+A hidden instance never patches its buffer in response to a watch event. Instead it sets `needs_refresh`. On the first `BufEnter` or hidden-to-visible transition, Fre runs one full refresh of the root and active expanded directories when the buffer is unmodified and unlocked. Modified or locked buffers retain `needs_refresh` until an explicit discard refresh or write reconciliation succeeds.
 
 ## 27. Refresh and Async Coordination
 
-### `instance:refresh()`
+### Public refresh
 
-Explicit refresh reloads:
+The normative public forms are `instance:refresh()` and `instance:refresh({ force = true })`. `opts` may be omitted and otherwise accepts exactly optional `force` and `on_complete` fields. `force` defaults to `false` and must be boolean. `on_complete`, when present, must be a function receiving `err`, where success passes `nil`. Invalid options are synchronous public-misuse errors.
 
-- The root directory.
-- Every currently active expanded directory.
+Before scheduling I/O, refresh synchronously rejects a destroying or destroyed instance, a creating instance whose initial attempt is still active, and any instance whose `actions.write` lock is active. `force = true` does not bypass the write lock. A load-failed instance instead transitions to creating and starts a fresh initial-load attempt. Ready instances reload the root and every active expanded directory.
 
-It fails while the buffer is modified.
+When the ready buffer is modified, omitted or false `force` raises synchronously and changes nothing. `force = true` is explicit caller authorization to discard modified text without prompting. The old text remains untouched until the complete candidate succeeds; success atomically replaces it and marks `nomodified`, while failure preserves it and reports the asynchronous error.
 
-### Atomic refresh and terminal execution refresh
+Refresh returns `nil` immediately after scheduling. It calls `on_complete(err)` exactly once on Neovim's main loop when supplied. Without `on_complete`, an asynchronous failure uses Fre's standard error reporter. Synchronous precondition and option errors never schedule I/O or invoke the callback.
 
-Every refresh first scans and builds a complete candidate tree and view without mutating authoritative nodes, buffer text, extmarks, or the buffer's `modified` flag. Only after every required scan, sort, column render, and validation succeeds does one commit replace the authoritative tree/view and buffer projection. A failed candidate is discarded, so no partial refresh is visible.
+The built-in `actions.refresh` calls ordinary `instance:refresh()` for an unmodified buffer. For a modified buffer it prompts first; confirmation calls the same public `instance:refresh({ force = true })`, while cancellation leaves the draft unchanged.
 
-After successful plan execution or accepted cancellation, terminal reconciliation first scans the root. It then scans only the formerly active expanded paths that the root-first candidate tree still shows, through their candidate ancestor chains, as existing directories. If completed operations deleted or moved a formerly expanded directory, that path and its unreachable descendant expansion state are pruned as normal reconciliation; the resulting `ENOENT` is not treated as a refresh failure and Fre does not attempt to scan it. Any other actual root or retained-directory scan, sort, column-render, or validation error fails the complete candidate atomically.
+Every refresh first scans and builds a complete candidate tree and view without mutating authoritative nodes, buffer text, extmarks, or `modified`. Only after every required scan, sort, column render, and validation succeeds does one commit replace the tree/view and projection. A successful commit records the exact projected stable-ID baseline, clears `needs_refresh`, and marks the buffer `nomodified`. A failed candidate changes nothing and leaves `needs_refresh` set.
 
-A successful terminal candidate reapplies sorting and filtering and commits the rendered projection as `nomodified`. Cancellation performs this point-in-time best-effort reconciliation immediately to discard unexecuted edits. The terminal candidate uses the Execution's serial per-generation request scheduler, with at most one scheduling request outstanding. This restriction is Execution-specific; ordinary non-Execution refresh may still read different directories concurrently.
+### Write reconciliation
 
-If this terminal refresh fails after success or cancellation, the Execution transitions to `failed`; `canceling -> failed` is allowed. Fre surfaces the direct Vim error, leaves the authoritative tree/view unchanged, restores exact pre-execution text, `modified`, and `modifiable`, releases the lock, and calls `on_complete` exactly once. It does not expose a partially refreshed buffer or add recovery state.
+`actions.write` owns a private reconciliation path that may replace its modified, locked source buffer. `execute()` never calls this path and never refreshes instance state.
 
-Watch events received while the mutation lock is held are ignored and may be lost. A late `EBUSY` side effect is often caught by a later watcher event, but this is not guaranteed when its event races the terminal scan and unlock. A later visibility-triggered rescan or explicit `refresh()` restores truth. Success and cancellation reconciliation are point-in-time best effort only; no stale, `needs_refresh`, or epoch flag is stored.
+After `execute()` has started, `actions.write` always attempts reconciliation after success, failure, or cancellation. It scans the root first, then only formerly active expanded paths that still exist as directories through candidate ancestor chains. Completed deletion or movement of an expanded directory prunes that branch normally. A successful candidate atomically commits filesystem truth, discards the stale draft, records a new projected baseline, clears `needs_refresh`, marks `nomodified`, and then unlocks.
 
-### Per-node generation
+If reconciliation fails, `actions.write` reports both the execution outcome and reconciliation error, unlocks without claiming that the old text matches the filesystem, sets `needs_refresh`, and leaves `instance:refresh({ force = true })` as the explicit recovery route. It does not roll back filesystem effects.
 
-`load_generation` remains a node-local async race guard for actual filesystem reads. It is unrelated to sorting.
+Parse failure and confirmation cancellation happen before `execute()` starts; they unlock and preserve the draft without reconciliation.
 
-Starting a newer ordinary load invalidates an older callback for the same node. Different directory nodes can load concurrently outside an Execution; terminal Execution reconciliation instead uses the serial scheduler above.
+### Per-node generation and patch serialization
 
-### Buffer patch serialization
+`load_generation` remains a node-local async race guard for actual directory reads. Starting a newer load invalidates an older callback for that node; different nodes may load concurrently.
 
-Directory reads can complete concurrently, but buffer mutations are queued per instance and applied on Neovim's main event loop.
-
-Before applying a completed async refresh, Fre checks again that:
-
-- The instance is live.
-- The node generation is current.
-- The buffer is still unmodified.
-- The node remains relevant to the requested projection.
-
-If any check fails, the result is discarded or retained only as safe cache without changing buffer text.
+Directory reads may finish concurrently, but buffer mutations are queued per instance on Neovim's main event loop. Before applying a completed async refresh, Fre checks that the instance and node are live, the generation is current, the buffer is still unmodified and unlocked, and the node remains relevant. Otherwise the result cannot change buffer text.
 
 ## 28. Garbage Collection
 
-GC has two independent policies:
-
-1. Hidden TTL per instance.
-2. Maximum live instances per configured group.
-
-Configuration:
-
-```lua
-gc = {
-  ttl_ms = 60_000,
-  default_group = "default",
-  groups = {
-    default = 10,
-    project = 5,
-    permanent = 0,
-  },
-}
-```
-
-Instance override:
-
-```lua
-gc = {
-  ttl_ms = 10_000,
-  group = "project",
-}
-```
+GC has two independent policies: hidden TTL per instance and maximum live instances per configured group. Existing configuration shapes and zero-disable semantics remain unchanged.
 
 ### Visibility
 
-An instance is visible if a direct `vim.fn.win_findbuf(instance.bufnr)` query returns at least one valid window. Manager stores no visibility index. `hidden_since` and TTL deadline state belong to the instance.
+An instance is visible when `vim.fn.win_findbuf(instance.bufnr)` returns at least one valid window. Manager stores no visibility index. When the first window appears, Fre clears `hidden_since` and invalidates the TTL deadline. When the last window disappears, it records `hidden_since`, schedules TTL when enabled, and enforces group capacity.
 
-When the first window appears:
+A never-opened instance starts hidden. The instance being registered is excluded from its own creation-time capacity candidate set, so `new()` cannot destroy the object it is returning. If all older candidates are visible or modified, temporary overflow is allowed and capacity is reconsidered on the next ordinary trigger.
 
-- Clear `hidden_since`.
-- Invalidate the current TTL deadline.
+### TTL and group capacity
 
-When the last window disappears:
+- `ttl_ms > 0` attempts automatic destruction after that continuous hidden duration; zero disables TTL.
+- `setup.gc.groups[name] > 0` caps the group; zero disables capacity GC.
+- Showing an instance resets its hidden interval.
+- Capacity selects the oldest eligible hidden instance by `hidden_since`, with creation sequence as the deterministic tie-breaker.
+- Visible, modified, newly registering, and nonterminal-execution instances are not automatic GC candidates.
+- TTL and capacity are independent; both zero means manual lifetime.
 
-- Set `hidden_since` if it was not already set.
-- Schedule a TTL callback when `ttl_ms > 0`.
-- Enforce group capacity.
+An unknown group passed to `new()` is a configuration error. A repeated `setup()` that omits or changes away a group still referenced by any live instance is rejected atomically; defaults and capacity maps remain unchanged. Existing groups can be removed after their last instance is destroyed.
 
-A never-opened new instance starts hidden at creation time.
+### Modified buffers and explicit destruction
 
-### TTL
-
-- `ttl_ms > 0`: attempt destruction after that continuous hidden duration.
-- `ttl_ms = 0`: disable time-based GC for that instance.
-- Showing the instance resets the hidden interval completely.
-- A delayed callback rechecks instance identity and instance-owned `hidden_since` before attempting destruction.
-
-### Group capacity
-
-- `setup.gc.groups[name] > 0`: cap live instances in that group.
-- `setup.gc.groups[name] = 0`: disable capacity GC for that group.
-- An unknown group passed to `new()` is a configuration error.
-- When over capacity, attempt to destroy the hidden instance with the oldest instance-owned `hidden_since`.
-- Use creation sequence as a deterministic tie-breaker.
-- Visible instances are never capacity-evicted.
-- If every candidate is visible, allow temporary overflow.
-- Enforce the limit again when an instance becomes hidden or a new instance is created.
-
-TTL and capacity switches are independent. Both must be zero for a fully manual-lifetime instance.
-
-### Modified buffers
-
-When no Execution is active, GC does not protect modified buffers and successful destruction force-wipes their contents without save confirmation. A nonterminal Execution still makes every destruction attempt fail under the lifecycle precondition.
-When an automatic TTL or capacity attempt collides with a nonterminal Execution, it calls the same `destroy()` path, receives the required direct Vim error, reports that error internally as appropriate, changes nothing, and drops that GC attempt. There is no pin, deferred-destruction queue, retry timer, or detached state. Destruction can occur only on a later ordinary GC trigger or a later explicit `destroy()` call after execution is terminal.
+Automatic TTL and capacity GC never discard a modified buffer. It drops that candidate and considers the next eligible hidden instance for capacity. Explicit `destroy()` remains a force-discard operation when no Execution is active. Any destruction attempt during a nonterminal Execution fails without changing the instance.
 
 ## 29. User Extension Through Buffer Data
 
@@ -1421,187 +1307,66 @@ Fre's responsibilities end at providing stable buffer identity, root metadata, f
 
 ## 30. Preparing a Mutation Plan
 
-`instance:prepare()` is deterministic over:
+`instance:prepare()` is the default compiler from the current editable projection to a complete executable Plan. It requires an initially ready instance, is deterministic over the last successful snapshot, current buffer lines, projected baseline IDs, stable markers, and live foreign marker sources, and performs no filesystem I/O or buffer mutation.
 
-- The last successful destination-instance filesystem snapshot.
-- The current editable buffer lines.
-- Stable row identity markers.
-- The paths, descriptors, and snapshot nodes resolved from still-live source instances referenced by foreign markers.
-
-It does not rescan the filesystem and does not mutate the buffer.
+Prepare owns all interpretation and planning: row parsing, occurrence classification, conflict checks, dependency ordering, move-cycle lowering, final operation order, and user-facing display. `execute()` never repeats those decisions.
 
 ### Path parsing
 
-For each row, prepare calls the shared `buffer.lua` physical-row decoder, then interprets its result. The decoder returns:
+Each row is decoded by the one shared `buffer.lua` physical-row decoder. Marked rows parse configured descriptors and apply `vim.trim()` to the remaining suffix; unmarked rows apply `vim.trim()` to the whole row. Prepare preserves the existing marker namespace, descriptor equality, exact retained byte ranges, required directory trailing `/`, reserved leading `0x1f` rule, newline rejection, internal-space behavior, and stable-kind checks.
 
-- Optional namespaced stable identity and source resolution.
-- Parsed semantic real-column fields and their actual consumed byte ranges when a marker is present.
-- Final normalized root-relative destination path text and its exact retained byte range.
-- Entry kind from stable identity or, for a new row, trailing `/` after path-boundary trimming.
+Prepared destination paths use normalized internal `/` separators, reject absolute or empty editable paths, reject `.` and escaping `..`, cannot target the instance root, and resolve to normalized absolute paths lexically inside the destination root. These checks describe `prepare()` output only; they are not a sandbox imposed on caller-created Plans.
 
-Rules:
+### Projected deletion baseline
 
-- For a marked row, the decoder parses every configured descriptor and then applies `vim.trim()` semantics to the entire remaining literal suffix. For a new unmarked row, it applies the same semantics to the entire row. The retained bytes form the path used by all following validation and normalization.
-- A new directory path must end in `/`.
-- A new file path must not end in `/`.
-- After trimming, every retained local or foreign stable directory row must end in `/`, while every retained stable file or symlink row must not. A mismatch is a row-specific prepare error; stable identity cannot convert entry kind.
-- Paths are normalized with internal `/` separators.
-- Absolute paths are rejected.
-- Empty paths, including rows made empty by `vim.trim()`, are rejected by prepare even though the decoder exposes the end-of-line repair boundary.
-- Newline bytes are rejected and cannot be escaped into one row.
-- Leading and trailing path whitespace is silently ignored by `vim.trim()` and is not round-trippable. Internal spaces remain literal path bytes.
-- An unmarked row whose first physical byte is reserved `0x1f` is rejected as ambiguous; valid marked rows and non-leading path components containing that byte are not rejected on this basis.
-- `.` and escaping `..` segments are rejected.
-- The resolved absolute target must remain inside the instance root.
-- The root itself is not a row and cannot be deleted or renamed.
+Every successful initial render, refresh, or write reconciliation stores the exact set of local stable IDs projected into the buffer. Occurrence counting during prepare ranges only over that baseline.
 
-`prepare.lua` performs occurrence interpretation and Plan construction from these decoder results. It does not parse physical rows or descriptor fields independently.
+For each baseline ID:
 
-### Existing ID occurrence rules
+- Zero valid local occurrences emits one delete of the original entry.
+- One occurrence at the original normalized path is unchanged; one at another path is a move.
+- Multiple occurrences retain the original when present; otherwise the deterministic primary destination becomes the move and other distinct destinations become copies.
 
-For each original stable ID:
+Filtered, collapsed, or otherwise nonprojected cached nodes are absent from the baseline and never imply deletion merely because their rows are not present. Removing a projected directory row emits one directory delete operation; its unchanged descendants are carried by that directory operation rather than expanded into descendant deletes.
 
-#### Zero occurrences
+### Ancestor operations and duplicate occurrences
 
-Generate delete for the original entry.
+Prepare determines ancestor directory moves, copies, and deletes before classifying descendant occurrences. An unchanged descendant carried by an ancestor directory operation emits no redundant operation. A descendant explicitly moved or copied outside an ancestor target remains an operation and is ordered before the ancestor operation that would remove its source.
 
-#### One occurrence
+Fre does not rewrite visible descendant row text when a directory row is edited. This avoids letting a duplicated copy occurrence mutate the original subtree. Parent-carried descendant semantics are resolved only by prepare from stable identities and normalized paths, independent of buffer row order.
 
-- Same normalized path: unchanged.
-- Different normalized path: move.
-
-#### Multiple occurrences
-
-Preparation derives ancestor-directory move/copy mappings before choosing descendant operations. Buffer line order is never an operation-selection tie-breaker.
-
-For one stable ID:
-
-- If one occurrence retains the original path, it remains the original entry.
-- An occurrence at the exact descendant path implied by an ancestor directory move or recursive copy is carried by that ancestor operation and emits no redundant descendant operation.
-- When an ancestor directory move implies the primary descendant target and that occurrence exists, it is the primary carried occurrence regardless of where its line appears.
-- Every remaining distinct non-carried occurrence becomes a copy from the original snapshot source. The dependency compiler schedules such reads before an ancestor move or delete removes that source.
-- If neither the original path nor a primary ancestor-implied occurrence exists, the lexicographically smallest normalized target is the move target and remaining distinct targets are copies. This deterministic choice has no flattened-view ordering meaning.
-- Duplicate target paths are rejected.
-
-A descendant occurrence exactly implied by an ancestor recursive copy is normalized away. Editing such an implied occurrence to a different target while omitting its implied target is an incompatible parent/child combination in the first implementation; users can retain the implied occurrence and add another duplicate target to express an extra copy.
-
-This supports normal same-instance line yank/paste behavior without assigning filesystem meaning to buffer order.
+When no occurrence retains the original path and no ancestor determines the carried target, the lexicographically smallest normalized target is the move target and remaining distinct targets are copies. Duplicate target paths are rejected.
 
 ### Foreign instance occurrences
 
-A marker whose instance ID differs from the destination instance represents a copy source, never a move or destination-owned occurrence.
+A marker from another live instance is a copy source, never a move or destination-owned occurrence. The shared decoder resolves the foreign source snapshot and descriptors, validates semantic read-only fields and kind syntax, and prepare emits one copy from that absolute snapshot path to the destination target.
 
-Prepare performs these steps:
+The source instance and node must remain live until prepare resolves them. Once the Plan contains the absolute source path, later source destruction does not change that Plan. Source and destination may use different column descriptors; successful destination reconciliation renders destination columns.
 
-1. Call the shared `buffer.lua` decoder, which resolves the process-global source instance and source node, selects the source descriptors, parses their field grammars, and returns the source snapshot plus normalized destination path and exact ranges.
-2. Verify from the decoder result that the marker resolves to a live foreign source rather than a destination-owned occurrence.
-3. Validate the returned semantic fields against the source-node snapshot through descriptor equality callbacks.
-4. Validate the normalized destination-root-relative target and the stable source kind's required trailing-slash syntax.
-5. Emit one logical copy from the resolved source snapshot path to that destination target.
+### New rows, shadowing, and conflicts
 
-The source instance and node must both be live at destination `prepare()` so the marker, source path, source descriptors, and source snapshot can be resolved. The source node's snapshot path is used even when the source buffer currently has unrelated unsaved edits. Foreign occurrences do not participate in the destination instance's local zero/one/multiple occurrence counts.
+Unmarked rows ending in `/` produce `create_directory`; other unmarked rows produce empty `create_file`. A directory action always remains one Plan operation. Prepare never expands a directory into descendant operations.
 
-If the source instance or node has already been destroyed or released before prepare, prepare reports a row-specific Vim error, emits no partial Plan, and leaves the destination buffer modified. Fre does not pin source instances, add cross-instance reference counting, or maintain persistent clipboard provenance. Once prepare has emitted an absolute-path `copy.from` in a Plan, later source-instance destruction does not invalidate the Plan; normal live filesystem checks still run at execute time.
+A parent directory delete shadows redundant descendant deletes and unchanged descendants whose final result remains in that subtree. Descendant moves or copies preserving data outside it remain explicit and are ordered first.
 
-Source and destination instances may configure different columns. The foreign marker selects the source descriptor set for parsing the pasted physical row. Descriptor parsing does not consult the source's current or historical dynamic width vector, so a source rerender or width change alone after paste does not invalidate that row. A successful destination refresh rerenders the copied target using the destination instance's columns.
+Default prepare rejects duplicate normalized targets, creates targeting occupied snapshot paths unless the Plan first vacates them, copy source equal to target, a directory copy/move target inside its source, incompatible ancestor/descendant outcomes, malformed or ambiguous markers, descriptor errors, and read-only-column changes. These checks make prepared Plans coherent; caller-created Plans are not required to satisfy them.
 
-### New rows
+### Move cycles
 
-Rows without an existing stable ID generate:
+Prepare lowers move cycles before returning. For `a -> b` and `b -> a`, `plan.operations` contains the actual ordered rename sequence through a collision-resistant temporary sibling path. Longer and case-only cycles use the same technique.
 
-- `create_directory` when ending in `/`.
-- `create_file` otherwise.
+Temporary rename operations are real Plan operations and are executed in array order. They may be omitted from `plan.display`, which remains the user-facing summary. Failure or cancellation can leave a temporary path; Fre performs no rollback.
 
-New files are empty. Fre does not infer file contents from another row unless that row carries a copied existing ID.
+## 31. Plan Format
 
-### Deletes and directory shadowing
-
-A removed directory row generates one recursive directory delete.
-
-A parent directory delete shadows only descendant operations whose final result remains inside the deleted subtree, including redundant descendant deletes and unchanged rows.
-
-A descendant move or copy whose target is outside the deleted subtree must be retained and scheduled before the parent delete. For example, moving `dir/a` to `saved-a` while deleting `dir/` preserves the move and then deletes the remaining directory.
-
-The same normalization principle applies where an ancestor directory move or copy already carries unchanged descendants with it: remove only operations exactly implied by the ancestor operation, never a descendant operation that preserves data outside the ancestor target.
-
-### Directory rename normalization
-
-Visible descendant prefix rewriting should make the buffer explicit before prepare. Prepare computes ancestor directory operations before descendant classification and gives the exact implied descendant path priority over all non-carried targets.
-
-For example, if `dir/` moves to `newdir/` while the `dir/a` marker also appears at `saved-a`, `newdir/a` is carried by the parent move and `saved-a` is a copy scheduled before the parent move. The result never depends on which descendant line appears first.
-
-Prepare normalizes only descendant moves or copies exactly implied by an ancestor directory operation. Descendant operations that preserve data outside the ancestor target remain explicit and are ordered before any ancestor operation that would remove their source.
-
-### Target conflicts
-
-Prepare rejects:
-
-- Multiple entries targeting the same normalized path.
-- A create targeting an occupied snapshot path unless the same plan vacates it first.
-- A directory move/copy target that is structurally inside its own source directory.
-- A copy whose normalized source and target are the same path.
-- Incompatible parent/child operation combinations, including replacing an ancestor-copy-implied descendant target instead of retaining it and adding an extra occurrence.
-- Invalid, unknown, or ambiguous namespaced stable identity markers.
-- Semantic read-only-column mismatches and descriptor parse failures, including missing or invalid required separators.
-
-These are plan-structure checks. They are not a live filesystem conflict check.
-
-## 31. Logical Plan Format
-
-A plan is a normal Lua table. Its only allowed top-level keys are:
-
-- Required `operations`: a dense array of operation tables.
-- Optional `display`: a dense array of strings.
-
-Unknown top-level keys are rejected by the shared plan validator used by `execute()` and `actions.confirm()`.
-
-The exact operation schemas are:
-
-```lua
-{ type = "create_file", path = absolute_path }
-
-{ type = "create_directory", path = absolute_path }
-
-{
-  type = "copy",
-  from = absolute_source,
-  to = absolute_target,
-  kind = "file" | "directory" | "symlink",
-}
-
-{
-  type = "move",
-  from = absolute_source,
-  to = absolute_target,
-  kind = "file" | "directory" | "symlink",
-}
-
-{
-  type = "delete",
-  path = absolute_path,
-  kind = "file" | "directory" | "symlink",
-}
-```
-
-Example:
+A Plan is ordinary caller-owned Lua data:
 
 ```lua
 Plan = {
   operations = {
-    {
-      type = "move",
-      from = "/project/a",
-      to = "/project/b",
-      kind = "file",
-    },
-    {
-      type = "copy",
-      from = "/project/src",
-      to = "/project/src-copy",
-      kind = "directory",
-    },
+    { type = "move", from = "/project/a", to = "/project/b", kind = "file" },
+    { type = "copy", from = "/project/src", to = "/project/src-copy", kind = "directory" },
   },
-
   display = {
     "MOVE  a -> b",
     "COPY  src/ -> src-copy/",
@@ -1609,100 +1374,69 @@ Plan = {
 }
 ```
 
-Each operation accepts only the fields shown in its schema; unknown operation fields are rejected.
+The conventional operation shapes are:
 
-Operation paths are absolute normalized local paths. User-facing display uses root-relative paths for in-root values. A copy source outside the destination root is shown as an absolute source path unless `prepare()` can label it with its live source instance and source-root-relative path. If present, every `display` element must be a string. `prepare()` always emits display lines. The executor validates `display` when present but otherwise ignores it.
+```lua
+{ type = "create_file", path = absolute_path }
+{ type = "create_directory", path = absolute_path }
+{ type = "copy", from = absolute_source, to = absolute_target, kind = kind }
+{ type = "move", from = absolute_source, to = absolute_target, kind = kind }
+{ type = "delete", path = absolute_path, kind = kind }
+```
 
-`kind` is required for copy, move, and delete. Execute verifies the live source with `lstat` and rejects a mismatched kind before mutating the filesystem.
+where `kind` is `file`, `directory`, or `symlink`. Prepared Plans use these shapes, normalized absolute paths, and root-relative display for in-root paths. External copy sources may be displayed absolutely or with their live source-instance label.
 
-The plan contains no instance version, snapshot version, capability token, prepare timestamp, or provenance signature.
+Plan has no version, generation, provenance, capability, timestamp, opaque identity, or prepare-only restriction. Callers may create or modify a Plan and pass it directly to `execute()`. The caller owns its ordering, paths, conflicts, operation fields, and display consistency.
 
-`execute(plan)` accepts a caller-created or caller-modified plan after full structural and root-scope validation. It does not require the plan to come from `prepare()`.
+`execute()` ignores `display`. It does not run a whole-Plan validator. If an operation is unknown or lacks data needed by its filesystem primitive, execution fails when it reaches that operation; earlier operations remain completed.
 
 ## 32. Confirmation and `:write`
 
-Fre buffers use `BufWriteCmd`. The default write path belongs to `actions.write` and is:
+Fre buffers use `BufWriteCmd`. The default workflow belongs entirely to `actions.write`:
 
 ```text
-instance:prepare()
--> actions.confirm(ctx, plan)
+require initial readiness
+-> acquire the instance write lock and make the source buffer nonmodifiable
+-> instance:prepare()
+-> actions.confirm(ctx, plan.display)
 -> instance:execute(plan, handlers)
--> open and focus the default progress float
+-> reconcile filesystem truth after success, failure, or cancellation
+-> restore modifiable and release the lock
 ```
 
-`execute()` exclusively owns terminal execution reconciliation. The default write action must not invoke a second refresh.
+The lock prevents a second write, projection change, refresh, destroy, or text edit. Navigation, lookup, window operations, and selection remain available. Direct `execute()` neither acquires this buffer lock nor snapshots, refreshes, or mutates tree/view/buffer state.
 
-### Empty plan
+Parse or confirmation failure happens before execute starts: the workflow unlocks, restores the prior `modifiable` value, and preserves the modified draft. Once execute starts, the workflow always follows Section 27 reconciliation rules.
 
-If `prepare()` returns no operations:
+### Empty Plan
 
-- Do not show confirmation or progress UI.
-- Refresh the instance.
-- Mark the buffer `nomodified` after successful refresh.
+When prepare emits no operations, `actions.write` skips confirmation and progress, uses its private reconciliation path to normalize the projection, marks `nomodified` on success, and unlocks. It does not call either public refresh form because the write lock remains active.
 
-This handles edits that only reorder rows or return text to its original state.
+### Confirmation
 
-### Default confirmation presenter
+Default confirmation requires the prepared `display` string array and presents it verbatim in a temporary read-only scratch view. It does not derive content from operations or inspect Plan validity. Cancellation executes nothing and preserves the draft.
 
-`actions.confirm()` runs the shared plan validator. If `plan.display` is absent, it derives deterministic logical summary lines from `operations`; otherwise it presents the validated string array.
+Caller-created Plans may use any display content or omit display when bypassing the default presenter. Users can compose prepare, another confirmation UI, and execute directly.
 
-The summary appears in a temporary read-only scratch view and asks the user to execute or cancel. It shows only logical operations and never shows temporary move paths or physical scheduling details.
+### Progress presentation
 
-Canceling confirmation executes nothing, leaves the Fre buffer unchanged, and leaves it modified. Users can bypass or replace confirmation by composing `prepare()`, their own UI, and `execute(plan)` directly.
+Only `actions.write` creates the default immediate, cancellable progress float. It renders the Execution's current operation, optional adapter detail, completed/total Plan operation counts, and cancel hint. Temporary operations count as operations but need not appear in confirmation display.
 
-### Default progress presenter
-
-Only `actions.write` creates the default progress UI, delegating rendering and terminal presentation to internal `progress.lua`. Immediately after confirmed execution returns its handle, Progress opens and focuses one centered editor-relative floating window backed by an unlisted scratch buffer. It has `style = "minimal"`, `focusable = true`, and a rounded border. There is no delay, and the source Fre buffer never renders progress text.
-
-The float has exactly four content rows:
-
-1. Phase and current logical operation or move-cycle summary.
-2. Optional detail, blank when absent.
-3. Spinner plus `completed/total` logical operation counts.
-4. Cancel hint.
-
-Geometry is fixed internal policy with no configuration or fallback mode. Before starting `execute()`, `actions.write` computes `available_width = vim.o.columns` and `available_height = vim.o.lines - vim.o.cmdheight`. A rounded border plus at least one content column and all four content rows requires `available_width >= 3` and `available_height >= 6`; otherwise `actions.write` raises a direct Vim error before creating an Execution or starting I/O. When it fits, `content_width = min(80, available_width - 2)`, `content_height = 4`, `outer_width = content_width + 2`, and `outer_height = 6`. Editor-relative placement is `col = floor((available_width - outer_width) / 2)` and `row = floor((available_height - outer_height) / 2)`. Long text uses the existing display-cell truncation with a visible ellipsis and never wraps.
-
-Recursive traversal, copy, delete, and cross-device move steps may update `detail` without incrementing logical totals. A move cycle uses the one synthetic `move cycle (N moves)` current summary defined in Section 33; private physical steps never become logical progress items. Temporary paths are normally hidden, but terminal `detail` identifies a known leftover path after failure or cancellation as required by Section 33.
-
-The float has these interaction rules:
-
-- Explicit `c`, `C`, `q`, or `Esc` closes the float immediately and requests cancellation regardless of the boolean returned by the associated Execution's `cancel()`.
-- Any external close, including `:close`, `<C-w>c`, or `WinClosed`, closes immediately and requests cancellation regardless of the return value.
-- Losing focus alone neither closes the float nor requests cancellation; the float remains visible.
-- A programmatic call to that Execution's `cancel()` closes its associated float only when it returns `true`; a `false` call has no UI effect.
-- Success or failure closes the float automatically.
-- An internal-closing guard prevents programmatic or terminal auto-close from recursively requesting cancellation through `WinClosed`.
-- Once closed, the progress UI cannot be minimized, restored, reopened, or moved into the Fre buffer.
-
-On cancellation, `actions.write` uses `vim.notify()` for a terminal summary that explicitly reports the completed count, a partial or potentially partial current operation, and the discarded unexecuted remainder. On success it emits the required execution summary. Failure auto-closes and surfaces the direct executor error as a Vim error.
-
-Presentation is isolated in narrow internal `progress.lua`. `actions.write` installs Progress's wrapped completion handler: it closes the float, notifies or presents the terminal outcome, and only then forwards any outer completion behavior exactly once. Progress consumes Execution handlers and the handle; it does not define mutation state, filesystem cancellation, or a public UI/configuration DSL. `execute()` has no terminal-presentation prerequisite or UI responsibility.
+Closing the float requests cancellation; losing focus alone does not. Terminal completion closes it and presents the execution outcome followed by any reconciliation error. Presentation never changes Execution state or callback cardinality.
 
 ### Direct execution
 
-Calling `instance:execute(plan, handlers_or_callback)` directly performs no confirmation and creates no progress UI. Callers consume progress through handlers and inspect or cancel the returned handle.
+`instance:execute(plan, handlers_or_callback)` performs no confirmation, buffer locking, progress UI, refresh, or reconciliation. The caller observes its Execution and is responsible for refreshing any affected Fre instances.
 
 ## 33. Executor Model
 
-`instance:execute(plan, handlers_or_callback)` is asynchronous and single-flight per instance. After successful synchronous validation it returns one simple Execution handle. Starting another execution while one is active reports a Vim error.
+`instance:execute(plan, handlers_or_callback)` is asynchronous and single-flight per instance. It trusts the supplied Plan and immediately creates an Execution over the supplied `operations` array. A concurrent Execution on the same instance is rejected.
 
-`handlers_or_callback` may be omitted, may be a handlers table containing exactly optional `on_progress(progress)` and `on_complete(err, result)` function fields, or may be a function shorthand for `on_complete`. Unknown fields and present non-functions are rejected synchronously. Function references are snapshotted into the Execution.
+Handlers may contain `on_progress(progress)` and `on_complete(err, result)`, or a function may be shorthand for completion. Execution exposes only `cancel()` and `get_status()`. Callbacks are protected and completion is attempted exactly once.
 
-The instance retains the active handle only until terminal state, unlock, and removal of that active reference. `on_complete` is then attempted exactly once, so it may start a new Execution even while an old quarantined `EBUSY` request remains live. A caller-held terminal handle remains readable through `get_status()` and otherwise collects naturally.
+### State and progress
 
-Execution exposes only:
-
-```lua
-execution:cancel()    -- boolean
-execution:get_status() -- copied plain table
-```
-
-It has no resume, retry, wait, event-subscription, reuse, or extmark API.
-
-### State, phase, and progress
-
-State transitions are exactly:
+State transitions are:
 
 ```text
 running -> succeeded
@@ -1711,525 +1445,182 @@ running -> canceling -> canceled
 running -> canceling -> failed
 ```
 
-`refreshing` is exclusively a phase and is never a state. The phase is one of `preparing`, `executing`, or `refreshing`. Async filesystem preflight and dependency preparation use `preparing`; Plan mutations use `executing`; successful and canceled terminal candidate refreshes use `refreshing`. State remains `running` during a success terminal refresh and `canceling` during a cancellation terminal refresh. A refresh failure leaves phase `refreshing` and follows `running -> failed` or `running -> canceling -> failed`.
+There is no preparing or refreshing Execution phase. Status contains state, completed, total, current operation, and optional adapter detail. Counts refer directly to entries in `plan.operations`, including prepare-generated temporary renames.
 
-`get_status()` returns a fresh plain table. `on_progress()` receives the same copied shape whenever observable state, phase, count, current operation, or detail changes:
+Execution dispatches operations strictly in array order and starts the next only after the current filesystem primitive completes. It does not reorder, merge, lower, append, infer dependencies, validate display, inspect prepare provenance, compare snapshots, or perform complete-plan filesystem preflight.
 
-```lua
-{
-  state = "running" | "canceling" | "succeeded" | "failed" | "canceled",
-  phase = "preparing" | "executing" | "refreshing",
-  completed = integer,
-  total = integer,
-  current = operation_or_cycle_summary_or_nil,
-  detail = string_or_nil, -- omitted when absent
-}
-```
+Filesystem primitives may use multiple asynchronous requests internally to implement one whole-directory copy or delete, but they do not expose descendant Plan operations. Adapter detail may describe internal progress without changing Plan totals.
 
-`completed` and `total` count logical Plan operations only. Outside a move cycle, `current` is `nil` at a logical-operation boundary or a copied logical operation table using the exact Section 31 schema. During a cycle of N logical moves, `current` is the single synthetic string `move cycle (N moves)`. `total` includes those N operations, while `completed` advances by N only after the whole cycle finishes; a canceled or failed partial cycle advances it by zero. During ordinary work, `detail` may identify a recursive physical step without exposing cycle temporary paths; terminal delivery may identify a known leftover temporary path in that same existing string field. No returned or delivered table aliases executor-owned mutable state or the caller's Plan.
+### Operation semantics
 
-Each `on_progress` call is protected. If it throws, Fre surfaces that error exactly once as a Vim error, disables that Execution's progress handler, and continues execution.
+- `create_file` creates one empty file; an occupied target is an execution error.
+- `create_directory` creates the planned directory; parents are not invented unless earlier operations create them.
+- `copy` invokes the adapter's one whole-entry copy primitive for the declared kind. Symlink copy copies the link itself.
+- `move` invokes exactly one filesystem rename from `from` to `to`, regardless of kind.
+- `delete` invokes the adapter's one whole-entry delete primitive for the declared kind. Symlink delete removes the link itself.
 
-Executor completion first finishes terminal refresh or snapshot restoration, closes immediately available request-owned file descriptors and directory handles, restores buffer state, unlocks the instance, transitions to the terminal state, clears the instance active reference, and delivers the terminal progress/result. It then invokes the protected `on_complete(err, result)` exactly once. There is no executor terminal-presentation prerequisite; an `actions.write` wrapper performs its presentation before forwarding outer completion behavior. An `EBUSY` RequestRecord is quarantined by its closure before completion; only record-owned file-descriptor, directory-handle, request-userdata, or equivalent resource closure may occur later. The result is a fresh plain table:
+Move has no implicit `EXDEV` or other copy-delete fallback. A cross-filesystem rename fails unless the caller or prepare explicitly supplied different operations. Execution never invents such operations after confirmation.
 
-```lua
-{
-  status = "succeeded" | "failed" | "canceled",
-  completed = integer,
-  total = integer,
-  current = operation_or_cycle_summary_or_nil,
-  partial_current = false | true | "unknown",
-  uv_cancel = "accepted" | "busy" | "no_request", -- canceled only
-}
-```
+### Failure and cancellation
 
-For success, `current = nil` and `partial_current = false`. Outside cycles, failure or cancellation uses the interrupted copied logical operation or `nil` at a boundary; `partial_current` is `false`, `true`, or `"unknown"` according to known effects and an `EBUSY` request. For any partially finished move cycle, `current = "move cycle (N moves)"`, `completed` advances by zero for its N moves, and `partial_current = "unknown"` regardless of which private moves ran. The result deliberately does not enumerate per-move states or residual temporary paths. Private temporary paths may remain; the summary is diagnostic, not a recovery plan. Terminal refresh and explicit filesystem inspection are the recovery route.
+At the first operation or adapter failure, Execution stops scheduling later Plan entries, records the current operation and whether an effect may be partial, transitions to failed, and invokes completion. Completed effects are never rolled back.
 
-Succeeded and canceled completion use `err = nil`. Failed completion, including terminal refresh failure, receives the direct error object/message. `on_complete` invocation is protected and attempted exactly once; if it throws, Execution state, request-owned resource closure, unlock, and terminal status remain final and the handler error surfaces as a Vim error. With no completion handler, execution failure is still surfaced through Fre's standard Vim error reporter.
+`cancel()` is accepted once while running, requests cancellation of the active adapter request when possible, and prevents later Plan operations from starting. If the active request cannot be canceled, its completion is handled once and no new operation is scheduled. Cancellation does not refresh buffers or delete partial targets or temporary paths.
 
-### Synchronous validation and asynchronous preflight
-
-Before creating a handle, locking the buffer, or starting I/O, `execute()` first checks the instance lifecycle/readiness precondition. If asynchronous initial `real_root` resolution and required root load have not completed successfully, it synchronously raises the lifecycle/readiness Vim error and creates no Execution. Once ready, it performs only pure-Lua validation:
-
-- `plan` is a table and `operations` is a dense array.
-- Every operation uses one recognized exact schema from Section 31 and has no unknown fields.
-- Required fields are strings and `kind` is one allowed enum value where required.
-- Optional `display` is a dense string array and no unknown top-level keys exist.
-- Operation paths have absolute normalized local syntax.
-- Every create path, delete path, move source, move target, and copy target is lexically inside this instance's stable lexical root.
-- A copy source may be outside the destination root because copy reads it without mutating it.
-- No operation deletes, moves, overwrites, or targets the destination instance root itself.
-- A directory move or copy target is not structurally inside its own source.
-
-Validation constructs an execution-owned deep copy containing every exact Plan top-level field, operation record, path/kind string, and display string. Preflight, scheduling, progress, and result construction use only this copy; caller mutation immediately after `execute()` returns is irrelevant. Handler validation and function-reference snapshotting occur in the same synchronous boundary.
-
-Any lifecycle/readiness failure or failure in this pure-Lua Plan, handler, and lexical validation raises synchronously, creates no Execution handle, and starts no filesystem request. `execute(plan)` remains independent of `prepare()` provenance.
-
-After handle creation and buffer lock, every filesystem-dependent preflight check is callback-form `vim.uv` work represented by the Execution in phase `preparing`:
-
-- Existing in-root source parents resolve inside the real root.
-- A symlink final source component can be moved, copied, or deleted as a link, but symlinked parents of any path Fre mutates cannot escape the destination root.
-- Every write target's nearest existing ancestor resolves inside the real root.
-- Live source `lstat` kind matches the declared kind, including external copy sources.
-- Filesystem occupancy and dependency assumptions required before mutation hold.
-
-This complete-plan asynchronous preflight finishes before the first mutation. It does not check Plan provenance, snapshot freshness, unrelated external changes, or eliminate normal filesystem races. The executor repeats asynchronous real-root containment and required `lstat` checks immediately before every physical mutating step using the filesystem state produced by earlier steps, including executor-generated temporary moves. External copy sources are rechecked with `lstat` but need not resolve inside the destination root.
-
-No synchronous filesystem call is permitted in execution validation, preflight, containment, `lstat`, `realpath`, mutation, recursive traversal, terminal rescan, or request-owned resource closure. A stuck filesystem call must remain represented by a cancellable Execution rather than blocking before handle creation.
-
-### Serial filesystem scheduling
-
-All executor preflight, mutation, and terminal candidate-refresh filesystem calls use callback-form `vim.uv`. There is at most one scheduling request for an active Execution generation at a time. This cardinality applies only to Execution scheduling; ordinary non-Execution refresh may issue concurrent directory reads.
-
-Each async step owns a self-contained `RequestRecord` or equivalent closure containing its Execution generation, request userdata, and only file descriptors, directory handles, or other resources opened by that step. `Execution.active_request` points to the current record; there is no instance-global request slot. A normal callback clears only its own matching active pointer.
-
-Recursive copy, recursive delete, directory traversal, file-copy chunks, cross-device move fallback, and move-cycle chains advance one scheduling request at a time. A callback may schedule the next ordinary step only while its captured Execution generation is current. On immediate `EBUSY` cancellation, that record is quarantined by closure; a new Execution may start after old `on_complete` without overwriting, canceling, or clearing the quarantined record.
-
-The dependency compiler lowers logical operations into ordered physical work:
-
-- Explicit parent-directory creation precedes child target creation.
-- A copy reads its source before another operation moves or deletes that source.
-- A target-vacating move or delete precedes another operation occupying that target.
-- Directory operations order before or after descendant operations according to containment.
-- Independent operations remain sequential.
-
-### Move cycles
-
-Move dependencies are analyzed as a graph. A cycle such as:
-
-```text
-MOVE a -> b
-MOVE b -> a
-```
-
-is lowered internally to:
-
-```text
-a   -> .fre-tmp-<id>
-b   -> a
-tmp -> b
-```
-
-Longer cycles use the same one-temporary-path rotation strategy. Temporary paths use a Fre-specific collision-resistant basename on the same local filesystem where possible and never appear in a logical Plan or progress totals. A successful logical cycle performs its required final temporary-path rotation before its moves count complete. Failure or cancellation launches no extra path deletion and may leave the temporary path on disk. Case-only renames can use the same technique.
-
-A cycle is one scheduling unit for diagnostics: `current = "move cycle (N moves)"`, `total` still includes N logical Plan moves, and `completed` advances by N only after the complete rotation succeeds. Cancellation invalidates the entire active chain and may leave a temporary path or partially rotated names. A partial cycle advances by zero, reports `partial_current = "unknown"`, and exposes no per-move state or residual path list.
-
-### Filesystem operation semantics
-
-#### Create file
-
-Create a new empty file. Existing target errors are surfaced.
-
-#### Create directory
-
-Create the explicitly planned directory. Parent directories are not implicitly invented unless they also exist as planned create operations.
-
-#### Copy file
-
-Copy file bytes and basic mode where supported by callback-form local APIs.
-
-#### Copy directory
-
-Recursively copy the source tree without following symlinks.
-
-#### Copy symlink
-
-Copy the link itself, not the target.
-
-#### Move
-
-Attempt local rename first. On cross-device failure, lower the logical move to a serial copy-then-delete chain appropriate to its kind. Cancellation or failure can leave both a partial target and some or all of the source.
-
-#### Delete file or symlink
-
-Delete the entry itself.
-
-#### Delete directory
-
-Recursively delete the directory and its contents without following symlinks.
-
-### Active cancellation
-
-`cancel()` is accepted exactly once only while state is `running` and phase is `preparing` or `executing`. The accepted call returns `true`, changes state to `canceling`, immediately invalidates the Execution generation, and closes the associated default progress float when one exists. Repeated calls, terminal-state calls, and calls after phase becomes `refreshing` return `false` and have no programmatic UI effect. Explicit or external float closure remains immediate and requests cancellation regardless of that return value.
-
-Cancellation then calls `current_request:cancel()` when a request exists. The canceled result records:
-
-- `uv_cancel = "accepted"` immediately when `request:cancel()` returns successfully. This classification is final before the request callback runs.
-- `uv_cancel = "busy"` when cancellation returns `EBUSY`; the OS call may finish later.
-- `uv_cancel = "no_request"` when cancellation occurs at a serial step boundary.
-
-Generation invalidation immediately prevents the current recursion, cross-device chain, move-cycle chain, and every later Plan operation from scheduling another request. It does not wait for the current logical operation, tree, or cycle to finish. Completed filesystem effects are never rolled back, the current operation is not counted completed, and executor temporary paths may remain.
-
-When libuv accepts cancellation, a later `ECANCELED` callback is expected cleanup-only evidence. It performs only request-owned file-descriptor, directory-handle, request-userdata, or equivalent resource closure and cannot establish or revise `uv_cancel`, terminal status, partial-current classification, or filesystem paths. After `EBUSY`, a late success or error callback has the same resource-closure-only lane: it cannot mutate Execution fields, schedule work, delete a temporary path, emit another terminal progress state, refresh, unlock, or invoke completion again. There is no guarantee that the OS syscall stopped.
-
-Immediately after issuing or skipping request cancellation, Fre enters phase `refreshing` and uses the serial root-first terminal candidate rescan from Section 27. If that candidate succeeds, Fre atomically commits it, marks the buffer `nomodified`, restores the configured/pre-execution `modifiable` value, unlocks, transitions to `canceled`, and completes exactly once without waiting for an `EBUSY` callback. This reconciliation is only a point-in-time best-effort snapshot. A watcher may later observe a late `EBUSY` side effect, but its event can race the terminal scan and unlock and be lost; a later visibility-triggered rescan or explicit `refresh()` restores truth.
-
-If the cancellation terminal refresh fails, Fre discards the candidate, transitions from `canceling` to `failed` with phase `refreshing`, surfaces the direct refresh error, leaves the authoritative tree/view unchanged, restores the exact pre-execution buffer text, `modified`, and `modifiable`, closes immediately available request-owned resources, unlocks, and invokes completion exactly once with failed status. It launches no filesystem-path cleanup and does not complete as canceled or add a recovery state machine, rollback, detached worker, external `cp`/`rm`, or hard latency guarantee. Any known leftover temporary path is identified in the existing progress `detail` text before terminal delivery.
-
-This is intentionally similar to Oil's immediate terminal behavior: Oil finishes and calls refresh without waiting for a late adapter callback, then ignores that callback. Fre additionally retains the current libuv request, attempts to cancel it, and stops all internal serial chains.
-
-### Failure
-
-At the first non-cancellation filesystem or executor failure:
-
-1. Invalidate the generation and stop scheduling work.
-2. Close only immediately available request-owned file descriptors, directory handles, request userdata, and equivalent resources; do not launch any filesystem operation to remove temporary paths.
-3. Restore the exact pre-execution buffer text, `modified`, and `modifiable`.
-4. Release the mutation lock and clear the active reference without refreshing.
-5. Transition to `failed`, deliver terminal progress/result, report the original direct error with any known leftover temporary path in that existing error text, and invoke completion exactly once.
-6. Do not roll back completed user-visible filesystem effects.
-
-Failure and cancellation terminalization never creates a cleanup Execution, background deletion, hidden state, structured recovery array, or post-terminal path-deletion lane. Known leftovers stay on disk. A later Execution and an explicit or ordinary-GC-triggered destroy may coexist with quarantined old RequestRecords because those records own only their late resource closure.
-
-### Success
-
-After every logical operation succeeds, including every required final cycle-temporary step:
-
-1. Set phase to `refreshing` and run the serial root-first terminal candidate scan from Section 27.
-2. Reconcile node trees, sorting, stable row state, real columns, and highlights.
-3. Mark the buffer `nomodified` and restore the configured/pre-execution `modifiable` value.
-4. Close immediately available request-owned resources, release the mutation lock, transition to `succeeded`, and clear the active reference.
-5. Deliver terminal progress/result, then invoke protected completion exactly once.
+The result reports terminal status, completed/total, current operation when any, and `partial_current` as false, true, or unknown. Exact libuv request bookkeeping and late-callback resource closure are implementation details, not public Plan or acceptance contracts.
 
 ## 34. External Changes and Optimistic Execution
 
-Fre intentionally does not maintain a stale lock or `needs_refresh` flag.
+Prepare compares edited rows with the last successful projected snapshot. It does not merge external changes. Execute applies caller-supplied operations to the filesystem as it exists when each operation runs; normal filesystem failures report conflicts.
 
-While the buffer is modified, watch events are ignored. Prepare compares the buffer to the last successful snapshot. Execute applies that logical delta to the filesystem as it exists at execution time.
+An unrelated external create or rename does not invalidate a prepared Plan. After default write execution, reconciliation shows the new truth. If an external process already deleted or moved a source, the corresponding user operation fails when reached.
 
-Expected examples:
-
-### Unrelated external create
-
-The user renames `a` while an external process creates `z`. The move succeeds, and post-success refresh displays `z`.
-
-### Unrelated external rename
-
-The user edits `a`; an external process renames unrelated `b` to `c`. The user's operation succeeds, and refresh shows `c`.
-
-### External deletion of an unchanged row
-
-The external deletion generates no user delete because the user did not remove that row relative to the snapshot. After another successful user operation, refresh removes the missing row.
-
-### Same-entry delete conflict
-
-The user removes `a` from the buffer and an external process also deletes `a`. Execution attempts the logical user delete and reports the missing-source filesystem error.
-
-### Same-entry move conflict
-
-The user renames `a` to `b`, but an external process removes or renames `a`. Execution reports the failed source move.
-
-This is deliberately optimistic and operation-driven. Fre does not try to merge snapshots.
-
-A cancellation rescan is similarly optimistic, point-in-time, and best-effort. Watch events are ignored while the execution lock is held. After unlock, a watcher may observe a late successful `EBUSY` request as an ordinary external change, but that event can race and be lost; a later visibility-triggered rescan or explicit `refresh()` restores truth. Fre stores no watcher epoch, pending-event, or stale flag.
+Watch events during hidden, modified, or locked states set `needs_refresh`. The next eligible visibility refresh, explicit refresh, or write reconciliation clears it after successfully committing filesystem truth.
 
 ## 35. Local Path and Symlink Rules
 
-Fre has one local path module responsible for:
+The path module owns platform-aware lexical normalization, Windows drive and separator handling, practical ASCII case-insensitive equality on Windows, root-relative display conversion, and temporary sibling-name generation.
 
-- Platform-aware normalization.
-- Windows drive and separator handling.
-- Root containment checks.
-- Root-relative display conversion.
-- Case sensitivity rules needed for equality and case-only rename.
-- Temporary sibling/path creation.
+`instance.root` is the stable lexical normalized absolute root. Initial loading may resolve an internal real root for scanning, but execute does not provide a root sandbox for caller Plans and performs no whole-plan or per-operation containment, `realpath`, or `lstat` preflight.
 
-The public `instance.root` is the stable lexical absolute normalized path computed without filesystem I/O. The asynchronous initial load separately resolves and stores the internal `real_root`; planned new targets continue to use normalized lexical paths because they may not exist yet.
+Default prepare emits root-contained mutation targets and may accept an external absolute `copy.from` because copy does not mutate that source. Caller-created Plans are trusted and may contain paths outside the instance root; the caller assumes that power and risk.
 
-Lexical containment alone is insufficient when an in-root parent directory is a symlink. During public plan execution, Fre asynchronously resolves each in-root source parent and each write target's nearest existing ancestor and requires those real paths to remain inside the real root. The final source component is asynchronously checked with `lstat`, allowing Fre to operate on an in-root symlink itself without following its target.
-
-`copy.from` is the deliberate exception: it may identify a readable local source outside the destination root, including a node resolved from another live Fre instance. Fre never mutates that external source. `copy.to` and every other mutating path remain root-contained.
-
-The same asynchronous containment check runs again immediately before each physical step that mutates filesystem state. This catches paths whose ancestry changed because an earlier operation in the same plan created, copied, or moved a symlink. Execution never uses synchronous filesystem containment, `realpath`, or `lstat`.
-
-Symlinks are represented using `lstat`:
-
-- A symlink is not expanded as a directory in the first implementation.
-- Selection delegates the symlink path to normal Neovim file opening.
-- Move, copy, and delete operate on the link itself.
-- Fre does not recursively follow links during directory copy or delete.
-
-These rules avoid expansion loops and accidental traversal outside the root.
+Symlinks are represented from loaded `lstat` data, are not expanded as directories, and selection delegates their path to normal Neovim opening. Prepared move, copy, and delete operations act on the link itself rather than following its target.
 
 ## 36. Error Handling
 
 Fre uses a small error model:
 
-- Synchronous public misuse, execution lifecycle/readiness failures, and pure-Lua Plan schema errors raise a Vim/Lua error immediately, create no Execution, and start no I/O.
-- Async filesystem failures are scheduled onto the main loop and reported as Vim errors.
-- `on_complete` receives the same direct execution failure for programmatic composition; a function argument is shorthand for that handler.
-- Parsing errors identify the buffer row and, when non-empty, its normalized retained path.
-- Plan errors identify conflicting logical paths.
-- Watch errors identify the watched directory.
-- Executor errors identify the logical operation and underlying filesystem message.
-- Progress and completion handler errors surface as Vim errors without altering terminal state or callback cardinality.
-- Cancellation refresh failure and rare destroy/GC resource-closure failure surface directly; neither creates a recovery state machine or filesystem-path cleanup lane.
+- Setup/new misuse and prepare errors raise direct Vim/Lua errors before a Plan is returned.
+- Row errors identify the row and retained path; prepared conflict errors identify paths.
+- Execute reports an operation dispatch or filesystem error when that operation is reached; earlier effects remain.
+- Watch errors identify the directory, set `needs_refresh`, and stop the watcher.
+- Reconciliation errors leave `needs_refresh`, unlock the buffer, and expose `instance:refresh({ force = true })` recovery.
+- Progress and completion handler errors surface without changing terminal state or callback cardinality.
 
-Fre does not add warning-only fallback behavior for unsupported adapters, invalid groups, malformed mappings, malformed columns, invalid layouts, or cancellation failures. Setup/new validation and runtime errors report these directly.
+Fre does not silently repair malformed markers, rewrite caller Plans, fall back from rename to copy-delete, roll back completed filesystem effects, or add warning-only behavior for invalid configuration.
 
 ## 37. Suggested Module Boundaries
 
-The exact filenames can change during implementation, but responsibilities should remain separated:
+The exact filenames may change, but these responsibilities form the intended seams:
 
 ```text
 lua/fre/init.lua                 public setup/new/lookup API
 lua/fre/config.lua               defaults, merge, validation
-lua/fre/manager.lua              instance indexes, process-wide directory takeover, and group GC
-lua/fre/instance.lua             Instance primitive methods and active-handle reference
-lua/fre/path.lua                 local path normalization and containment
-lua/fre/fs.lua                   general local async filesystem operations
+lua/fre/manager.lua              instance indexes, directory takeover, group GC
+lua/fre/instance.lua             Instance primitives and active Execution
+lua/fre/path.lua                 lexical local-path normalization
+lua/fre/fs.lua                   ordinary async directory loading
 lua/fre/tree.lua                 nodes, child reconciliation, expansion trie
-lua/fre/view.lua                 DFS projection, real row rendering, highlights, row patches
-lua/fre/buffer.lua               buffer lifecycle, shared physical-row decoder, conceal, cursor autocmds
-lua/fre/window.lua               layouts and window primitives
+lua/fre/view.lua                 projection, projected baseline, rendering, needs_refresh
+lua/fre/buffer.lua               lifecycle, physical-row decoder, conceal, cursor integration
+lua/fre/window.lua               layouts and deterministic multi-window selection
 lua/fre/watch.lua                per-directory watchers and debounce
-lua/fre/columns.lua              real-column constructors, renderers, and field grammars
-lua/fre/actions.lua              function-based action composition and write workflow
-lua/fre/progress.lua             private default write-progress float
-lua/fre/mutation/prepare.lua     decoder-result occurrence interpretation and Plan construction
-lua/fre/mutation/execute.lua     Execution state, serial scheduling, request cancel, terminal reconciliation
-lua/fre/mutation/fs.lua          serial cancellable callback-form primitives and request-owned resource closure
-lua/fre/mutation/move_graph.lua  move SCC/cycle lowering
-lua/fre/gc.lua                   TTL scheduling and capacity enforcement
+lua/fre/columns.lua              real-column renderers and field grammars
+lua/fre/actions.lua              lock, prepare/confirm/execute workflow, reconciliation
+lua/fre/progress.lua             private default write-progress presentation
+lua/fre/mutation/prepare.lua     occurrence interpretation, ordering, cycles, display
+lua/fre/mutation/execute.lua     Plan-order interpretation, Execution state and cancellation
+lua/fre/mutation/fs.lua          whole-entry filesystem primitives and test adapter seam
+lua/fre/mutation/move_graph.lua  prepare-time move-cycle lowering
+lua/fre/gc.lua                   TTL and capacity scheduling
 ```
 
-Deep modules should expose narrow interfaces:
-
-- Tree owns node relationships and directory-local ordering.
-- View owns projection, row rendering, and internal extmarks, not filesystem access or physical-row decoding.
-- Buffer owns the shared physical-row decoder and cursor integration; it delegates field grammar to Columns.
-- Prepare owns occurrence interpretation and Plan construction, not physical-row parsing or execution.
-- Execute owns Execution state, serial scheduling, current-request cancellation, and terminal reconciliation, not presentation.
-- Mutation FS owns callback-form cancellable primitives plus request-owned file-descriptor and directory-handle closure, never post-terminal filesystem-path deletion.
-- Progress owns only the default `actions.write` float and terminal presentation.
-- Actions own workflows, not instance mutation state.
-- Manager owns lookup/lifetime indexes and the one process-wide directory takeover autocmd, not tree behavior.
+Tree owns node relationships and directory-local ordering. Buffer owns one physical-row decoder and delegates field grammars to Columns. View owns projection state, exact projected baseline IDs, and `needs_refresh`. Prepare owns every Plan decision. Execute owns only serial interpretation and Execution observation. Mutation FS exposes whole-entry primitives and hides any adapter-specific directory implementation. Actions owns the buffer lock, confirmation, progress UI, and reconciliation. Manager owns lifetime indexes and process-wide takeover.
 
 ## 38. Testing Strategy
 
-Tests should use temporary real directories for filesystem integration and injectable boundaries for time and watchers.
+Tests prioritize the normal end-to-end buffer file-manager workflow. Temporary real directories cover ordinary integration; a small injectable mutation filesystem adapter scripts failures, cancellation, and partial effects that cannot be induced portably. Tests assert through public interfaces rather than request-generation bookkeeping.
 
-### Pure or mostly pure unit tests
+### Pure tests
 
-- Path normalization and root containment on POSIX and Windows-shaped paths.
-- Expansion snapshot re-rooting.
-- Pending expansion trie construction.
-- Per-node sibling sorting.
-- Flattened DFS projection from independently sorted nodes.
-- Hidden-file filtering.
-- Namespaced stable-marker encoding and parsing.
-- Real-column dynamic width calculation from all visible rows, including UTF-8 display widths, combining marks, variation selectors, ZWJ emoji, left/right ASCII padding, center padding with `floor(total / 2)` on the left and the extra space on the right, and ordinary-space separators.
-- Sequential descriptor parsing, including valid multi-word formats, grammar-consumed inter-field whitespace, strictly shorter literal suffixes, actual consumed byte ranges, independence from current and historical width vectors, and rejection of thrown errors, nil results, no progress, synthesized non-suffix results, semantic mismatches, and missing or invalid descriptor-required separators. Parseable alignment/separator whitespace changes are accepted and normalized by successful execute plus refresh rather than reported as standalone metadata edits.
-- Marked suffixes and complete unmarked rows use `vim.trim()` semantics for path-boundary normalization and exact retained half-open byte ranges, including last-column padding, leading and trailing suffix whitespace, internal spaces, no-column rows, and an end-of-line zero-width repair boundary when trimming retains no path bytes.
-- An exact prepare test uses an otherwise unmarked physical row whose first byte is `0x1f` and requires a row-specific reserved-prefix collision error; valid marked paths, loaded entries, marked moves, and internal path components containing `0x1f` remain accepted on this basis.
-- Marked-kind tests cover retained local and foreign stable rows: directories without `/` fail, files with `/` fail, and symlinks with `/` fail, while their correctly suffixed counterparts retain their original kind.
-- Same-instance stable-ID occurrence interpretation.
-- Foreign-instance marker resolution without node-ID collision binding.
-- Plan normalization and directory shadowing, including moving a descendant out before parent deletion.
-- Ancestor move/copy normalization prioritizes implied descendant targets over line order and schedules extra copies before source-removing ancestor moves.
-- Exact public plan-schema validation.
-- Root containment through symlinked parent directories.
-- Move dependency graphs and cycles.
-- GC candidate ordering.
-- Configuration precedence covers repeated `setup()` reset from exact built-ins, the first-call-only Manager `default_file_explorer` decision with later values silently discarded, rejection of that field in `new()`, wholesale sequence replacement, named-map merging, user mapping merge by mode/LHS across setup then new, `use_mapping_default` installation from a separate internal base, exact public `mapping = {}`, manager-owned setup `gc.groups`, instance-selected `gc.group`, and rejection of instance `max_instances`.
-- Mutable-table snapshot isolation covers setup tables, new-option tables, columns, user mappings, named maps, `instance.config`, and already-installed mappings; caller mutation and later repeated setup do not affect existing instances.
-- Recursive serializability validation for `buffer.variables`.
-- Execution state tests allow exactly `running -> succeeded`, `running -> failed`, `running -> canceling -> canceled`, and `running -> canceling -> failed`; `refreshing` is asserted only as an independent phase. They also cover copied status/progress/result tables, logical completed/total accounting, current-operation copies, partial-current values, and single-use terminal handles.
-- Synchronous malformed Plan and handler validation creates no handle and starts no filesystem work.
-- Direct `execute()` before asynchronous initial `real_root` resolution and required root-load readiness completes synchronously raises the lifecycle/readiness Vim error, creates no Execution, acquires no lock, and starts no I/O; constructor filesystem work remains asynchronous.
-- Protected-handler tests verify that a throwing `on_progress` is reported exactly once, disables only further progress delivery, and lets the executor continue through later work and completion; a throwing `on_complete` is attempted and reported exactly once without changing terminal state, request-owned resource closure, unlock, result, or completion cardinality.
-- Completion ordering tests assert that execute restores/unlocks, reaches terminal state, clears the active reference, and delivers terminal progress/result before protected `on_complete`; execute has no presentation prerequisite. The `actions.write` wrapper closes, notifies/presents, and then forwards outer completion behavior exactly once.
-- `cancel()` returns `false` when phase is already `refreshing`, on a repeated call after an accepted cancellation, and in every terminal state.
-- Fake-request cancellation at a queued request asserts `uv_cancel = "accepted"` immediately after a successful `request:cancel()` return and before invoking the later `ECANCELED` callback; that callback is resource-closure-only and cannot revise classification, status, partial-current, exactly-once completion, scheduling, resource ownership, or any filesystem path.
-- Fake-request `EBUSY` covers immediate canceled completion plus late success and late error callbacks that close only their owned resources and cannot change status, schedule work or path deletion, refresh, unlock, or complete twice.
-- Fake-request cancellation at a no-request serial boundary records `no_request` and schedules no following step.
-- Table-driven ordinary-operation partial-current accounting covers known untouched (`false`), known partial (`true`), and late-`EBUSY` ambiguous (`"unknown"`) cases without adding recovery arrays.
-- Table-driven move-cycle accounting always reports `partial_current = "unknown"` for a partially finished cycle regardless of which private moves ran, with no per-move or residual-path recovery arrays.
-- Terminal candidate scheduler tests instrument success and cancellation refreshes to assert root-first scan order and at most one outstanding scheduling request for the active Execution generation, while a separate ordinary refresh test permits concurrent reads of different directories.
-- Failure/cancellation cleanup tests leave known cycle or copy temporary paths on disk, identify them only in the existing direct error or `detail` text, launch no cleanup filesystem request, expose no recovery array/state, and permit both a later Execution and later explicit destroy while an old quarantined RequestRecord closes only its owned resources.
+- POSIX and Windows-shaped lexical normalization, practical ASCII case-insensitive Windows equality, and root-relative display.
+- Expansion inheritance, pending tries, sibling sorting, DFS projection, and hidden filtering.
+- Marker encoding/decoding, descriptor parsing, retained byte ranges, `vim.trim()` behavior, kind suffixes, and read-only-column errors.
+- Projected baseline occurrence interpretation, including collapsed/filtered nodes that must not become deletes.
+- Local and foreign marker copies, duplicate occurrence selection, ancestor carrying, directory shadowing, and conflict errors from default prepare.
+- Prepare-time dependency ordering and two-node, longer, and case-only move-cycle lowering into actual temporary rename operations.
+- Prepared display is produced with the final ordered operation set; arbitrary caller Plan display is not validated.
+- Configuration precedence, live-group removal rejection, GC candidate ordering, and mutable-table isolation.
+- Execution state, progress copies, exactly-once completion, sequential operation dispatch, and stop-at-first-error behavior.
 
-### Headless Neovim integration tests
+### Headless Neovim integration
 
-- First setup with `default_file_explorer = true` sets both netrw loaded globals, clears an existing `FileExplorer` augroup, installs exactly one Manager `BufEnter` takeover, and immediately checks an already-current local directory buffer.
-- First setup with `default_file_explorer = false` performs none of those takeover effects and leaves a directory buffer available to netrw or another plugin.
-- Later setup calls update their other defaults but silently discard both true and false `default_file_explorer` values, including values that would otherwise fail boolean validation; the first retained value and installed takeover behavior never change.
-- `new({ default_file_explorer = true })` and the false equivalent both raise setup-only-field validation errors.
-- Directory takeover covers startup-equivalent current-directory handling and `:edit dir/`, creates an independent no-predecessor instance from current setup defaults, and replaces only the entered window.
-- Takeover ignores unnamed, non-local URI/scheme, ordinary-file, invalid, and Fre-owned buffers; replacement-triggered `BufEnter` cannot recurse or create a duplicate instance.
-- A modified directory buffer raises a direct Vim error and remains unchanged. An unmodified original buffer is deleted only after no window displays it; synchronous construction failure leaves it in place, while asynchronous load failure follows the normal instance error path.
-- Instance creates a hidden `acwrite` buffer immediately.
-- Physical stable markers are concealed by syntax while raw buffer APIs expose marker, real columns, and path.
-- Extmarks provide internal highlights and row lookup but are not copied identity or repair state and are never exposed by `get_pos()`.
-- Normal and Visual mode can enter real columns while positions inside the concealed marker clamp to the first visible field.
-- `InsertEnter`, `InsertCharPre`, and `CursorMovedI` use the decoder's first retained path byte rather than the raw suffix start, including the end-of-line repair boundary for an empty-after-trim marked path.
-- Insert attempts on a malformed marked row report an error and insert no byte.
-- Visual and characterwise yanks can copy column text.
-- Same-instance `yy`/`p` preserves local identity; cross-instance `yy`/`p` resolves the live source instance/node even when numeric node IDs collide.
-- Cross-instance paste works when source and destination column configurations differ.
-- A source-only rerender or dynamic width-vector change after a marked row is pasted does not invalidate destination parsing.
-- Destroying or releasing the foreign source instance/node before destination `prepare()` produces a row error, no Plan, and leaves the destination modified.
-- Semantic read-only-column changes, descriptor-required separator failures, and malformed or unknown markers produce row errors without automatic repair; parseable alignment/separator whitespace alone is normalized after successful execution.
-- Complete marker removal is presented as delete plus create rather than silently restored.
-- Roots and filesystem entries containing newline bytes fail validation/loading with explicit unsupported-name errors.
-- `vim.b.fre` metadata and valid configured buffer variables exist.
-- Invalid or cyclic `buffer.variables` are rejected.
-- Expand inserts only the requested subtree.
-- Multiple branches share prefixes without duplicate nodes.
-- Collapse removes one contiguous range and preserves cached state.
-- Reveal expands ancestors without opening a window and uses the tuple returned by `get_pos()`.
-- Reveal target is applied when the instance is later opened.
-- Real columns exist in buffer text, participate in parsing, and mark the buffer modified when edited.
-- Expand, collapse, filter, and refresh retain incremental row patches when the dynamic width vector is unchanged and rerender all visible rows when it changes.
-- `get_pos(path)` returns the exact `{ row, col }` after dynamic columns, including UTF-8 byte offsets, no-column rows, trimmed row boundaries, and empty-path EOL repair.
-- `get_pos(path)` uses the Entry lexical root-relative normalizer: `src` and `src/` select the same snapshot node, `/` separators normalize consistently, and meaningful path whitespace is not trimmed.
-- `get_pos(path)` remains correct after incremental inserts and full width-change rerenders and while the buffer is modified; the old root-relative snapshot path remains a key while an unsaved renamed path does not.
-- `get_pos(path)` returns `nil` for absent, collapsed, not-visible, and completely marker-removed rows, while a retained malformed marked row raises a row-specific Vim error.
-- Explicit `get_pos()` operator-history tests cover `dd`/`p` self-healing when the old hint no longer matches, `yy`/`p`, a duplicate pasted before the original while the valid old hint remains authoritative, a missing hint choosing the lowest duplicate, undo rebinding, and redo rebinding.
-- Table-driven `get_entry()` tests cover `nil` for out-of-range, absent, blank, unmarked-new, and completely marker-removed rows; valid local, live-foreign, and duplicate occurrences returning independent fresh tables with exactly `instance_id`, `node_id`, `absolute_path`, `relative_path`, `name`, and `kind`; positive-integer IDs; normalized absolute paths without display slashes; normalized `/` root-relative paths without display slashes; root Entry `relative_path = ""`; and row-specific Vim errors for malformed markers, reserved-prefix collisions, unknown markers, destroyed foreign sources, invalid source nodes, every descriptor-parse failure category, semantic read-only changes or equality-callback errors, and every kind/trailing-slash mismatch.
-- Sort-callback tests assert exact root `parent_entry` values and that directory Entries omit `/` while directory row rendering alone appends it.
-- Directory rename rewrites visible descendant prefixes using exact retained path ranges without consuming raw-suffix boundary whitespace.
-- H1 operations fail while modified.
-- During execution the source buffer is nonmodifiable; edits, write, prepare, another execute, projection changes, sort/filter changes, reveal, and refresh fail while navigation, open/hide/toggle/select, `get_entry()`, and `get_pos()` remain usable.
-- `get_entry()` and action-context rows are 1-based; action-context columns are 0-based UTF-8 byte offsets.
-- Function mappings receive action context; exact defaults install `<CR>`, `zv`, `zc`, `za`, `q`, `g.`, and `R`, install no `h` or `l`, and obey true/false `use_mapping_default` without per-key disable syntax.
-- Open/hidden/toggle layouts behave per current tab.
-- `actions.write` immediately opens and focuses one unlisted scratch progress float whose spinner, phase, current logical operation, detail, and counts update without writing progress text into the source buffer.
-- Geometry tests cover the exact `available_width`, `available_height`, threshold errors at width below 3 or height below 6 before execute/I/O, `min(80, available_width - 2)` content width, four content rows, two-cell rounded-border additions, floor-centered editor-relative row/col, and display-cell truncation.
-- Explicit `c`, `C`, `q`, `Esc`, `:close`, `<C-w>c`, and external `WinClosed` close immediately and request cancellation regardless of its return; focus loss alone does neither.
-- Programmatic `cancel()` returning `true` closes only its associated default float, while a `false` return has no UI effect; success and failure auto-close, and the internal-closing guard prevents recursive cancellation.
-- Canceled write emits a partial/discarded summary, success emits its execution summary, and the progress UI cannot be minimized, reopened, or restored.
-- Direct `execute()` creates no UI, and a function second argument behaves exactly as `on_complete`.
-- `actions.select`, `actions.tab_select`, and `actions.split_select` each reject both `opts.instance.root` and `opts.instance.inherit` before creating a child.
-- Every select variant opens the snapshot source `Entry.absolute_path` for unsaved renamed and duplicated marked rows; it never opens the retained edited destination text.
+- Initial loading exposes deterministic success and failure completion; methods obey creating, ready, load-failed, and destroyed contracts.
+- Directory takeover, marker conceal, real columns, cursor boundaries, mappings, layouts, selection, lookup, expansion, reveal, and inheritance preserve their documented behavior.
+- Every successful projection records its exact stable-ID baseline.
+- Directory row edits do not programmatically rewrite descendant text; prepare still carries implied descendants, and a duplicate copy occurrence never changes original rows.
+- Table-driven public refresh tests cover omitted and false `force`, `force = true`, invalid options, synchronous creating/destroying/destroyed/write-lock rejection with no I/O or callback, load-failed retry, atomic preservation on scan failure, exactly-once `on_complete(err)`, standard error reporting when the callback is absent, and `actions.refresh` prompting before the public force form.
+- Hidden, modified, and write-locked watcher events set `needs_refresh`; the first eligible visibility transition refreshes and clears it.
+- Multiple windows sharing one instance retain independent cursor/view state while instance content and lifetime remain shared.
 
-### Mutation integration tests
+### Mutation integration
 
-- New file and directory creation.
-- Leading and trailing path whitespace on marked and unmarked rows is silently normalized by `vim.trim()` semantics and disappears after successful write and refresh, while internal spaces remain literal; exact retained ranges cover last-column padding, leading/trailing suffix whitespace, empty-after-trim repair, and no-column rows.
-- Rename within one directory.
-- Move across directories under the root.
-- Copy by duplicated same-instance stable ID.
-- Cross-instance file and recursive directory copy from an external `copy.from` into the destination root.
-- Cross-instance copy still works after source-instance destruction when destruction happens after prepare produced the absolute-path Plan.
-- Recursive directory copy.
-- Recursive directory delete.
-- Parent move/delete shadows only operations it truly subsumes.
-- Parent directory rename plus an earlier-buffer-line descendant duplicate still carries the implied descendant and copies the extra target before the parent move.
-- Editing away an ancestor-copy-implied descendant target is rejected unless the implied occurrence remains and the edit is represented by an additional duplicate.
-- Moving or copying a descendant outside a deleted parent is preserved and ordered first.
-- Two-node and longer move cycles use temporary paths.
-- Case-only rename where supported.
-- Cross-device move uses a serial copy-delete fallback.
-- Execution failure restores exact pre-execution text, `modified`, and `modifiable`, and does not refresh despite any completed filesystem effects.
-- Successful execution refreshes exactly once, restores the configured/pre-execution `modifiable` value, and marks `nomodified`.
-- Direct `execute(plan)` works without preceding prepare.
-- Direct malformed plans reject synchronously with no handle or filesystem request; valid ready-instance plans perform all preflight, containment, `lstat`, `realpath`, mutations, traversal, terminal scans, and request-owned resource closure asynchronously.
-- Direct plans reject malformed schemas, unknown fields, invalid display arrays, out-of-root mutating paths, parent-symlink escapes, and a directory move/copy targeting its own descendant before any mutation; the descendant-target test calls `execute(plan)` directly and verifies the filesystem is untouched.
-- Direct plans permit an external absolute `copy.from` while requiring `copy.to` inside the destination root.
-- Root containment is rechecked asynchronously before every mutating physical step, including a plan that first moves or copies a symlink into a later target's ancestry.
-- Cancellation during asynchronous preparing performs no later preflight or mutation request; a successful terminal rescan clears edits, restores the configured/pre-execution `modifiable` value, and reports canceled.
-- Cancellation during an ordinary operation stops all later Plan operations and reports the current operation as incomplete.
-- Cancellation during recursive copy/delete stops the serial chain, retains partial filesystem effects, and reports a partial current operation.
-- Cancellation during a move cycle stops the serial rotation, may leave its private temporary path, and reports partial completion without counting the current logical move complete.
-- Cancellation results cover `accepted`, `busy`, and `no_request`; `accepted` is asserted immediately from the successful cancel return before the later cleanup-only `ECANCELED` callback, and late `EBUSY` callbacks clean resources without duplicate completion.
-- A success or cancellation terminal candidate refresh failure transitions to `failed` (including `canceling -> failed`), surfaces the direct refresh error, leaves the authoritative tree/view unchanged, restores exact pre-execution text, `modified`, and `modifiable`, unlocks, and completes exactly once without a second recovery state machine.
-- Success and cancellation after deleting an expanded directory scan root first, prune the missing expanded branch without an `ENOENT` failure, and commit the candidate; equivalent tests cover moving an expanded directory. Other retained-directory scan errors fail the complete candidate atomically.
-- `actions.select()` defaults to `ctx.winid`, honors `opts.target_winid`, and rejects invalid windows.
+- Default `:write` locks, prepares, confirms, executes, reconciles, restores `modifiable`, and marks `nomodified`.
+- Empty Plan skips confirmation/execution and succeeds through private reconciliation.
+- Create, rename, move, copy, delete, cross-instance copy, parent shadowing, and move cycles work through prepared Plans.
+- One directory action remains one Plan operation; no descendant operation or recursive Plan progress is exposed.
+- Move performs one rename. `EXDEV` fails and never triggers an implicit copy-delete sequence.
+- Direct caller Plans execute without readiness, prepare provenance, display validation, root sandboxing, or whole-plan preflight.
+- A direct Plan with valid early operations and a later malformed/unknown operation leaves early effects and fails when the invalid operation is reached.
+- Execution never refreshes or changes Fre buffer/tree state; its caller is responsible.
+- Parse and confirmation cancellation preserve the draft.
+- Once execution starts, success, failure, and cancellation all cause `actions.write` to attempt reconciliation. Successful reconciliation shows filesystem truth; failed reconciliation leaves `needs_refresh` and `instance:refresh({ force = true })` recovery.
+- Partial filesystem effects are not rolled back.
+- The fake mutation adapter deterministically covers first-operation failure, later failure after completed operations, cancelable and noncancelable active work, partial whole-directory operations, and exactly-once completion.
 
-### Watch tests
+### Watch and GC tests
 
-- Root changes refresh only root children.
-- Expanded child changes refresh only that node.
-- Collapsing stops inactive subtree watchers.
-- Re-expanding recreates watchers.
-- Modified buffers ignore events.
-- Self-generated execution events are ignored while the lock is active.
-- Cancellation watcher tests cover both outcomes after the point-in-time terminal rescan: a delivered late-`EBUSY` event triggers a watcher refresh after unlock, while a raced/lost event triggers no automatic reconciliation and truth returns only on a visibility-triggered rescan or explicit `refresh()`.
-- Stale async generations cannot patch the buffer.
-
-### GC tests with a fake clock
-
-- Hidden TTL begins at creation for never-opened instances.
-- Visibility resets TTL.
-- `ttl_ms = 0` disables TTL.
-- Group max evicts oldest hidden instance.
-- Group max zero disables capacity GC.
-- Visible instances cause temporary overflow.
-- Modified instances with no active Execution are force-destroyed when selected.
-- Explicit destruction during every nonterminal Execution state synchronously raises the direct Vim error and changes nothing.
-- TTL and capacity collisions with every nonterminal Execution state receive and internally report the same error, change nothing, and drop the attempt; no pin, defer queue, retry timer, or detached state exists, and destruction occurs only after a later ordinary GC trigger or explicit destroy.
-- After an Execution becomes terminal, successful destruction discards instance-owned `hidden_since`/GC state and invalidates outstanding non-Execution loads, refreshes, watcher timers, and watcher callbacks only; their late callbacks close required resources without touching Neovim state. Manager has no visibility or timestamp index.
-
-### Inheritance tests
-
-- Child-root inheritance retains only descendant expansion.
-- Parent-root inheritance synthesizes the connecting chain.
-- Same-root inheritance copies state.
-- Unrelated roots inherit nothing.
-- Collapsed barriers preserve dormant expanded descendants.
-- Missing inherited paths drop one branch only.
-- Explicit sort/hidden options beat predecessor state.
-- Otherwise predecessor sort and hidden state beat setup defaults.
-- Later changes do not propagate between instances.
+- Root and expanded-node events use their directory refresh boundaries; collapse releases watchers and re-expansion recreates them.
+- Modified/hidden/locked events set rather than lose `needs_refresh`; stale load generations cannot patch the buffer.
+- TTL and capacity zero-disable semantics remain independent.
+- Visible and modified instances are protected from automatic GC.
+- A newly registered hidden instance cannot evict itself; temporary overflow resolves on a later eligible trigger.
+- Repeated setup atomically rejects removal of a group used by a live instance.
+- Explicit destroy may discard modified text but cannot collide with a nonterminal Execution.
 
 ## 39. Acceptance Criteria
 
 The design is implemented successfully when all of the following are observable:
 
-1. A Fre instance can be created for a local directory without opening a window.
-2. Its buffer displays editable root-relative paths.
-3. Arbitrary nested and branching directories can be expanded incrementally.
-4. Entry values use positive-integer IDs, normalized absolute and `/` root-relative filesystem-semantic snapshot paths without display slashes, and `""` for the root relative path; only directory rows append `/`, and sort receives the exact root parent Entry.
-5. `get_pos(path)` applies that same lexical root-relative normalizer, treats one display trailing slash equivalently without trimming meaningful whitespace, resolves a visible snapshot node, and returns its exact 1-based row and 0-based retained-path byte column without exposing extmarks, scanning arbitrary edited paths, or treating unsaved renamed text as a new key.
-6. `get_pos(path)` handles dynamic columns, UTF-8, no-column and trim/empty row boundaries, returns `nil` for absent/collapsed/marker-removed rows, and raises a row-specific error for retained malformed marked rows.
-7. Columns are real parseable buffer text, use per-render visible-row maximum widths, can be selected and yanked normally, and remain semantically read-only in the first implementation; the shared decoder parses them sequentially with descriptor-owned, width-independent grammars and exact actual-consumption ranges.
-8. Every directory independently sorts direct children with the instance comparator.
-9. `set_sort()` refreshes using the new comparator without a separate sort subsystem.
-10. Modified buffers block projection changes but can remain hidden or be destroyed when no Execution is nonterminal.
-11. New instances inherit expansion, sort, and hidden-file state with documented precedence.
-12. `select`, `tab_select`, and `split_select` compose file opening or child-instance creation, reject caller root/inherit overrides, and select snapshot sources for unsaved renamed or duplicated marked rows.
-13. Configuration resets from exact built-ins on every setup, replaces sequences, merges named maps, snapshots mutable tables, exposes `use_mapping_default = true` with `mapping = {}`, and derives installed mappings from the separate internal base plus user overrides. Mapping values are functions with no per-key disable syntax; exact defaults retain `<CR>`, `zv`, `zc`, `za`, `q`, `g.`, and `R` and add no `h` or `l`.
-14. `prepare()` recognizes create, copy, move, and delete from ordinary buffer edits, including cross-instance copies resolved through namespaced markers, and applies the documented `vim.trim()` retained-range and marked-kind contracts.
-15. Confirmation shows logical operations only.
-16. `execute(plan)` rejects lifecycle-unready instances synchronously without a handle or I/O, accepts a plain plan independently of prepare provenance once ready, synchronously enforces the exact pure-Lua schema, and asynchronously enforces preflight plus per-step root/symlink safety.
-17. A valid `execute()` returns a single-use Execution exposing only cancellation and copied status; state transitions are exactly the four documented paths with `refreshing` only a phase, and protected handlers support progress, exactly-once completion, function shorthand, and error reporting that cannot alter execution or callback cardinality.
-18. Every Execution filesystem call, including terminal candidate refresh, uses callback-form `vim.uv`, retains at most one scheduling request per active generation, and advances recursive, cross-device, cycle, and terminal-scan work serially; ordinary refresh may read directories concurrently and quarantined resource-closure-only RequestRecords from older generations may coexist.
-19. Cancellation immediately invalidates all chains, attempts active request cancellation, never counts a partial current logical operation complete, and immediately performs serial root-first reconciliation/unlocks without waiting for an `EBUSY` callback.
-20. Terminal reconciliation scans root first and scans only candidate-existing expanded directories; completed deletion or movement of expanded directories prunes them normally, while other scan errors fail atomically.
-21. Successful terminal refreshes after success or cancellation leave the source buffer `nomodified` and restore its configured/pre-execution `modifiable` value; any execution or terminal refresh failure leaves the authoritative tree/view unchanged as applicable and restores exact pre-execution text, `modified`, and `modifiable`, with cancellation refresh failure classified as failed.
-22. Execute restores/unlocks, terminalizes, clears the active reference, and delivers terminal progress/result before protected completion, with no presentation prerequisite. Only `actions.write` creates and presents the fixed-geometry immediate progress float before forwarding outer completion behavior; its exact close/cancel semantics preserve false programmatic cancel calls as UI-inert.
-23. Move cycles and cross-device moves use invisible serial physical steps. Successful logical operations finish required cycle-temporary steps before completion; failure or cancellation may leave partial state or temporary paths and launches no post-terminal path cleanup or recovery machinery.
-24. Unrelated external changes do not block optimistic execution; cancellation reconciliation is point-in-time and best-effort, a watcher may observe a late `EBUSY` effect but the event can race and be lost, and visibility-triggered or explicit refresh restores truth without watcher recovery flags.
-25. Actual filesystem conflicts and refresh/handler/request-resource failures surface as Vim errors under the documented rules.
-26. Watch refresh is per directory node and never overwrites modified text.
-27. TTL and group-capacity GC obey independent zero-disable semantics. Automatic collisions with nonterminal Execution report and drop the attempt without retry/defer/pin state; explicit collisions raise directly and change nothing.
-28. `vim.b.fre`, filetype, buffer options, and lookup APIs allow user policy such as automatic cwd.
-29. The first setup's `default_file_explorer` value permanently decides whether Fre disables netrw and takes over entered local directory buffers; later setup calls silently discard only that field, `new()` rejects it, and takeover creates ordinary independent Fre instances without a second directory registry.
+1. A local Fre instance can load asynchronously without a window and exposes deterministic ready or load-failed completion.
+2. Its buffer renders editable root-relative paths, real read-only columns, concealed stable markers, and incremental branching expansion.
+3. Lookup, sorting, hidden state, inheritance, layouts, selection, mappings, and default explorer takeover retain the contracts above.
+4. Every successful projection stores the exact visible stable-ID baseline; nonprojected cached nodes never become deletes.
+5. `prepare()` compiles ordinary buffer edits into a complete ordered caller-readable Plan with operations and display, including copies, parent carrying, conflicts, and move-cycle temporary renames.
+6. A Plan is plain caller-constructible data with no version, provenance, generation, capability, timestamp, or prepare-only identity.
+7. Confirmation presents the prepared display verbatim and never changes Plan operations.
+8. `execute(plan)` runs supplied operations in array order, independent of readiness and prepare, and never replans, appends, lowers, validates display, preflights the whole Plan, or refreshes instance state.
+9. Unknown or malformed operations fail when reached, preserving earlier completed effects; filesystem errors stop later operations and never roll back.
+10. Directory actions remain single Plan operations. Move is exactly one rename and has no implicit cross-filesystem fallback.
+11. Execution remains UI-free and exposes cancellable progress plus exactly-once completion; internal request bookkeeping is not public contract.
+12. `actions.write` alone owns readiness, buffer locking, confirmation, progress presentation, and post-execution reconciliation.
+13. Parse/confirmation cancellation preserves the draft; after execution starts, successful reconciliation replaces it with filesystem truth after every terminal outcome.
+14. Reconciliation failure reports directly, unlocks, leaves `needs_refresh`, and permits recovery through `instance:refresh({ force = true })`.
+15. Public `refresh()` defaults to non-force and rejects modified text; `refresh({ force = true })` explicitly discards it without prompting after atomic success. Both synchronously reject creating, destroying, destroyed, and write-locked instances; load-failed refresh retries initial loading; optional `on_complete(err)` observes async completion exactly once. Watcher events retain a pending refresh signal instead of being lost.
+16. Automatic GC protects visible and modified instances, cannot self-evict a new instance, and repeated setup cannot orphan a live GC group.
+17. Default prepare emits normalized root-contained targets, while direct caller Plans are explicitly trusted and receive no execute-time root sandbox.
+18. Actual filesystem, watcher, refresh, configuration, and handler failures surface under the documented error rules.
 
 ## 40. Explicit Trade-offs
 
 This design intentionally accepts:
 
-- More internal tree and extmark machinery in exchange for incremental file-view performance, while keeping extmark IDs private.
-- Real columns make rendered metadata part of the ordinary-space-separated physical line protocol so ordinary Vim yanks can copy it; grammar-consumed alignment/separator whitespace has no immutable visual owner and is normalized after successful execution.
-- Dynamic column widths can turn a logically local projection change into a full visible-row rerender when alignment widths change.
-- Oil-style `vim.trim()` path-boundary normalization means leading and trailing path whitespace is not round-trippable and is silently removed after successful write and refresh; internal spaces remain literal.
-- An otherwise unmarked new path cannot begin with reserved byte `0x1f`, although valid marked paths and internal path components may contain it.
-- No automatic marker or semantic read-only-column repair; destructive edits may become explicit errors or delete-plus-create plans.
-- Cross-instance copy depends on the source instance and node remaining live until prepare resolves the source path, descriptors, and snapshot; no instance pinning or clipboard provenance is retained, while source width changes alone do not invalidate pasted rows.
-- Asynchronous complexity and intentionally serial executor I/O in exchange for immediate handle creation, best-effort cancellation, and explicit partial-state accounting.
-- Cancellation may not stop an `EBUSY` OS call, may leave a partial file/tree/cross-device move/cycle and executor temporary paths, provides only a point-in-time terminal rescan, and performs no post-terminal path deletion.
-- Forced loss of unsaved edits when GC or explicit destruction succeeds, or when accepted execution cancellation completes a successful terminal refresh; a failed terminal refresh instead restores the exact pre-execution snapshot.
-- No automatic merge of external changes.
-- Partial filesystem mutation when execution fails or is canceled mid-plan, with no rollback.
-- Errors for projection actions on modified or execution-locked buffers instead of a persistent hidden draft model.
-- Local-only scope instead of carrying Oil's adapter architecture or using a worker process or external copy/delete commands.
-- Re-reading root and candidate-existing expanded directories after successful or canceled execution instead of maintaining a perfect predictive cache.
-- One immediate, non-reopenable default write-progress float rather than delayed, minimized, or persistent progress presentation.
-- A first-setup-only process-wide file-explorer decision rather than reversible netrw restoration or runtime takeover switching; `BufEnter` creates an instance only when a directory is actually entered instead of pre-creating one for every added directory buffer.
+- A trusted direct Plan can target paths outside the instance root, use misleading display, or fail partway because execute does not police caller intent.
+- Prepared Plans are based on the last projected snapshot and are not invalidated by later filesystem changes.
+- Execution stops at the first failure and never rolls back earlier filesystem effects.
+- A move is one rename; cross-filesystem moves fail unless the caller explicitly supplies copy and delete operations.
+- Whole-directory filesystem primitives may have partial effects, while Plan and progress expose only the one directory operation.
+- Once default write execution begins, successful reconciliation discards the stale draft even after failure or cancellation.
+- Reconciliation can fail; `needs_refresh` plus public `instance:refresh({ force = true })` is the recovery path rather than a transaction or merge system.
+- Automatic GC may exceed capacity temporarily to protect visible, modified, or newly registering instances.
+- Real columns and `vim.trim()` make alignment and boundary whitespace normalization part of successful write behavior.
+- Stable markers are not automatically repaired; damaged identities can become errors or explicit delete-plus-create intent.
+- Cross-instance copy requires the source to remain live only until prepare resolves its absolute path.
+- Local-only filesystem scope, one immediate progress presenter, and a first-setup-only default-explorer decision.
 
-These trade-offs preserve a small public model while keeping common expansion, refresh, lookup, selection, execution observation, and best-effort cancellation predictable.
+These trade-offs keep prepare complete, execute small, and the default write workflow recoverable without turning Fre into a transaction manager.
 
 ## 41. Open Questions
 
-There are no unresolved product or architecture questions required before implementation planning. Implementation may choose concrete helper names and test tooling while preserving the contracts in this document.
+No product or architecture decision remains open for the first implementation. Adapter-internal algorithms for whole-directory copy/delete, helper names, and concrete test tooling are implementation details as long as they preserve the single-operation Plan interface and observable contracts above.
