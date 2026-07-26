@@ -307,7 +307,17 @@ describe("fre ticket 12 duplicate and directory semantics", function()
     assert_error("must not be inside its own source subtree", function() second:prepare() end)
     if package.config:sub(1, 1) == "\\" then
       set_lines(second, { edited_line(second, "source", "SOURCE/") })
-      assert_error("must differ from its source", function() second:prepare() end)
+      local temporary = fixture:path(".source.fre-tmp-move-cycle-1")
+      local plan = second:prepare()
+      assert.are.same(
+        { type = "move", from = fixture:path("source"), to = temporary, kind = "directory" },
+        plan.operations[1]
+      )
+      assert.are.same(
+        { type = "move", from = temporary, to = fixture:path("SOURCE"), kind = "directory" },
+        plan.operations[2]
+      )
+      assert.are.equal("MOVE  source/ -> SOURCE/", plan.display[1])
     end
   end)
 

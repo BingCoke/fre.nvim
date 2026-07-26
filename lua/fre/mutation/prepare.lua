@@ -1,5 +1,6 @@
 local buffer = require("fre.buffer")
 local path = require("fre.path")
+local move_graph = require("fre.mutation.move_graph")
 
 local M = {}
 local supported_kinds = { file = true, directory = true, symlink = true }
@@ -90,37 +91,6 @@ local function action_label(action)
   if action.type == "delete" then return display_path(action.from_relative, action.kind) end
   return display_path(action.to_relative,
     action.type == "create_directory" and "directory" or "file")
-end
-
-local function order_actions(actions)
-  local ordered, emitted = {}, {}
-  while #ordered < #actions do
-    local selected
-    for _, action in ipairs(actions) do
-      if not emitted[action] then
-        local ready = true
-        for dependency in pairs(action.dependencies) do
-          if not emitted[dependency] then ready = false; break end
-        end
-        if ready and (selected == nil or action.sequence < selected.sequence) then
-          selected = action
-        end
-      end
-    end
-    if selected == nil then
-      local cycle = {}
-      for _, action in ipairs(actions) do
-        if not emitted[action] then cycle[#cycle + 1] = action end
-      end
-      table.sort(cycle, function(left, right) return left.sequence < right.sequence end)
-      local labels = {}
-      for _, action in ipairs(cycle) do labels[#labels + 1] = action_label(action) end
-      fail("move dependency cycle is unsupported: " .. table.concat(labels, ", "))
-    end
-    emitted[selected] = true
-    ordered[#ordered + 1] = selected
-  end
-  return ordered
 end
 
 local function node_depth(node)
@@ -223,11 +193,22 @@ function M.prepare(instance)
   local function add_action(action, rank, tie)
     action_counter = action_counter + 1
     action.dependencies = {}
+    action.occupancy_dependencies = {}
+    action.non_occupancy_dependencies = {}
     action.rank = rank
     action.tie = tie or ""
     action.creation_index = action_counter
     actions[#actions + 1] = action
     return action
+  end
+
+  local function add_dependency(action, dependency, reason)
+    action.dependencies[dependency] = true
+    if reason == "occupancy" then
+      action.occupancy_dependencies[dependency] = true
+    else
+      action.non_occupancy_dependencies[dependency] = true
+    end
   end
 
   for _, item in ipairs(rows) do
@@ -317,12 +298,13 @@ function M.prepare(instance)
 
     local function validate_external(occurrence)
       if node.kind == "directory" then
-        if path.equal(source, occurrence.target, { windows = windows }) then
+        local equal_source = path.equal(source, occurrence.target, { windows = windows })
+        if equal_source and source == occurrence.target then
           fail_row(occurrence.row, "directory target "
             .. display_path(occurrence.target_relative, node.kind)
             .. " must differ from its source " .. display_path(source_relative, node.kind))
         end
-        if path.contains(source, occurrence.target) then
+        if not equal_source and path.contains(source, occurrence.target) then
           fail_row(occurrence.row, "directory target "
             .. display_path(occurrence.target_relative, node.kind)
             .. " must not be inside its own source subtree "
@@ -368,7 +350,7 @@ function M.prepare(instance)
       intent.actions[#intent.actions + 1] = action
       intent.vacancy = action
       for _, copy_occurrence in ipairs(copies) do
-        action.dependencies[copy_occurrence.action] = true
+        add_dependency(action, copy_occurrence.action, "source-read")
       end
     elseif #found == 0 then
       if not parent_intent or #parent_intent.final_roots > 0 then
@@ -408,6 +390,16 @@ function M.prepare(instance)
   -- copy/move carries them. Targets inside a produced directory run afterwards.
   for _, action in ipairs(actions) do
     if action.to then
+      local has_target_container = false
+      for _, producer in ipairs(actions) do
+        if producer ~= action
+            and producer.kind == "directory"
+            and (producer.type == "copy" or producer.type == "move")
+            and path.contains(producer.to, action.to) then
+          has_target_container = true
+          break
+        end
+      end
       for _, id in ipairs(classification_order) do
         local intent = intents[id]
         if intent.node.kind == "directory" then
@@ -417,9 +409,12 @@ function M.prepare(instance)
                 "target remains inside deleted ancestor "
                   .. display_path(intent.source_relative, "directory"))
             end
-            for _, ancestor_action in ipairs(intent.actions) do
-              if ancestor_action ~= action then
-                ancestor_action.dependencies[action] = true
+            if not path.equal(intent.source, action.to, { windows = windows })
+                and not has_target_container then
+              for _, ancestor_action in ipairs(intent.actions) do
+                if ancestor_action ~= action then
+                  add_dependency(ancestor_action, action, "ancestor-source")
+                end
               end
             end
           end
@@ -428,7 +423,7 @@ function M.prepare(instance)
                 and ancestor_action.kind == "directory"
                 and (ancestor_action.type == "copy" or ancestor_action.type == "move")
                 and path.contains(ancestor_action.to, action.to) then
-              action.dependencies[ancestor_action] = true
+              add_dependency(action, ancestor_action, "target-container")
             end
           end
         end
@@ -442,7 +437,7 @@ function M.prepare(instance)
     if producer.foreign and producer.kind == "directory" then
       for _, action in ipairs(actions) do
         if action ~= producer and action.to and path.contains(producer.to, action.to) then
-          action.dependencies[producer] = true
+          add_dependency(action, producer, "target-container")
         end
       end
     end
@@ -457,7 +452,7 @@ function M.prepare(instance)
           local removes_source = action.kind == "directory"
             and path.contains(action.from, foreign.from)
             or path.equal(action.from, foreign.from, { windows = windows })
-          if removes_source then action.dependencies[foreign] = true end
+          if removes_source then add_dependency(action, foreign, "source-read") end
         end
       end
     end
@@ -476,7 +471,7 @@ function M.prepare(instance)
               or ancestor_action.type == "delete"
             local descendant_removes_source = action.type == "move" or action.type == "delete"
             if ancestor_removes_source or descendant_removes_source then
-              ancestor_action.dependencies[action] = true
+              add_dependency(ancestor_action, action, "ancestor-source")
             end
           end
         end
@@ -517,7 +512,7 @@ function M.prepare(instance)
               .. " is occupied by snapshot path "
               .. display_path(assert(path.relative(instance.root, occupied.path)), occupied.kind))
           end
-          action.dependencies[vacancy] = true
+          add_dependency(action, vacancy, "occupancy")
         end
       end
     end
@@ -529,6 +524,23 @@ function M.prepare(instance)
     return left.creation_index < right.creation_index
   end)
   for sequence, action in ipairs(actions) do action.sequence = sequence end
+
+  local reserved_paths = { instance.root }
+  for _, absolute in pairs(baseline) do reserved_paths[#reserved_paths + 1] = absolute end
+  for _, occupied in ipairs(snapshot) do reserved_paths[#reserved_paths + 1] = occupied.path end
+  for _, action in ipairs(actions) do
+    if action.from then reserved_paths[#reserved_paths + 1] = action.from end
+    if action.to then reserved_paths[#reserved_paths + 1] = action.to end
+    for _, entry in ipairs(action.source_entries or {}) do
+      reserved_paths[#reserved_paths + 1] = entry.path
+    end
+  end
+
+  local ordered, display_order = move_graph.order_and_lower(actions, {
+    windows = windows,
+    reserved_paths = reserved_paths,
+    describe = action_label,
+  })
 
   local function virtual_key(value)
     local normalized = path.normalize(value, { windows = windows })
@@ -571,7 +583,6 @@ function M.prepare(instance)
     virtual[key] = { path = target, kind = entry.kind, node_id = entry.node_id }
   end
 
-  local ordered = order_actions(actions)
   for _, action in ipairs(ordered) do
     if action.type == "delete" then
       for _, selected in ipairs(selected_entries(action)) do virtual[selected.key] = nil end
@@ -595,10 +606,8 @@ function M.prepare(instance)
   end
 
   local operations, display = {}, {}
-  for index, action in ipairs(ordered) do
-    operations[index] = public_operation(action)
-    display[index] = operation_display(action)
-  end
+  for index, action in ipairs(ordered) do operations[index] = public_operation(action) end
+  for index, action in ipairs(display_order) do display[index] = operation_display(action) end
   return { operations = operations, display = display }
 end
 

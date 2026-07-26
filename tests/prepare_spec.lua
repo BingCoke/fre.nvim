@@ -380,7 +380,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     end)
   end)
 
-  it("orders an ordinary acyclic vacancy chain and rejects move cycles", function()
+  it("orders an ordinary acyclic vacancy chain and lowers move cycles", function()
     local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b", ["c.txt"] = "c" })
     local a_to_b = edited_line(instance, "a.txt", "b.txt")
     local b_to_c = edited_line(instance, "b.txt", "c.txt")
@@ -404,7 +404,17 @@ describe("fre ticket 10 prepare basic mutations", function()
     }, plan.display)
 
     set_lines(instance, { a_to_b, b_to_a, c_line })
-    assert_error("move dependency cycle is unsupported", function() instance:prepare() end)
+    local temporary = fixture:path(".a.txt.fre-tmp-move-cycle-1")
+    plan = instance:prepare()
+    assert.are.same({
+      { type = "move", from = fixture:path("a.txt"), to = temporary, kind = "file" },
+      {
+        type = "move", from = fixture:path("b.txt"), to = fixture:path("a.txt"),
+        kind = "file",
+      },
+      { type = "move", from = temporary, to = fixture:path("b.txt"), kind = "file" },
+    }, plan.operations)
+    assert.are.same({ "MOVE  a.txt -> b.txt", "MOVE  b.txt -> a.txt" }, plan.display)
   end)
 
   it("is deterministic plain caller-owned data with only Plan and operation fields", function()
@@ -439,7 +449,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     assert.are_not.equal(first.operations, second.operations)
   end)
 
-  it("uses practical Windows equality for pure planning and rejects case-only cycles", function()
+  it("uses practical Windows equality and lowers case-only cycles", function()
     local bufnr = vim.api.nvim_create_buf(false, true)
     local root = { id = 1, path = "C:/Project", kind = "directory" }
     local a = { id = 2, path = "C:/Project/A.txt", kind = "file", name = "A.txt" }
@@ -486,9 +496,18 @@ describe("fre ticket 10 prepare basic mutations", function()
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
       buffer.marker(fake.id, a.id) .. "a.txt",
     })
-    assert_error("move dependency cycle is unsupported", function()
-      mutation_prepare.prepare(fake)
-    end)
+    plan = mutation_prepare.prepare(fake)
+    assert.are.same({
+      {
+        type = "move", from = "C:/Project/A.txt",
+        to = "C:/Project/.A.txt.fre-tmp-move-cycle-1", kind = "file",
+      },
+      {
+        type = "move", from = "C:/Project/.A.txt.fre-tmp-move-cycle-1",
+        to = "C:/Project/a.txt", kind = "file",
+      },
+    }, plan.operations)
+    assert.are.same({ "MOVE  A.txt -> a.txt" }, plan.display)
     vim.api.nvim_buf_delete(bufnr, { force = true })
   end)
 end)
