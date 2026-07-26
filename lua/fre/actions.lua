@@ -1,4 +1,7 @@
+local config = require("fre.config")
 local default_ui = require("fre.write_ui")
+local mapping = require("fre.mapping")
+local window = require("fre.window")
 
 local M = {}
 local ui_adapter = default_ui
@@ -15,6 +18,283 @@ local function instance_from(ctx)
     fail("action context buffer does not match its instance", 3)
   end
   return ctx.instance
+end
+
+local function exact_opts(opts, allowed, name)
+  if opts == nil then return {} end
+  if type(opts) ~= "table" then fail(name .. " options must be a table", 4) end
+  for key in pairs(opts) do
+    if type(key) ~= "string" or not allowed[key] then
+      fail(name .. " options contain unknown field " .. tostring(key), 4)
+    end
+  end
+  return opts
+end
+
+local function entry_from(ctx)
+  instance_from(ctx)
+  if ctx.entry == nil then fail("action requires an entry", 4) end
+  if type(ctx.entry) ~= "table" then fail("action context entry must be a table", 4) end
+  if type(ctx.entry.absolute_path) ~= "string" or ctx.entry.absolute_path == "" then
+    fail("action context entry must contain an absolute path", 4)
+  end
+  if ctx.entry.kind ~= "file" and ctx.entry.kind ~= "symlink"
+      and ctx.entry.kind ~= "directory" then
+    fail("action context entry has unsupported kind " .. tostring(ctx.entry.kind), 4)
+  end
+  return ctx.entry
+end
+
+local function entry_path(ctx)
+  return entry_from(ctx).absolute_path
+end
+
+local function no_options(opts, name)
+  exact_opts(opts, {}, name)
+end
+
+local function validate_target(winid)
+  if type(winid) ~= "number" or winid % 1 ~= 0
+      or not vim.api.nvim_win_is_valid(winid) then
+    fail("target window is not valid", 4)
+  end
+  return winid
+end
+
+local function child_options(instance, overrides, root)
+  if overrides == nil then overrides = {} end
+  if type(overrides) ~= "table" then fail("opts.instance must be a table", 4) end
+  if overrides.root ~= nil then fail("opts.instance.root is action-owned", 4) end
+  if overrides.inherit ~= nil then fail("opts.instance.inherit is action-owned", 4) end
+  local result = config.copy(overrides)
+  result.root = root
+  result.inherit = instance
+  instance.manager:resolve_instance_config(result, instance)
+  return result
+end
+
+local function file_buffer(filename)
+  local existing = vim.fn.bufnr(filename)
+  local bufnr = vim.fn.bufadd(filename)
+  local created = existing < 0
+  local ok, err = pcall(vim.fn.bufload, bufnr)
+  if not ok then
+    if created and vim.api.nvim_buf_is_valid(bufnr) and #vim.fn.win_findbuf(bufnr) == 0 then
+      pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+    end
+    error(err, 0)
+  end
+  return bufnr, created
+end
+
+local function cleanup_file_buffer(bufnr, created)
+  if created and vim.api.nvim_buf_is_valid(bufnr) and #vim.fn.win_findbuf(bufnr) == 0 then
+    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+  end
+end
+
+local function replace_with_file(source, target, filename)
+  local bufnr, created = file_buffer(filename)
+  local ok, err = pcall(window.replace_buffer, source, target, bufnr)
+  if not ok then
+    cleanup_file_buffer(bufnr, created)
+    error(err, 0)
+  end
+  return bufnr
+end
+
+local function restore_caller(tabpage, winid)
+  if vim.api.nvim_tabpage_is_valid(tabpage) then
+    pcall(vim.api.nvim_set_current_tabpage, tabpage)
+  end
+  if vim.api.nvim_win_is_valid(winid) then pcall(vim.api.nvim_set_current_win, winid) end
+end
+
+local function snapshot_tabs()
+  local result = {}
+  for _, tabpage in ipairs(vim.api.nvim_list_tabpages()) do result[tabpage] = true end
+  return result
+end
+
+local function snapshot_buffers()
+  local result = {}
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do result[bufnr] = true end
+  return result
+end
+
+local function remove_created_tabs(before, buffers_before, caller_tab, caller_win)
+  local created = {}
+  for _, tabpage in ipairs(vim.api.nvim_list_tabpages()) do
+    if not before[tabpage] then created[#created + 1] = tabpage end
+  end
+  table.sort(created, function(left, right)
+    return vim.api.nvim_tabpage_get_number(left) > vim.api.nvim_tabpage_get_number(right)
+  end)
+  for _, tabpage in ipairs(created) do
+    if vim.api.nvim_tabpage_is_valid(tabpage) then
+      local number = vim.api.nvim_tabpage_get_number(tabpage)
+      pcall(vim.cmd, "noautocmd " .. tostring(number) .. "tabclose!")
+    end
+  end
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if not buffers_before[bufnr] and vim.api.nvim_buf_is_valid(bufnr)
+        and #vim.fn.win_findbuf(bufnr) == 0 then
+      pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+    end
+  end
+  restore_caller(caller_tab, caller_win)
+end
+
+function M.context()
+  return mapping.context()
+end
+
+function M.expand(ctx, opts)
+  no_options(opts, "expand")
+  return instance_from(ctx):expand(entry_path(ctx))
+end
+
+function M.collapse(ctx, opts)
+  no_options(opts, "collapse")
+  return instance_from(ctx):collapse(entry_path(ctx))
+end
+
+function M.toggle_expand(ctx, opts)
+  no_options(opts, "toggle_expand")
+  return instance_from(ctx):toggle_expand(entry_path(ctx))
+end
+
+function M.reveal(ctx, opts)
+  no_options(opts, "reveal")
+  return instance_from(ctx):reveal(entry_path(ctx))
+end
+
+function M.open(ctx, opts)
+  opts = exact_opts(opts, { layout = true }, "open")
+  return instance_from(ctx):open(opts.layout)
+end
+
+function M.hidden(ctx, opts)
+  no_options(opts, "hidden")
+  return instance_from(ctx):hidden()
+end
+
+function M.toggle(ctx, opts)
+  opts = exact_opts(opts, { layout = true }, "toggle")
+  return instance_from(ctx):toggle(opts.layout)
+end
+
+function M.set_hidden_file(ctx, opts)
+  opts = exact_opts(opts, { hidden_file = true }, "set_hidden_file")
+  if type(opts.hidden_file) ~= "boolean" then
+    fail("set_hidden_file.hidden_file must be a boolean", 3)
+  end
+  return instance_from(ctx):set_hidden_file(opts.hidden_file)
+end
+
+function M.toggle_hidden_file(ctx, opts)
+  no_options(opts, "toggle_hidden_file")
+  return instance_from(ctx):toggle_hidden_file()
+end
+
+function M.refresh(ctx, opts)
+  no_options(opts, "refresh")
+  local instance = instance_from(ctx)
+  if not vim.bo[instance.bufnr].modified then return instance:refresh() end
+  local delivered = false
+  return M.confirm(ctx, { "Discard changes and refresh?" }, function(accepted)
+    if delivered then return end
+    delivered = true
+    if accepted == true then instance:refresh({ force = true }) end
+  end)
+end
+
+function M.select(ctx, opts)
+  local instance = instance_from(ctx)
+  local entry = entry_from(ctx)
+  opts = exact_opts(opts, { target_winid = true, instance = true }, "select")
+  local target = validate_target(opts.target_winid or ctx.winid)
+  local prepared = child_options(instance, opts.instance, entry.absolute_path)
+  if entry.kind ~= "directory" then
+    return replace_with_file(instance, target, entry.absolute_path)
+  end
+
+  local child = require("fre").new(prepared)
+  local ok, err = pcall(window.replace, child, target)
+  if not ok then
+    pcall(child.destroy, child)
+    error(err, 0)
+  end
+  window.sync_visibility(instance)
+  child:_on_visibility_enter()
+  return child
+end
+
+function M.tab_select(ctx, opts)
+  local instance = instance_from(ctx)
+  local entry = entry_from(ctx)
+  opts = exact_opts(opts, { instance = true }, "tab_select")
+  validate_target(ctx.winid)
+  local prepared = child_options(instance, opts.instance, entry.absolute_path)
+  local caller_tab = vim.api.nvim_get_current_tabpage()
+  local caller_win = vim.api.nvim_get_current_win()
+  local tabs_before = snapshot_tabs()
+  local buffers_before = snapshot_buffers()
+  local child
+  local file_bufnr
+  local file_created
+  local ok, result = pcall(function()
+    vim.cmd("tabnew")
+    local target = vim.api.nvim_get_current_win()
+    if entry.kind == "directory" then
+      child = require("fre").new(prepared)
+      window.replace(child, target)
+      child:_on_visibility_enter()
+      return child
+    end
+    file_bufnr, file_created = file_buffer(entry.absolute_path)
+    vim.api.nvim_win_set_buf(target, file_bufnr)
+    return file_bufnr
+  end)
+  if not ok then
+    if child then pcall(child.destroy, child) end
+    remove_created_tabs(tabs_before, buffers_before, caller_tab, caller_win)
+    cleanup_file_buffer(file_bufnr, file_created)
+    error(result, 0)
+  end
+  return result
+end
+
+function M.split_select(ctx, opts)
+  local instance = instance_from(ctx)
+  local entry = entry_from(ctx)
+  opts = exact_opts(opts, { layout = true, instance = true }, "split_select")
+  validate_target(ctx.winid)
+  if opts.layout == nil then fail("split_select.layout is required", 3) end
+  local prepared = child_options(instance, opts.instance, entry.absolute_path)
+  window.prepare_split(opts.layout)
+  if entry.kind == "directory" then
+    local child = require("fre").new(prepared)
+    local ok, err = pcall(child.open, child, config.copy(opts.layout))
+    if not ok then
+      pcall(child.destroy, child)
+      error(err, 0)
+    end
+    return child
+  end
+
+  local bufnr, created = file_buffer(entry.absolute_path)
+  local ok, result = pcall(window.split_buffer, bufnr, config.copy(opts.layout))
+  if not ok then
+    cleanup_file_buffer(bufnr, created)
+    error(result, 0)
+  end
+  return bufnr
+end
+
+function M.destroy(ctx, opts)
+  no_options(opts, "destroy")
+  return instance_from(ctx):destroy()
 end
 
 local function report_internal(instance, message)

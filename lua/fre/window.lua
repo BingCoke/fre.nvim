@@ -572,7 +572,7 @@ local function set_split_fixed(winid, option, value)
   end)
 end
 
-local function build_split(instance, layout, effective, preferred)
+local function build_split_buffer(bufnr, layout, effective, preferred)
   local tabpage = vim.api.nvim_get_current_tabpage()
   local anchor = assert(split_anchor(tabpage, preferred), "current tab has no ordinary window")
   vim.api.nvim_set_current_win(anchor)
@@ -584,7 +584,7 @@ local function build_split(instance, layout, effective, preferred)
   }
   vim.cmd(commands[layout.position])
   local winid = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(winid, instance.bufnr)
+  vim.api.nvim_win_set_buf(winid, bufnr)
   resize_split(winid, layout, effective.size)
   return winid
 end
@@ -638,6 +638,87 @@ local function rollback_created_windows(tabpage, before, caller_win)
       and vim.api.nvim_win_get_tabpage(caller_win) == tabpage then
     pcall(vim.api.nvim_set_current_win, caller_win)
   end
+end
+
+function M.replace(instance, winid)
+  if type(winid) ~= "number" or not vim.api.nvim_win_is_valid(winid) then
+    fail("target window is not valid", 2)
+  end
+  local snapshot = snapshot_destination(instance, winid)
+  local ok, err = pcall(function()
+    protect_destination_buffer(instance, snapshot)
+    vim.api.nvim_win_set_buf(winid, instance.bufnr)
+    restore_destination_buffer(snapshot)
+    M.apply_window_options(instance, winid)
+    if not is_float(winid) then
+      local current = { position = "current" }
+      set_metadata(instance, winid, current, current)
+      instance._last_layout_by_tab = instance._last_layout_by_tab or {}
+      instance._last_layout_by_tab[vim.api.nvim_win_get_tabpage(winid)] = current
+    end
+  end)
+  if not ok then
+    restore_destination(instance, snapshot)
+    error(err, 0)
+  end
+  M.sync_visibility(instance)
+  return winid
+end
+
+function M.replace_buffer(instance, winid, bufnr)
+  if type(winid) ~= "number" or not vim.api.nvim_win_is_valid(winid) then
+    fail("target window is not valid", 2)
+  end
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    fail("replacement buffer is not valid", 2)
+  end
+  local snapshot = snapshot_destination(instance, winid)
+  local ok, err = pcall(function()
+    protect_destination_buffer(instance, snapshot)
+    vim.api.nvim_win_set_buf(winid, bufnr)
+    restore_destination_buffer(snapshot)
+    clear_metadata(instance, winid)
+  end)
+  if not ok then
+    restore_destination(instance, snapshot)
+    pcall(M.sync_visibility, instance)
+    error(err, 0)
+  end
+  M.sync_visibility(instance)
+  return winid
+end
+
+function M.prepare_split(requested)
+  local layout = M.normalize(requested, { path = "layout" })
+  if layout.position ~= "left" and layout.position ~= "right"
+      and layout.position ~= "top" and layout.position ~= "bottom" then
+    fail("layout.position must be left, right, top, or bottom", 2)
+  end
+  local effective = M.materialize(layout)
+  validate_split_fit(effective)
+  return copy(layout), copy(effective)
+end
+
+function M.split_buffer(bufnr, requested)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    fail("split buffer is not valid", 2)
+  end
+  local layout, effective = M.prepare_split(requested)
+  local tabpage = vim.api.nvim_get_current_tabpage()
+  local caller_win = vim.api.nvim_get_current_win()
+  local before = snapshot_windows(tabpage)
+  local winid
+  local ok, err = pcall(function()
+    winid = build_split_buffer(bufnr, layout, effective, caller_win)
+    if split_size(winid, layout) ~= effective.size then
+      fail("layout.size could not be materialized exactly", 4)
+    end
+  end)
+  if not ok then
+    rollback_created_windows(tabpage, before, caller_win)
+    error(err, 0)
+  end
+  return winid
 end
 
 local function resolve(instance, layout, tabpage)
@@ -706,7 +787,7 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
       if layout.position == "float" then
         winid = build_float(instance, layout, effective)
       else
-        winid = build_split(instance, layout, effective, caller_win)
+        winid = build_split_buffer(instance.bufnr, layout, effective, caller_win)
       end
       restore_view(winid, saved)
       M.apply_window_options(instance, winid)
