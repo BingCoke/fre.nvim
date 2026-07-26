@@ -349,17 +349,19 @@ describe("fre ticket 10 prepare basic mutations", function()
     assert_error("row 1: unsupported snapshot kind other", function() instance:prepare() end)
   end)
 
-  it("rejects foreign markers before inventing cross-instance copy semantics", function()
+  it("plans a foreign marker as a copy from its source snapshot", function()
     local source_root = fixture:mkdir("source")
     local destination_root = fixture:mkdir("destination")
     fixture:write("source/from.txt", "x")
     local source = wait_ready(keep(fre.new({ root = source_root })))
     local destination = wait_ready(keep(fre.new({ root = destination_root })))
     set_lines(destination, { lines(source)[1] })
-    local err = assert_error("foreign marker copy sources are not supported yet", function()
-      destination:prepare()
-    end)
-    assert.is_truthy(err:find("row 1", 1, true), err)
+    assert.are.same({
+      {
+        type = "copy", from = fixture:path("source", "from.txt"),
+        to = fixture:path("destination", "from.txt"), kind = "file",
+      },
+    }, destination:prepare().operations)
   end)
 
   it("rejects duplicate canonical targets repeated stable IDs and cached occupied targets", function()

@@ -171,20 +171,22 @@ function M.prepare(instance)
     if decoded.marked then
       validate_kind(decoded.entry.kind, row)
       local absolute, relative = target_for_row(instance, row, decoded)
-      if decoded.instance_id ~= instance.id then
-        fail_row(row, "foreign marker copy sources are not supported yet for path "
-          .. display_path(relative, decoded.entry.kind))
-      end
-      if baseline[decoded.node_id] == nil then
-        fail_row(row, "local marker is not part of the projected baseline for path "
-          .. display_path(relative, decoded.entry.kind))
-      end
       local occurrence = {
         row = row, node_id = decoded.node_id, kind = decoded.entry.kind,
         target = absolute, target_relative = relative,
       }
-      occurrences[decoded.node_id] = occurrences[decoded.node_id] or {}
-      occurrences[decoded.node_id][#occurrences[decoded.node_id] + 1] = occurrence
+      if decoded.foreign then
+        occurrence.foreign = true
+        occurrence.source = decoded.entry.absolute_path
+        occurrence.source_node = decoded.source_node
+      else
+        if baseline[decoded.node_id] == nil then
+          fail_row(row, "local marker is not part of the projected baseline for path "
+            .. display_path(relative, decoded.entry.kind))
+        end
+        occurrences[decoded.node_id] = occurrences[decoded.node_id] or {}
+        occurrences[decoded.node_id][#occurrences[decoded.node_id] + 1] = occurrence
+      end
       rows[#rows + 1] = occurrence
     elseif decoded.line ~= "" then
       local absolute, relative = target_for_row(instance, row, decoded)
@@ -233,6 +235,29 @@ function M.prepare(instance)
       item.action = add_action({
         type = item.kind == "directory" and "create_directory" or "create_file",
         to = item.target, to_relative = item.target_relative, kind = item.kind, row = item.row,
+      }, item.row, item.target)
+    elseif item.foreign then
+      if path.equal(item.source, item.target) then
+        fail_row(item.row, "copy source must differ from target "
+          .. display_path(item.target_relative, item.kind))
+      end
+      if item.kind == "directory" and path.contains(item.source, item.target) then
+        fail_row(item.row, "directory target " .. display_path(item.target_relative, item.kind)
+          .. " must not be inside its own source subtree " .. item.source .. "/")
+      end
+
+      local source_entries = {}
+      local function capture_source(node)
+        source_entries[#source_entries + 1] = { path = node.path, kind = node.kind }
+        if node.kind == "directory" and node.children_cached then
+          for _, child in ipairs(node.children_order or {}) do capture_source(child) end
+        end
+      end
+      capture_source(item.source_node)
+      item.action = add_action({
+        type = "copy", from = item.source, from_relative = item.source,
+        to = item.target, to_relative = item.target_relative, kind = item.kind,
+        row = item.row, foreign = true, source_entries = source_entries,
       }, item.row, item.target)
     end
   end
@@ -411,6 +436,33 @@ function M.prepare(instance)
     end
   end
 
+  -- A foreign directory target is a target-side container just like a local
+  -- directory copy target, but its source never participates in local ownership.
+  for _, producer in ipairs(actions) do
+    if producer.foreign and producer.kind == "directory" then
+      for _, action in ipairs(actions) do
+        if action ~= producer and action.to and path.contains(producer.to, action.to) then
+          action.dependencies[producer] = true
+        end
+      end
+    end
+  end
+
+  -- Overlapping instance roots can make a foreign snapshot path locally owned as
+  -- well. Preserve copy semantics by reading it before a local move/delete removes it.
+  for _, foreign in ipairs(actions) do
+    if foreign.foreign then
+      for _, action in ipairs(actions) do
+        if action ~= foreign and (action.type == "move" or action.type == "delete") then
+          local removes_source = action.kind == "directory"
+            and path.contains(action.from, foreign.from)
+            or path.equal(action.from, foreign.from, { windows = windows })
+          if removes_source then action.dependencies[foreign] = true end
+        end
+      end
+    end
+  end
+
   -- Source-removing descendant edits precede a directory copy so it reflects the
   -- extraction. Every descendant action precedes an ancestor move/delete that removes it.
   for _, action in ipairs(actions) do
@@ -524,12 +576,18 @@ function M.prepare(instance)
     if action.type == "delete" then
       for _, selected in ipairs(selected_entries(action)) do virtual[selected.key] = nil end
     elseif action.type == "move" or action.type == "copy" then
-      local selected = selected_entries(action)
-      if action.type == "move" then
-        for _, item in ipairs(selected) do virtual[item.key] = nil end
-      end
-      for _, item in ipairs(selected) do
-        add_virtual(action, derived_target(action.to, action.from, item.entry.path), item.entry)
+      if action.foreign then
+        for _, entry in ipairs(action.source_entries) do
+          add_virtual(action, derived_target(action.to, action.from, entry.path), entry)
+        end
+      else
+        local selected = selected_entries(action)
+        if action.type == "move" then
+          for _, item in ipairs(selected) do virtual[item.key] = nil end
+        end
+        for _, item in ipairs(selected) do
+          add_virtual(action, derived_target(action.to, action.from, item.entry.path), item.entry)
+        end
       end
     elseif action.type == "create_file" or action.type == "create_directory" then
       add_virtual(action, action.to, { kind = action.kind })

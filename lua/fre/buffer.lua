@@ -199,6 +199,9 @@ local function decode_line(instance, row, line, opts)
   if instance_id ~= instance.id then
     source = instance.manager:find_by_id(instance_id)
     if not source then fail_row(row, "marker references unknown instance " .. tostring(instance_id)) end
+    if source._destroyed or source.state == "destroying" or source.state == "destroyed" then
+      fail_row(row, "marker references destroyed instance " .. tostring(instance_id))
+    end
   end
 
   local node = source.nodes_by_id[node_id]
@@ -209,11 +212,26 @@ local function decode_line(instance, row, line, opts)
     fail_row(row, "marker references unknown node " .. tostring(node_id)
       .. " in instance " .. tostring(instance_id))
   end
+  if source ~= instance and (node.id ~= node_id or type(node.path) ~= "string"
+      or type(source.nodes_by_path) ~= "table" or source.nodes_by_path[node.path] ~= node) then
+    fail_row(row, "marker references invalid node " .. tostring(node_id)
+      .. " in instance " .. tostring(instance_id))
+  end
 
+  local entry
+  if source == instance then
+    entry = source:_entry(node)
+  else
+    local entry_ok, entry_or_error = pcall(source._entry, source, node)
+    if not entry_ok then
+      fail_row(row, "marker references invalid node " .. tostring(node_id)
+        .. " in instance " .. tostring(instance_id) .. ": " .. tostring(entry_or_error))
+    end
+    entry = entry_or_error
+  end
   local suffix = line:sub(suffix_index)
   local values, column_ranges, separator_ranges, fields, path_suffix, path_offset =
     parse_columns(row, source, node, suffix, marker_end)
-  local entry = source:_entry(node)
   local proposed_path, path_range = trim_range(path_suffix, path_offset)
   local has_trailing_slash = proposed_path:sub(-1) == "/"
   if node.kind == "directory" and not has_trailing_slash
@@ -226,6 +244,7 @@ local function decode_line(instance, row, line, opts)
   return {
     kind = "existing", marked = true, line = line, marker = marker,
     instance_id = instance_id, node_id = node_id,
+    source_instance = source, source_node = node, foreign = source ~= instance,
     entry = entry,
     proposed_path = proposed_path, path = proposed_path,
     marker_range = { start_byte = 0, end_byte = marker_end },
