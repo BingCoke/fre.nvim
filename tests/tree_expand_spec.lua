@@ -338,6 +338,49 @@ describe("fre directory tree expansion", function()
     assert.is_nil(instance.nodes_by_path[path.resolve(instance.root, "idle/x.txt")])
   end)
 
+  it("rolls back an ordinary directory load when projection fails and retries cleanly", function()
+    fixture:tree({ ["dir/child.txt"] = "x" })
+    local child_path = fixture:path("dir", "child.txt")
+    local fail_render = true
+    local descriptor = custom_value_column(function(entry)
+      if fail_render and path.equal(entry.absolute_path, child_path) then
+        error("directory render exploded")
+      end
+      return entry.name
+    end)
+    local adapter, counts, pending, release = deferred_loader()
+    fre._set_fs_adapter(adapter)
+    local instance = keep(fre.new({ root = fixture.root, columns = { descriptor } }))
+    release(instance.root)
+    wait_ready(instance)
+
+    local dir_path = fixture:path("dir")
+    local dir = instance.nodes_by_path[dir_path]
+    instance:expand("dir")
+    wait_for(function() return pending[dir_path] and pending[dir_path][1] end)
+    local expected = snapshot(instance, dir)
+    local next_node_id = instance._next_node_id
+    release(dir_path, 1)
+    wait_for(function()
+      return dir.load_state == "unloaded" and instance._last_async_error
+        and instance._last_async_error:find("directory render exploded", 1, true)
+    end)
+    assert_snapshot(instance, dir, expected)
+    assert.are.equal(next_node_id, instance._next_node_id)
+    assert.is_false(dir.loaded)
+    assert.is_false(dir.children_cached)
+    assert.is_nil(instance.nodes_by_path[child_path])
+    assert.are.equal(1, counts[dir_path])
+
+    fail_render = false
+    instance:expand("dir")
+    wait_for(function() return pending[dir_path] and pending[dir_path][2] end)
+    release(dir_path, 2)
+    wait_for(function() return instance:get_pos("dir/child.txt") ~= nil end)
+    assert.are.equal(2, counts[dir_path])
+    assert.are.equal("loaded", dir.load_state)
+  end)
+
   it("rejects expand collapse and toggle synchronously while modified without state changes", function()
     fixture:tree({ ["dir/file.txt"] = "x" })
     local instance = wait_ready(keep(fre.new({ root = fixture.root })))

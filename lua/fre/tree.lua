@@ -187,6 +187,7 @@ function Tree:snapshot_directory(parent)
     real_path = parent.real_path,
     nodes_by_id = shallow_copy(self.instance.nodes_by_id),
     nodes_by_path = shallow_copy(self.instance.nodes_by_path),
+    next_node_id = self.instance._next_node_id,
     child_metadata = child_metadata,
   }
 end
@@ -196,6 +197,7 @@ function Tree:restore_directory(parent, snapshot)
   for key, value in pairs(snapshot.nodes_by_id) do self.instance.nodes_by_id[key] = value end
   for key in pairs(self.instance.nodes_by_path) do self.instance.nodes_by_path[key] = nil end
   for key, value in pairs(snapshot.nodes_by_path) do self.instance.nodes_by_path[key] = value end
+  self.instance._next_node_id = snapshot.next_node_id
   for child, info in pairs(snapshot.child_metadata) do
     child.stat = info.stat
     child.link = info.link

@@ -1,5 +1,6 @@
 local fs = require("fre.fs")
 local mutation_fs = require("fre.mutation.fs")
+local inheritance = require("fre.inheritance")
 local Instance = require("fre.instance")
 local manager_module = require("fre.manager")
 local path = require("fre.path")
@@ -26,8 +27,10 @@ function M.new(opts)
   end
 
   local root = path.absolute(opts.root)
+  local snapshot = inheritance.snapshot(opts.inherit)
+  local expansion = snapshot and inheritance.compile(snapshot, root) or nil
   local effective = manager_module.default:resolve_instance_config(opts, opts.inherit)
-  return Instance.new(manager_module.default, root, effective)
+  return Instance.new(manager_module.default, root, effective, expansion)
 end
 
 function M.get_instance(bufnr)

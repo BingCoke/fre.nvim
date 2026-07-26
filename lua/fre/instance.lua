@@ -1,6 +1,7 @@
 local config = require("fre.config")
 local buffer = require("fre.buffer")
 local mapping = require("fre.mapping")
+local inheritance = require("fre.inheritance")
 local path = require("fre.path")
 local mutation_execute = require("fre.mutation.execute")
 local mutation_prepare = require("fre.mutation.prepare")
@@ -256,6 +257,7 @@ function Instance:_finish_initial(token, generation, err, children, real_root)
       self.needs_refresh = false
       self._tree_generation = self._tree_generation + 1
       self:_sync_watchers()
+      inheritance.start(self)
     end
   end
   -- This function already runs on the main loop. Existing observers complete
@@ -592,7 +594,9 @@ function Instance:_ensure_directory_loaded(node, callback)
       end
       local waiters = node._load_waiters or {}
       node._load_waiters = {}
+      local tree_snapshot
       if not err then
+        tree_snapshot = self.tree:snapshot_directory(node)
         local ok, value = pcall(function()
           local ordered = self.tree:reconcile(node, children or {}, function(a, b)
             return self.current_sort(self:_entry(node), self:_entry(a), self:_entry(b))
@@ -602,14 +606,24 @@ function Instance:_ensure_directory_loaded(node, callback)
         end)
         if not ok then err = value end
       end
+      if not err then
+        local ok, result = pcall(self._render_success, self)
+        if not ok then
+          err = result
+        elseif result == false then
+          err = "buffer projection commit failed"
+        end
+      end
       if err then
+        if tree_snapshot then
+          self.tree:restore_directory(node, tree_snapshot)
+          self:_projection()
+        end
         node.load_state = "unloaded"
         node.loaded = false
         node.children_cached = false
       else
-        local ok, render_err = pcall(self._render_success, self)
-        if not ok then err = render_err end
-        if not err then self:_sync_watchers() end
+        self:_sync_watchers()
       end
       for _, waiter in ipairs(waiters) do waiter(err) end
     end)
@@ -756,12 +770,15 @@ function Instance:expand(snapshot_path)
       self:_render_success()
       self:_sync_watchers()
     end
+    local prefix = table.concat(vim.list_slice(segments, 1, index), "/")
     if child.loaded then
       if became_expanded then self:_rescan_directory(child) end
+      inheritance.resume(self, prefix)
       if index == #segments then stop(nil) else walk(child, index + 1) end
     else
       self:_ensure_directory_loaded(child, function(err)
         if err then stop(err); return end
+        inheritance.resume(self, prefix)
         if index == #segments then stop(nil) else walk(child, index + 1) end
       end)
     end
@@ -784,6 +801,7 @@ function Instance:collapse(snapshot_path)
   local node = self:_directory_or_fail(self:_cached_node(relative), relative)
   node.expanded = false
   self:_invalidate_subtree_loads(node)
+  inheritance.collapse(self, relative)
   self:_render_success()
   self:_sync_watchers()
   return nil
@@ -1537,7 +1555,7 @@ function Instance:destroy()
   return nil
 end
 
-function Instance.new(manager, root, effective)
+function Instance.new(manager, root, effective, expansion)
   local bufnr = vim.api.nvim_create_buf(false, true)
   local self = setmetatable({
     manager = manager,
@@ -1568,6 +1586,7 @@ function Instance.new(manager, root, effective)
     _execution = nil,
     _reveal_generation = 0,
     _pending_reveal = nil,
+    _inheritance_trie = expansion,
     _last_layout_by_tab = {},
     _next_node_id = 1,
     nodes_by_id = {},
