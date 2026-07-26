@@ -1,0 +1,1303 @@
+local config = require("fre.config")
+local buffer = require("fre.buffer")
+local path = require("fre.path")
+local mutation_execute = require("fre.mutation.execute")
+local mutation_prepare = require("fre.mutation.prepare")
+local Tree = require("fre.tree")
+
+local Instance = {}
+Instance.__index = Instance
+
+local required_options = {
+  buftype = "acwrite",
+  bufhidden = "hide",
+  swapfile = false,
+  buflisted = false,
+}
+
+local function copy(value)
+  return config.copy(value)
+end
+
+local function fail(message, level)
+  error("fre: " .. message, level or 3)
+end
+
+local function require_ready(instance)
+  if instance.state == "creating" or instance.state == "load-failed" then
+    fail("instance is not ready", 4)
+  end
+end
+
+local function safe_string(value)
+  local text = tostring(value)
+  return (text:gsub("[\r\n]", " "))
+end
+
+local function display_name(instance, node)
+  local relative = assert(path.relative(instance.root, node.path))
+  if node.kind == "directory" then
+    return relative .. "/"
+  end
+  return relative
+end
+
+function Instance:_entry(node)
+  local relative_path = ""
+  if node ~= self.root_node then
+    relative_path = assert(path.relative(self.root, node.path))
+  end
+  return {
+    instance_id = self.id,
+    node_id = node.id,
+    absolute_path = node.path,
+    relative_path = relative_path,
+    name = node.name,
+    kind = node.kind,
+  }
+end
+
+function Instance:_column_context(node, entry, descriptor, index, is_last)
+  local mtime = node.mtime
+  if type(mtime) == "table" then
+    mtime = { sec = tonumber(mtime.sec) or 0, nsec = tonumber(mtime.nsec) or 0 }
+  else
+    mtime = { sec = tonumber(mtime) or 0, nsec = 0 }
+  end
+  return {
+    entry = entry,
+    descriptor = descriptor,
+    config = descriptor,
+    column_index = index,
+    is_last = is_last,
+    instance = { id = self.id, bufnr = self.bufnr, root = self.root },
+    metadata = {
+      kind = node.kind,
+      mode = tonumber(node.mode) or 0,
+      mtime = mtime,
+    },
+  }
+end
+
+function Instance:_replace_lines(first, last, lines)
+  if not vim.api.nvim_buf_is_valid(self.bufnr) then return false end
+  local views = {}
+  for _, winid in ipairs(vim.fn.win_findbuf(self.bufnr)) do
+    if vim.api.nvim_win_is_valid(winid) then
+      views[winid] = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
+    end
+  end
+  local was_modifiable = vim.bo[self.bufnr].modifiable
+  vim.bo[self.bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(self.bufnr, first, last, false, lines)
+  vim.bo[self.bufnr].modified = false
+  vim.bo[self.bufnr].modifiable = was_modifiable
+  for winid, view in pairs(views) do
+    if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == self.bufnr then
+      pcall(vim.api.nvim_win_call, winid, vim.fn.winrestview, view)
+    end
+  end
+  return true
+end
+
+function Instance:_set_lines(lines)
+  return self:_replace_lines(0, -1, lines)
+end
+
+function Instance:_loading_line()
+  return "[fre] Loading " .. self.root
+end
+
+function Instance:_error_line(err)
+  return "[fre] Error loading " .. safe_string(err)
+end
+
+function Instance:_projection()
+  return self.tree:project(function(node)
+    return self.current_hidden_file or node.name:sub(1, 1) ~= "."
+  end)
+end
+
+function Instance:_prepare_projection(validate)
+  local projection = self:_projection()
+  return buffer.prepare(self, projection, function(node)
+    return display_name(self, node)
+  end, { validate = validate == true })
+end
+
+function Instance:_render_success()
+  local projection = self:_projection()
+  return buffer.project(self, projection, function(node)
+    return display_name(self, node)
+  end)
+end
+
+function Instance:_snapshot_visibility()
+  local snapshot = {}
+  for _, node in pairs(self.nodes_by_id) do
+    snapshot[node] = {
+      visible_size = node.visible_size,
+      visible_start = node.visible_start,
+      visible_end = node.visible_end,
+      visible_range = node.visible_range and copy(node.visible_range) or nil,
+    }
+  end
+  return snapshot
+end
+
+function Instance:_restore_visibility(snapshot)
+  for node, value in pairs(snapshot) do
+    node.visible_size = value.visible_size
+    node.visible_start = value.visible_start
+    node.visible_end = value.visible_end
+    node.visible_range = value.visible_range
+  end
+end
+
+
+function Instance:_emit_ready(err, result)
+  local data = {
+    instance_id = self.id,
+    bufnr = self.bufnr,
+    error = err,
+    result = result,
+  }
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = "FreReady",
+    modeline = false,
+    data = data,
+  })
+end
+
+function Instance:_call_callback(callback, err)
+  if not callback.active then
+    return
+  end
+  callback.active = false
+  local ok, callback_err = pcall(callback.fn, err)
+  if not ok then
+    vim.schedule(function()
+      error(callback_err)
+    end)
+  end
+end
+
+function Instance:_schedule_callback(callback, err)
+  vim.schedule(function()
+    if self._destroyed then
+      return
+    end
+    self:_call_callback(callback, err)
+  end)
+end
+
+function Instance:_cancel_pending_callbacks()
+  for _, callback in ipairs(self._ready_callbacks) do
+    callback.active = false
+  end
+  self._ready_callbacks = {}
+end
+
+
+function Instance:_finish_initial(token, generation, err, children, real_root)
+  if self._destroyed or self._attempt ~= token or self._attempt_done[token]
+      or self.root_node.load_generation ~= generation then
+    return nil
+  end
+  self._attempt_done[token] = true
+  local callbacks = self._ready_callbacks
+  self._ready_callbacks = {}
+  if not err then
+    local ok, value = pcall(function()
+      local ordered = self.tree:reconcile(self.root_node, children or {}, function(a, b)
+        return self.current_sort(
+          self:_entry(self.root_node), self:_entry(a), self:_entry(b)
+        )
+      end)
+      local snapshot = {}
+      for _, node in ipairs(ordered) do
+        snapshot[#snapshot + 1] = {
+          id = node.id, name = node.name, path = node.path, kind = node.kind,
+        }
+      end
+      return { children = snapshot, root = self.root }
+    end)
+    if ok then
+      self.result = value
+    else
+      err = value
+    end
+  end
+  if err then
+    self.root_node.load_state = "unloaded"
+    self.root_node.loaded = false
+    self.root_node.children_cached = false
+    self.state = "load-failed"
+    self.error = err
+    self.result = nil
+    self.needs_refresh = true
+    self:_set_lines({ self:_error_line(err) })
+  else
+    self.real_root = real_root
+    self.error = nil
+    self.state = #vim.fn.win_findbuf(self.bufnr) > 0 and "ready-visible" or "ready-hidden"
+    local render_ok, render_err = pcall(self._render_success, self)
+    if not render_ok then
+      err = render_err
+      self.state = "load-failed"
+      self.error = err
+      self.result = nil
+      self.needs_refresh = true
+      self:_set_lines({ self:_error_line(err) })
+    else
+      self.needs_refresh = false
+    end
+  end
+  -- This function already runs on the main loop. Existing observers complete
+  -- before FreReady so reentrant event handlers cannot suppress them.
+  for _, callback in ipairs(callbacks) do
+    self:_call_callback(callback, err)
+  end
+  self:_emit_ready(err, self.result)
+  return err
+end
+
+function Instance:_start_load(initial, on_complete)
+  self._attempt = self._attempt + 1
+  local token = self._attempt
+  self._attempt_done[token] = false
+  self.root_node.load_generation = self.root_node.load_generation + 1
+  local generation = self.root_node.load_generation
+  self.root_node.load_state = "loading"
+  self.root_node.loaded = false
+  if initial then
+    self.state = "creating"
+    self.error = nil
+    self.result = nil
+    self:_set_lines({ self:_loading_line() })
+  end
+
+  local finished = false
+  local function done(err, children, real_root)
+    if finished then return end
+    finished = true
+    vim.schedule(function()
+      if self._destroyed or token ~= self._attempt
+          or generation ~= self.root_node.load_generation then
+        return
+      end
+      local completion_err = self:_finish_initial(token, generation, err, children, real_root)
+      if completion_err ~= nil then err = completion_err end
+      if on_complete then
+        local ok, callback_err = pcall(on_complete, err)
+        if not ok then
+          vim.schedule(function() error(callback_err) end)
+        end
+      end
+    end)
+  end
+
+  local ok, adapter_err = pcall(self.manager:get_fs_adapter().load, self.root, done)
+  if not ok then done(adapter_err) end
+end
+
+function Instance:when_ready(callback)
+  if type(callback) ~= "function" then
+    fail("when_ready callback must be a function", 2)
+  end
+  if self._destroyed then
+    fail("instance is destroyed", 2)
+  end
+  local entry = { fn = callback, active = true }
+  if self.state == "ready-hidden" or self.state == "ready-visible" then
+    self:_schedule_callback(entry, nil, self._attempt)
+  elseif self.state == "load-failed" then
+    self:_schedule_callback(entry, self.error, self._attempt)
+  else
+    self._ready_callbacks[#self._ready_callbacks + 1] = entry
+  end
+  return self
+end
+
+local function split_relative(relative)
+  local result = {}
+  for segment in relative:gmatch("[^/]+") do result[#result + 1] = segment end
+  return result
+end
+
+function Instance:_require_write_capability(token)
+  if type(token) ~= "table" or token.released
+      or not self.actions or self.actions.write ~= token then
+    fail("invalid write capability", 3)
+  end
+end
+
+function Instance:_acquire_write_lock()
+  if self._destroyed or self.state == "destroying" or self.state == "destroyed" then
+    fail("instance is destroyed", 3)
+  end
+  require_ready(self)
+  if not vim.api.nvim_buf_is_valid(self.bufnr) then fail("instance buffer is not valid", 3) end
+  if self.actions and self.actions.write then fail("instance is already write-locked", 3) end
+  if self._refresh_request then fail("refresh is already in progress", 3) end
+  if self._execution and not mutation_execute.is_terminal(self._execution) then
+    fail("an execution is already in progress", 3)
+  end
+  if not vim.bo[self.bufnr].modifiable then
+    fail("buffer is not modifiable", 3)
+  end
+
+  local actions = self.actions
+  if type(actions) ~= "table" then
+    actions = {}
+    self.actions = actions
+  end
+  local token = {
+    original_modifiable = vim.bo[self.bufnr].modifiable,
+    released = false,
+  }
+  actions.write = token
+  local ok, err = pcall(function() vim.bo[self.bufnr].modifiable = false end)
+  if not ok then
+    actions.write = nil
+    if next(actions) == nil then self.actions = nil end
+    token.released = true
+    error(err, 0)
+  end
+  return token
+end
+
+function Instance:_release_write_lock(token)
+  if type(token) ~= "table" or token.released then return false end
+  if not self.actions or self.actions.write ~= token then return false end
+  token.released = true
+  local ok, err = true, nil
+  if vim.api.nvim_buf_is_valid(self.bufnr) then
+    ok, err = pcall(function() vim.bo[self.bufnr].modifiable = token.original_modifiable end)
+  end
+  self.actions.write = nil
+  if next(self.actions) == nil then self.actions = nil end
+  if not ok then self:_report_async_error(err) end
+  return true
+end
+
+function Instance:_require_projection_change()
+  if self._destroyed or self.state == "destroying" or self.state == "destroyed" then
+    fail("instance is destroyed", 3)
+  end
+  require_ready(self)
+  if self.actions and self.actions.write then fail("instance is write-locked", 3) end
+  if self._refresh_request then fail("refresh is already in progress", 3) end
+  if vim.bo[self.bufnr].modified then
+    fail("buffer is modified; write or discard changes before changing the tree", 3)
+  end
+end
+
+function Instance:_normalize_snapshot_path(snapshot_path)
+  if type(snapshot_path) ~= "string" then fail("snapshot path must be a string", 3) end
+  local windows = path.is_windows(self.root)
+  local relative
+  if path.is_absolute(snapshot_path) then
+    local absolute = path.normalize(snapshot_path, { windows = windows })
+    if not path.contains(self.root, absolute) then
+      fail("path is outside the instance root: " .. snapshot_path, 3)
+    end
+    relative = assert(path.relative(self.root, absolute))
+  else
+    relative = path.normalize_relative(snapshot_path, { windows = windows })
+    if relative == ".." or relative:sub(1, 3) == "../" then
+      fail("snapshot path escapes the instance root: " .. snapshot_path, 3)
+    end
+  end
+  return relative, path.resolve(self.root, relative)
+end
+
+function Instance:_cached_node(relative)
+  local node = self.root_node
+  for _, segment in ipairs(split_relative(relative)) do
+    if node.kind ~= "directory" or node.load_state ~= "loaded" then return nil end
+    node = self.tree:find_child(node, segment)
+    if not node then return nil end
+  end
+  return node
+end
+
+function Instance:_directory_or_fail(node, relative)
+  if not node then fail("snapshot path does not exist: " .. relative, 3) end
+  if node.kind ~= "directory" then
+    fail(relative .. " is a " .. tostring(node.kind) .. " and cannot be expanded", 3)
+  end
+  return node
+end
+
+function Instance:_active_directory(node)
+  if node == self.root_node then return true end
+  local current = node
+  while current and current ~= self.root_node do
+    if current.kind ~= "directory" or not current.expanded then return false end
+    current = current.parent
+  end
+  return current == self.root_node
+end
+
+function Instance:_report_async_error(err)
+  self._last_async_error = tostring(err)
+  local ok, notify_err = pcall(
+    vim.notify, "fre: " .. self._last_async_error, vim.log.levels.ERROR
+  )
+  if not ok then
+    self._last_async_error = self._last_async_error
+      .. "; error reporter failed: " .. tostring(notify_err)
+  end
+end
+
+function Instance:_ensure_directory_loaded(node, callback)
+  if node.loaded then callback(nil); return end
+  node._load_waiters = node._load_waiters or {}
+  node._load_waiters[#node._load_waiters + 1] = callback
+  if node.load_state == "loading" then return end
+
+  node.load_generation = node.load_generation + 1
+  local generation = node.load_generation
+  node.load_state = "loading"
+  node.loaded = false
+  node.children_cached = false
+  local finished = false
+  local function done(err, children, real_path)
+    if finished then return end
+    finished = true
+    vim.schedule(function()
+      if self._destroyed or self.nodes_by_id[node.id] ~= node
+          or node.load_generation ~= generation or node.load_state ~= "loading" then
+        return
+      end
+      if vim.bo[self.bufnr].modified or (self.actions and self.actions.write)
+          or not self:_active_directory(node) then
+        node._load_waiters = {}
+        node.load_state = "unloaded"
+        node.loaded = false
+        node.children_cached = false
+        return
+      end
+      local waiters = node._load_waiters or {}
+      node._load_waiters = {}
+      if not err then
+        local ok, value = pcall(function()
+          local ordered = self.tree:reconcile(node, children or {}, function(a, b)
+            return self.current_sort(self:_entry(node), self:_entry(a), self:_entry(b))
+          end)
+          if real_path then node.real_path = real_path end
+          return ordered
+        end)
+        if not ok then err = value end
+      end
+      if err then
+        node.load_state = "unloaded"
+        node.loaded = false
+        node.children_cached = false
+      else
+        local ok, render_err = pcall(self._render_success, self)
+        if not ok then err = render_err end
+      end
+      for _, waiter in ipairs(waiters) do waiter(err) end
+    end)
+  end
+  local ok, adapter_err = pcall(self.manager:get_fs_adapter().load, node.path, done)
+  if not ok then done(adapter_err) end
+end
+
+function Instance:_rescan_directory(node)
+  if not node.loaded or node.load_state == "refreshing" then return end
+  node.load_generation = node.load_generation + 1
+  local generation = node.load_generation
+  node.load_state = "refreshing"
+  local finished = false
+  local function done(err, children, real_path)
+    if finished then return end
+    finished = true
+    vim.schedule(function()
+      if self._destroyed or self.nodes_by_id[node.id] ~= node
+          or node.load_generation ~= generation or node.load_state ~= "refreshing" then
+        return
+      end
+      if vim.bo[self.bufnr].modified or (self.actions and self.actions.write)
+          or not self:_active_directory(node) then
+        node.load_state = "loaded"
+        node.loaded = true
+        node.children_cached = true
+        return
+      end
+      local tree_snapshot
+      if not err then
+        tree_snapshot = self.tree:snapshot_directory(node)
+        local ok, value = pcall(function()
+          local ordered = self.tree:reconcile(node, children or {}, function(a, b)
+            return self.current_sort(self:_entry(node), self:_entry(a), self:_entry(b))
+          end)
+          if real_path then node.real_path = real_path end
+          return ordered
+        end)
+        if not ok then err = value end
+      end
+      if err then
+        if tree_snapshot then
+          self.tree:restore_directory(node, tree_snapshot)
+          self:_projection()
+        end
+        node.load_state = "loaded"
+        node.loaded = true
+        node.children_cached = true
+        self:_report_async_error(err)
+        return
+      end
+      local ok, render_err = pcall(self._render_success, self)
+      if not ok then
+        self.tree:restore_directory(node, tree_snapshot)
+        self:_projection()
+        node.load_state = "loaded"
+        node.loaded = true
+        node.children_cached = true
+        self:_report_async_error(render_err)
+      end
+    end)
+  end
+  local ok, adapter_err = pcall(self.manager:get_fs_adapter().load, node.path, done)
+  if not ok then done(adapter_err) end
+end
+
+function Instance:_invalidate_subtree_loads(node)
+  if node.kind ~= "directory" then return end
+  if node.load_state == "loading" or node.load_state == "refreshing" then
+    local preserved = node.loaded
+    node.load_generation = node.load_generation + 1
+    node._load_waiters = {}
+    node.load_state = preserved and "loaded" or "unloaded"
+    node.loaded = preserved
+    node.children_cached = preserved
+  end
+  for _, child in ipairs(node.children_order or {}) do
+    self:_invalidate_subtree_loads(child)
+  end
+end
+
+function Instance:set_sort(sort_fn)
+  if type(sort_fn) ~= "function" then fail("sort must be a function", 2) end
+  self:_require_projection_change()
+  self.current_sort = sort_fn
+  return self:refresh()
+end
+
+function Instance:set_hidden_file(hidden_file)
+  if type(hidden_file) ~= "boolean" then
+    fail("hidden_file must be a boolean", 2)
+  end
+  self:_require_projection_change()
+  if hidden_file == self.current_hidden_file then return nil end
+  local previous = self.current_hidden_file
+  local visibility = self:_snapshot_visibility()
+  self.current_hidden_file = hidden_file
+  local ok, result = pcall(self._render_success, self)
+  if not ok or result == false then
+    self.current_hidden_file = previous
+    self:_restore_visibility(visibility)
+    if not ok then error(result, 0) end
+    fail("buffer projection commit failed", 2)
+  end
+  return nil
+end
+
+function Instance:toggle_hidden_file()
+  return self:set_hidden_file(not self.current_hidden_file)
+end
+
+function Instance:expand(snapshot_path)
+  self:_require_projection_change()
+  local relative = self:_normalize_snapshot_path(snapshot_path)
+  if relative == "" then return nil end
+  local segments = split_relative(relative)
+  local request = { active = true, synchronous = true }
+  local function stop(err)
+    if not request.active then return end
+    request.active = false
+    if err then
+      if request.synchronous then fail(err, 4) end
+      self:_report_async_error(err)
+    end
+  end
+  local function walk(parent, index)
+    if not request.active then return end
+    local child = self.tree:find_child(parent, segments[index])
+    if not child then
+      stop("snapshot path does not exist: " .. table.concat(vim.list_slice(segments, 1, index), "/"))
+      return
+    end
+    if child.kind ~= "directory" then
+      stop(table.concat(vim.list_slice(segments, 1, index), "/") .. " is a "
+        .. tostring(child.kind) .. " and cannot be expanded")
+      return
+    end
+    local became_expanded = not child.expanded
+    if became_expanded then
+      child.expanded = true
+      self:_render_success()
+    end
+    if child.loaded then
+      if became_expanded then self:_rescan_directory(child) end
+      if index == #segments then stop(nil) else walk(child, index + 1) end
+    else
+      self:_ensure_directory_loaded(child, function(err)
+        if err then stop(err); return end
+        if index == #segments then stop(nil) else walk(child, index + 1) end
+      end)
+    end
+  end
+
+  local first = self.tree:find_child(self.root_node, segments[1])
+  if not first then fail("snapshot path does not exist: " .. segments[1], 2) end
+  if first.kind ~= "directory" then
+    fail(segments[1] .. " is a " .. tostring(first.kind) .. " and cannot be expanded", 2)
+  end
+  walk(self.root_node, 1)
+  request.synchronous = false
+  return nil
+end
+
+function Instance:collapse(snapshot_path)
+  self:_require_projection_change()
+  local relative = self:_normalize_snapshot_path(snapshot_path)
+  if relative == "" then fail("the instance root cannot be collapsed", 2) end
+  local node = self:_directory_or_fail(self:_cached_node(relative), relative)
+  node.expanded = false
+  self:_invalidate_subtree_loads(node)
+  self:_render_success()
+  return nil
+end
+
+function Instance:toggle_expand(snapshot_path)
+  self:_require_projection_change()
+  local relative = self:_normalize_snapshot_path(snapshot_path)
+  if relative == "" then fail("the instance root cannot be toggled", 2) end
+  local node = self:_directory_or_fail(self:_cached_node(relative), relative)
+  if node.expanded then return self:collapse(relative) end
+  return self:expand(relative)
+end
+
+function Instance:get_entry(row)
+  require_ready(self)
+  local decoded = buffer.decode(self, row)
+  if not decoded or not decoded.marked then
+    return nil
+  end
+  return decoded.entry
+end
+
+function Instance:get_pos(snapshot_path)
+  require_ready(self)
+  if type(snapshot_path) ~= "string" then
+    fail("snapshot path must be a string", 2)
+  end
+  local relative = path.normalize_relative(snapshot_path, { windows = path.is_windows(self.root) })
+  local absolute = path.resolve(self.root, relative)
+  local node = self.nodes_by_path[absolute]
+  if not node or not self.view or not self.view.baseline or self.view.baseline[node.id] == nil then
+    return nil
+  end
+  local marker = buffer.marker(self.id, node.id)
+  local hint = buffer.hint_row(self, node)
+  if hint and buffer.row_has_marker(self, hint, marker) then
+    local decoded = buffer.decode(self, hint)
+    return { hint, decoded.path_range.start_byte }
+  end
+  local matches = buffer.find_marker_rows(self, marker)
+  if #matches == 0 then
+    return nil
+  end
+  local row = matches[1]
+  buffer.rebind(self, node, row)
+  local decoded = buffer.decode(self, row)
+  return { row, decoded.path_range.start_byte }
+end
+
+function Instance:_display_window()
+  local current = vim.api.nvim_get_current_win()
+  local tabpage = vim.api.nvim_get_current_tabpage()
+  local chosen
+  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+    if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == self.bufnr then
+      if winid == current then return winid end
+      if not chosen or winid < chosen then chosen = winid end
+    end
+  end
+  return chosen
+end
+
+function Instance:_apply_pending_reveal()
+  local request = self._pending_reveal
+  if not request or request.generation ~= self._reveal_generation or self._destroyed then
+    return false
+  end
+  local position = self:get_pos(request.relative)
+  local winid = self:_display_window()
+  if not position or not winid then return false end
+  vim.api.nvim_win_set_cursor(winid, position)
+  if self._pending_reveal == request then self._pending_reveal = nil end
+  return true
+end
+
+function Instance:reveal(snapshot_path)
+  if self._destroyed or self.state == "destroying" or self.state == "destroyed" then
+    fail("instance is destroyed", 2)
+  end
+  require_ready(self)
+  local relative, absolute = self:_normalize_snapshot_path(snapshot_path)
+  if relative == "" then fail("the instance root has no revealable row", 2) end
+  local segments = split_relative(relative)
+  if not self.current_hidden_file then
+    for _, segment in ipairs(segments) do
+      if segment:sub(1, 1) == "." then
+        fail("path is hidden; enable hidden files explicitly before reveal: " .. relative, 2)
+      end
+    end
+  end
+
+  local position = self:get_pos(relative)
+  if not position then self:_require_projection_change() end
+
+  self._reveal_generation = self._reveal_generation + 1
+  local request = {
+    generation = self._reveal_generation,
+    relative = relative,
+    absolute = absolute,
+    active = true,
+    synchronous = true,
+  }
+  self._pending_reveal = request
+
+  local function current()
+    return request.active and not self._destroyed
+      and request.generation == self._reveal_generation
+  end
+  local function stop(err)
+    if not current() then return end
+    request.active = false
+    if err then
+      if self._pending_reveal == request then self._pending_reveal = nil end
+      if request.synchronous then fail(err, 4) end
+      self:_report_async_error(err)
+      return
+    end
+    self:_apply_pending_reveal()
+  end
+  local function finish(parent)
+    if not current() then return end
+    local target = self.tree:find_child(parent, segments[#segments])
+    if not target or self.nodes_by_path[target.path] ~= target then
+      stop("snapshot path does not exist: " .. relative)
+      return
+    end
+    request.absolute = target.path
+    request.relative = assert(path.relative(self.root, target.path))
+    stop(nil)
+  end
+  local function walk(parent, index)
+    if not current() then return end
+    if index == #segments then finish(parent); return end
+    local child = self.tree:find_child(parent, segments[index])
+    local prefix = table.concat(vim.list_slice(segments, 1, index), "/")
+    if not child then
+      stop("snapshot path does not exist: " .. prefix)
+      return
+    end
+    if child.kind ~= "directory" then
+      stop(prefix .. " is a " .. tostring(child.kind) .. " and cannot contain the reveal target")
+      return
+    end
+    if not child.expanded then
+      child.expanded = true
+      local ok, err = pcall(self._render_success, self)
+      if not ok then
+        child.expanded = false
+        self:_projection()
+        stop(err)
+        return
+      end
+    end
+    if child.loaded then
+      walk(child, index + 1)
+    else
+      self:_ensure_directory_loaded(child, function(err)
+        if not current() then return end
+        if err then stop(err); return end
+        walk(child, index + 1)
+      end)
+    end
+  end
+
+  if position then
+    stop(nil)
+  else
+    walk(self.root_node, 1)
+  end
+  request.synchronous = false
+  return nil
+end
+
+local function schedule_refresh_completion(instance, callback, err)
+  vim.schedule(function()
+    if callback then
+      local ok, callback_err = pcall(callback, err)
+      if not ok then instance:_report_async_error(callback_err) end
+    elseif err ~= nil then
+      instance:_report_async_error(err)
+    end
+  end)
+end
+
+function Instance:_finish_refresh_request(request, err)
+  if request.completed then return end
+  request.completed = true
+  if self._refresh_request == request then self._refresh_request = nil end
+  schedule_refresh_completion(self, request.on_complete, err)
+end
+
+function Instance:_finish_initial_refresh(request, err)
+  if request.completed then return end
+  request.completed = true
+  if self._initial_refresh_request == request then self._initial_refresh_request = nil end
+  self.needs_refresh = err ~= nil
+  schedule_refresh_completion(self, request.on_complete, err)
+end
+
+function Instance:_active_expanded_paths()
+  local paths = {}
+  local function visit(parent)
+    for _, node in ipairs(parent.children_order or {}) do
+      if node.kind == "directory" and node.expanded then
+        paths[#paths + 1] = node.path
+        if node.children_cached then visit(node) end
+      end
+    end
+  end
+  visit(self.root_node)
+  return paths
+end
+
+function Instance:_new_refresh_candidate()
+  local candidate = setmetatable({
+    manager = self.manager,
+    id = self.id,
+    bufnr = self.bufnr,
+    root = self.root,
+    config = self.config,
+    current_sort = self.current_sort,
+    current_hidden_file = self.current_hidden_file,
+    _next_node_id = self._next_node_id,
+    nodes_by_id = {},
+    nodes_by_path = {},
+    view = nil,
+    real_root = self.real_root,
+  }, Instance)
+  candidate.tree = Tree.clone(self.tree, candidate)
+  return candidate
+end
+
+function Instance:_refresh_result(candidate)
+  local children = {}
+  for _, node in ipairs(candidate.root_node.children_order or {}) do
+    children[#children + 1] = {
+      id = node.id, name = node.name, path = node.path, kind = node.kind,
+    }
+  end
+  return { children = children, root = self.root }
+end
+
+function Instance:_sort_candidate_cache()
+  local function visit(parent)
+    if parent.loaded then
+      table.sort(parent.children_order, function(a, b)
+        return self.current_sort(self:_entry(parent), self:_entry(a), self:_entry(b))
+      end)
+    end
+    for _, child in ipairs(parent.children_order or {}) do
+      if child.kind == "directory" and child.children_cached then visit(child) end
+    end
+  end
+  visit(self.root_node)
+end
+
+function Instance:_commit_refresh_candidate(request, candidate, prepared)
+  if self._destroyed or self._refresh_request ~= request
+      or self._refresh_generation ~= request.generation then
+    self:_finish_refresh_request(request, "refresh was superseded")
+    return
+  end
+  if request.write_token ~= nil then
+    if not self.actions or self.actions.write ~= request.write_token
+        or request.write_token.released then
+      self:_finish_refresh_request(request, "write reconciliation lost its capability")
+      return
+    end
+  elseif self.actions and self.actions.write then
+    self:_finish_refresh_request(request, "instance became write-locked during refresh")
+    return
+  end
+  if vim.api.nvim_buf_get_changedtick(self.bufnr) ~= request.changedtick
+      or vim.bo[self.bufnr].modified ~= request.modified then
+    self:_finish_refresh_request(request, "buffer changed during refresh")
+    return
+  end
+
+  local buffer_snapshot = buffer.snapshot(self)
+  local old = {
+    tree = self.tree, root_node = self.root_node,
+    nodes_by_id = self.nodes_by_id, nodes_by_path = self.nodes_by_path,
+    next_node_id = self._next_node_id, real_root = self.real_root,
+    result = self.result, error = self.error, view = self.view,
+  }
+  self.tree = candidate.tree
+  self.tree.instance = self
+  self.root_node = candidate.root_node
+  self.nodes_by_id = candidate.nodes_by_id
+  self.nodes_by_path = candidate.nodes_by_path
+  self._next_node_id = candidate._next_node_id
+  self.real_root = candidate.real_root
+  self.result = self:_refresh_result(candidate)
+  self.error = nil
+
+  local ok, commit_result = pcall(buffer.commit, self, prepared)
+  if not ok or commit_result == false then
+    local commit_err = ok and "buffer projection commit failed" or commit_result
+    self.tree = old.tree
+    self.root_node = old.root_node
+    self.nodes_by_id = old.nodes_by_id
+    self.nodes_by_path = old.nodes_by_path
+    self._next_node_id = old.next_node_id
+    self.real_root = old.real_root
+    self.result = old.result
+    self.error = old.error
+    self.view = old.view
+    candidate.tree.instance = candidate
+    local restore_ok, restore_err = pcall(buffer.restore, self, buffer_snapshot)
+    if not restore_ok then
+      commit_err = tostring(commit_err) .. "; rollback failed: " .. tostring(restore_err)
+    end
+    self.needs_refresh = true
+    self:_finish_refresh_request(request, commit_err)
+    return
+  end
+
+  for _, node in pairs(old.nodes_by_id) do node.row_extmark = nil end
+  self.needs_refresh = false
+  self:_finish_refresh_request(request, nil)
+end
+
+function Instance:_start_atomic_refresh(force, on_complete, write_token)
+  self._refresh_generation = self._refresh_generation + 1
+  local request = {
+    generation = self._refresh_generation,
+    force = force,
+    on_complete = on_complete,
+    changedtick = vim.api.nvim_buf_get_changedtick(self.bufnr),
+    modified = vim.bo[self.bufnr].modified,
+    completed = false,
+    active_paths = self:_active_expanded_paths(),
+    write_token = write_token,
+  }
+  self._refresh_request = request
+  self.needs_refresh = true
+
+  local candidate_ok, candidate = pcall(self._new_refresh_candidate, self)
+  if not candidate_ok then
+    self:_finish_refresh_request(request, candidate)
+    return
+  end
+  request.candidate = candidate
+
+  local function current()
+    local capability_current = request.write_token == nil
+      or (self.actions and self.actions.write == request.write_token
+        and not request.write_token.released)
+    return not request.completed and not self._destroyed
+      and self._refresh_request == request
+      and self._refresh_generation == request.generation
+      and capability_current
+  end
+  local function finish_error(err)
+    self.needs_refresh = true
+    self:_finish_refresh_request(request, err)
+  end
+  local function reconcile(node, children, real_path)
+    candidate.tree:reconcile(node, children or {}, function(a, b)
+      return candidate.current_sort(
+        candidate:_entry(node), candidate:_entry(a), candidate:_entry(b)
+      )
+    end)
+    if real_path then node.real_path = real_path end
+  end
+
+  local scan
+  scan = function(index)
+    if not current() then
+      if not request.completed then finish_error("refresh was superseded") end
+      return
+    end
+    local scan_path = index == 0 and candidate.root or request.active_paths[index]
+    if not scan_path then
+      local sort_ok, sort_err = pcall(candidate._sort_candidate_cache, candidate)
+      if not sort_ok then finish_error(sort_err); return end
+      local prepared_ok, prepared = pcall(candidate._prepare_projection, candidate, true)
+      if not prepared_ok then finish_error(prepared); return end
+      self:_commit_refresh_candidate(request, candidate, prepared)
+      return
+    end
+
+    local node = index == 0 and candidate.root_node or candidate.nodes_by_path[scan_path]
+    if index > 0 and (not node or node.kind ~= "directory"
+        or not candidate:_active_directory(node)) then
+      scan(index + 1)
+      return
+    end
+    node.load_generation = (node.load_generation or 0) + 1
+    local load_generation = node.load_generation
+    node.load_state = "refreshing"
+    local finished = false
+    local function done(err, children, real_path)
+      if finished then return end
+      finished = true
+      vim.schedule(function()
+        if not current() then
+          if not request.completed then finish_error("refresh was superseded") end
+          return
+        end
+        if candidate.nodes_by_path[scan_path] ~= node
+            or node.load_generation ~= load_generation then
+          finish_error("refresh directory generation was superseded")
+          return
+        end
+        if err ~= nil then finish_error(err); return end
+        local reconcile_ok, reconcile_err = pcall(reconcile, node, children, real_path)
+        if not reconcile_ok then finish_error(reconcile_err); return end
+        if index == 0 and real_path then candidate.real_root = real_path end
+        scan(index + 1)
+      end)
+    end
+    local adapter_ok, adapter_err = pcall(
+      self.manager:get_fs_adapter().load, scan_path, done
+    )
+    if not adapter_ok then done(adapter_err) end
+  end
+  scan(0)
+end
+
+function Instance:_reconcile_write(token, on_complete)
+  self:_require_write_capability(token)
+  if type(on_complete) ~= "function" then fail("reconciliation callback must be a function", 3) end
+  if self._refresh_request then fail("refresh is already in progress", 3) end
+  self:_start_atomic_refresh(true, on_complete, token)
+  return nil
+end
+
+
+function Instance:refresh(opts)
+  if opts == nil then opts = {} end
+  if type(opts) ~= "table" then fail("refresh options must be a table", 2) end
+  for key in pairs(opts) do
+    if key ~= "force" and key ~= "on_complete" then
+      fail("refresh options contain unknown field " .. tostring(key), 2)
+    end
+  end
+  local force = opts.force
+  if force == nil then force = false end
+  if type(force) ~= "boolean" then fail("refresh.force must be a boolean", 2) end
+  if opts.on_complete ~= nil and type(opts.on_complete) ~= "function" then
+    fail("refresh.on_complete must be a function", 2)
+  end
+
+  if self._destroyed or self.state == "destroying" or self.state == "destroyed" then
+    fail("instance is destroyed", 2)
+  end
+  if self.state == "creating" then fail("instance is still loading", 2) end
+  if self.actions and self.actions.write then fail("instance is write-locked", 2) end
+  if self._refresh_request then fail("refresh is already in progress", 2) end
+
+  if self.state == "load-failed" then
+    self.needs_refresh = true
+    self:_cancel_pending_callbacks()
+    local request = { on_complete = opts.on_complete, completed = false }
+    self._initial_refresh_request = request
+    self:_start_load(true, function(err)
+      self:_finish_initial_refresh(request, err)
+    end)
+    return nil
+  end
+  if self.state ~= "ready-hidden" and self.state ~= "ready-visible" then
+    fail("instance is not ready", 2)
+  end
+  for _, node in pairs(self.nodes_by_id) do
+    if node.kind == "directory"
+        and (node.load_state == "loading" or node.load_state == "refreshing") then
+      fail("a directory load is already in progress", 2)
+    end
+  end
+  if vim.bo[self.bufnr].modified and not force then
+    fail("buffer is modified; pass force = true to discard changes", 2)
+  end
+
+  self:_start_atomic_refresh(force, opts.on_complete)
+  return nil
+end
+
+function Instance:open(_layout)
+  if self._destroyed then fail("instance is destroyed", 2) end
+  vim.api.nvim_set_current_buf(self.bufnr)
+  buffer.apply_window_options(self)
+  if self.state == "ready-hidden" then self.state = "ready-visible" end
+  if self._pending_reveal then self:_apply_pending_reveal() end
+  return self
+end
+
+function Instance:hidden()
+  if self._destroyed then fail("instance is destroyed", 2) end
+  if #vim.fn.win_findbuf(self.bufnr) == 0 and self.state == "ready-visible" then
+    self.state = "ready-hidden"
+  end
+  return true
+end
+
+function Instance:toggle(layout)
+  if self._destroyed then fail("instance is destroyed", 2) end
+  if vim.api.nvim_get_current_buf() == self.bufnr then
+    return self:hidden()
+  end
+  return self:open(layout)
+end
+
+function Instance:prepare()
+  if self.actions and self.actions.write then fail("instance is write-locked", 2) end
+  return mutation_prepare.prepare(self)
+end
+
+function Instance:_prepare_write(token)
+  self:_require_write_capability(token)
+  return mutation_prepare.prepare(self)
+end
+
+function Instance:_start_execution(plan, handlers)
+  if self._execution and not mutation_execute.is_terminal(self._execution) then
+    fail("an execution is already in progress", 3)
+  end
+  local execution
+  execution = mutation_execute.start(
+    self, plan, handlers, self.manager:get_mutation_adapter(), function(completed)
+      if self._execution == completed then self._execution = nil end
+    end
+  )
+  self._execution = execution
+  return execution
+end
+
+function Instance:execute(plan, handlers)
+  if self._destroyed or self.state == "destroying" or self.state == "destroyed" then
+    fail("instance is destroyed", 2)
+  end
+  if self.actions and self.actions.write then fail("instance is write-locked", 2) end
+  return self:_start_execution(plan, handlers)
+end
+
+function Instance:_execute_write(token, plan, handlers)
+  self:_require_write_capability(token)
+  return self:_start_execution(plan, handlers)
+end
+
+function Instance:destroy()
+  if self._destroyed or self.state == "destroying" then
+    return nil
+  end
+  if self.actions and self.actions.write then fail("instance is write-locked", 2) end
+  if self._execution and not mutation_execute.is_terminal(self._execution) then
+    fail("cannot destroy an instance with an active execution", 2)
+  end
+  self.state = "destroying"
+  self._destroyed = true
+  self._attempt = self._attempt + 1
+  self._refresh_generation = self._refresh_generation + 1
+  if self._refresh_request then
+    self:_finish_refresh_request(self._refresh_request, "instance was destroyed during refresh")
+  end
+  if self._initial_refresh_request then
+    self:_finish_initial_refresh(
+      self._initial_refresh_request, "instance was destroyed during refresh"
+    )
+  end
+  self._reveal_generation = self._reveal_generation + 1
+  self._pending_reveal = nil
+  self:_cancel_pending_callbacks()
+  buffer.teardown(self)
+  if vim.api.nvim_buf_is_valid(self.bufnr) then
+    vim.api.nvim_buf_delete(self.bufnr, { force = true })
+  end
+  self.manager:remove(self)
+  self.state = "destroyed"
+  return nil
+end
+
+function Instance.new(manager, root, effective)
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  local self = setmetatable({
+    manager = manager,
+    id = manager:allocate_id(),
+    bufnr = bufnr,
+    root = root,
+    config = copy(effective),
+    state = "creating",
+    error = nil,
+    result = nil,
+    real_root = nil,
+    current_sort = effective.sort,
+    current_hidden_file = effective.hidden_file,
+    _attempt = 0,
+    _attempt_done = {},
+    _ready_callbacks = {},
+    _destroyed = false,
+    _refresh_generation = 0,
+    _refresh_request = nil,
+    _initial_refresh_request = nil,
+    _execution = nil,
+    _reveal_generation = 0,
+    _pending_reveal = nil,
+    _next_node_id = 1,
+    nodes_by_id = {},
+    nodes_by_path = {},
+    view = { baseline = {} },
+    needs_refresh = false,
+  }, Instance)
+  vim.api.nvim_buf_set_name(bufnr, "fre://" .. tostring(self.id))
+
+  for key, value in pairs(required_options) do
+    vim.bo[bufnr][key] = value
+  end
+  for key, value in pairs(self.config.buffer.options or {}) do
+    vim.bo[bufnr][key] = value
+  end
+  vim.bo[bufnr].filetype = "fre"
+  vim.b[bufnr].fre = {
+    version = 1,
+    instance_id = self.id,
+    root = self.root,
+    gc_group = self.config.gc.group,
+  }
+  for key, value in pairs(self.config.buffer.variables or {}) do
+    if key ~= "fre" then
+      vim.b[bufnr][key] = copy(value)
+    end
+  end
+
+  self.tree = Tree.new(self, root)
+  buffer.setup(self)
+  self:_set_lines({ self:_loading_line() })
+  manager:register(self)
+  self:_start_load(true)
+  return self
+end
+
+return Instance
