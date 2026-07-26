@@ -1,6 +1,7 @@
 local config = require("fre.config")
 local fs = require("fre.fs")
 local mutation_fs = require("fre.mutation.fs")
+local watch = require("fre.watch")
 
 local Manager = {}
 Manager.__index = Manager
@@ -33,6 +34,7 @@ function Manager.new()
     _default_file_explorer = nil,
     _fs_adapter = fs.default,
     _mutation_adapter = mutation_fs.default,
+    _watch_adapter = watch.default,
     instances_by_id = {},
     instances_by_buf = {},
     groups = groups,
@@ -79,6 +81,23 @@ function Manager:set_mutation_adapter(adapter)
     end
   end
   self._mutation_adapter = adapter
+end
+
+function Manager:get_watch_adapter()
+  return self._watch_adapter
+end
+
+function Manager:set_watch_adapter(adapter)
+  if type(adapter) ~= "table" then fail("watch adapter must be a table") end
+  for _, method in ipairs({
+    "new_fs_event", "fs_event_start", "new_timer", "timer_start",
+    "timer_stop", "close", "schedule",
+  }) do
+    if type(adapter[method]) ~= "function" then
+      fail("watch adapter must provide " .. method .. "()")
+    end
+  end
+  self._watch_adapter = adapter
 end
 
 function Manager:setup(opts)

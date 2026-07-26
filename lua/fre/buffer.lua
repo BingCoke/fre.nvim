@@ -554,9 +554,16 @@ function M.setup(instance)
     end,
   })
 
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = instance._buffer_augroup, buffer = instance.bufnr,
+    callback = function() instance:_on_visibility_enter() end,
+  })
   vim.api.nvim_create_autocmd("BufWinEnter", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
-    callback = function() apply_window_options(instance, vim.api.nvim_get_current_win()) end,
+    callback = function()
+      apply_window_options(instance, vim.api.nvim_get_current_win())
+      instance:_on_visibility_enter()
+    end,
   })
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = instance._buffer_augroup, buffer = instance.bufnr,

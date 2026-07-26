@@ -4,6 +4,7 @@ local path = require("fre.path")
 local mutation_execute = require("fre.mutation.execute")
 local mutation_prepare = require("fre.mutation.prepare")
 local Tree = require("fre.tree")
+local Watch = require("fre.watch")
 
 local Instance = {}
 Instance.__index = Instance
@@ -251,6 +252,8 @@ function Instance:_finish_initial(token, generation, err, children, real_root)
       self:_set_lines({ self:_error_line(err) })
     else
       self.needs_refresh = false
+      self._tree_generation = self._tree_generation + 1
+      self:_sync_watchers()
     end
   end
   -- This function already runs on the main loop. Existing observers complete
@@ -346,6 +349,7 @@ function Instance:_acquire_write_lock()
   if not vim.bo[self.bufnr].modifiable then
     fail("buffer is not modifiable", 3)
   end
+  self:_cancel_watch_refresh()
 
   local actions = self.actions
   if type(actions) ~= "table" then
@@ -378,6 +382,7 @@ function Instance:_release_write_lock(token)
   self.actions.write = nil
   if next(self.actions) == nil then self.actions = nil end
   if not ok then self:_report_async_error(err) end
+  self:_schedule_watch_followup()
   return true
 end
 
@@ -391,6 +396,7 @@ function Instance:_require_projection_change()
   if vim.bo[self.bufnr].modified then
     fail("buffer is modified; write or discard changes before changing the tree", 3)
   end
+  self:_cancel_watch_refresh()
 end
 
 function Instance:_normalize_snapshot_path(snapshot_path)
@@ -438,6 +444,109 @@ function Instance:_active_directory(node)
     current = current.parent
   end
   return current == self.root_node
+end
+
+function Instance:_is_visible()
+  if not vim.api.nvim_buf_is_valid(self.bufnr) then return false end
+  for _, winid in ipairs(vim.fn.win_findbuf(self.bufnr)) do
+    if vim.api.nvim_win_is_valid(winid)
+        and vim.api.nvim_win_get_buf(winid) == self.bufnr then
+      return true
+    end
+  end
+  return false
+end
+
+function Instance:_watch_specs()
+  local specs = {
+    { path = self.root_node.path, node_id = self.root_node.id,
+      tree_generation = self._tree_generation },
+  }
+  local function visit(parent)
+    for _, node in ipairs(parent.children_order or {}) do
+      if node.kind == "directory" and node.expanded then
+        specs[#specs + 1] = {
+          path = node.path, node_id = node.id, tree_generation = self._tree_generation,
+        }
+        visit(node)
+      end
+    end
+  end
+  visit(self.root_node)
+  return specs
+end
+
+function Instance:_sync_watchers(recreate_failed)
+  if self._destroyed or (self.state ~= "ready-hidden" and self.state ~= "ready-visible") then
+    return
+  end
+  self._watchers:sync(self:_watch_specs(), { recreate_failed = recreate_failed == true })
+end
+
+function Instance:_suspend_watchers_for_write(token)
+  self:_require_write_capability(token)
+  if path.is_windows(self.root) then self._watchers:suspend() end
+end
+
+function Instance:_next_watch_event_generation()
+  self._watch_event_generation = self._watch_event_generation + 1
+  return self._watch_event_generation
+end
+
+function Instance:_mark_watch_pending(generation)
+  generation = generation or self:_next_watch_event_generation()
+  self._watch_pending_generation = math.max(self._watch_pending_generation, generation)
+  self.needs_refresh = true
+end
+
+function Instance:_schedule_watch_followup()
+  if self._destroyed or not self.needs_refresh or self._watch_followup_scheduled then return end
+  self._watch_followup_scheduled = true
+  vim.schedule(function()
+    self._watch_followup_scheduled = false
+    if not self._destroyed and self.needs_refresh then self:_on_visibility_enter() end
+  end)
+end
+
+function Instance:_watch_commit_safe(entry, request)
+  if self._destroyed or self.state == "destroying" or self.state == "destroyed"
+      or not vim.api.nvim_buf_is_valid(self.bufnr) then return false end
+  if self.state ~= "ready-hidden" and self.state ~= "ready-visible" then return false end
+  if not self._watchers:is_current(entry) then return false end
+  local node = self.nodes_by_id[entry.node_id]
+  if not node or node.path ~= entry.path or node.kind ~= "directory"
+      or not node.loaded or not self:_active_directory(node) then return false end
+  if not self:_is_visible() or vim.bo[self.bufnr].modified
+      or (self.actions and self.actions.write) or self._refresh_request then return false end
+  if self._execution and not mutation_execute.is_terminal(self._execution) then return false end
+  if request then
+    if self._watch_refresh_request ~= request then return false end
+  elseif self._watch_refresh_request or self.needs_refresh then
+    return false
+  end
+  for _, current in pairs(self.nodes_by_id) do
+    if current.kind == "directory"
+        and (current.load_state == "loading" or current.load_state == "refreshing") then
+      return false
+    end
+  end
+  return true
+end
+
+function Instance:_on_watch_error(entry, err)
+  if self._destroyed or self._watchers.failed[entry.path] ~= entry then return end
+  self:_mark_watch_pending()
+  self:_report_async_error("watch failed for " .. entry.path .. ": " .. tostring(err))
+end
+
+function Instance:_on_watch_event(entry)
+  if self._destroyed or not self._watchers:is_current(entry) then return end
+  local generation = self:_next_watch_event_generation()
+  if not self:_watch_commit_safe(entry) then
+    self:_mark_watch_pending(generation)
+    return
+  end
+  self:_start_watch_directory_refresh(entry, generation)
 end
 
 function Instance:_report_async_error(err)
@@ -498,6 +607,7 @@ function Instance:_ensure_directory_loaded(node, callback)
       else
         local ok, render_err = pcall(self._render_success, self)
         if not ok then err = render_err end
+        if not err then self:_sync_watchers() end
       end
       for _, waiter in ipairs(waiters) do waiter(err) end
     end)
@@ -558,6 +668,8 @@ function Instance:_rescan_directory(node)
         node.loaded = true
         node.children_cached = true
         self:_report_async_error(render_err)
+      else
+        self:_sync_watchers()
       end
     end)
   end
@@ -640,6 +752,7 @@ function Instance:expand(snapshot_path)
     if became_expanded then
       child.expanded = true
       self:_render_success()
+      self:_sync_watchers()
     end
     if child.loaded then
       if became_expanded then self:_rescan_directory(child) end
@@ -670,6 +783,7 @@ function Instance:collapse(snapshot_path)
   node.expanded = false
   self:_invalidate_subtree_loads(node)
   self:_render_success()
+  self:_sync_watchers()
   return nil
 end
 
@@ -821,6 +935,7 @@ function Instance:reveal(snapshot_path)
         stop(err)
         return
       end
+      self:_sync_watchers()
     end
     if child.loaded then
       walk(child, index + 1)
@@ -899,6 +1014,153 @@ function Instance:_new_refresh_candidate()
   }, Instance)
   candidate.tree = Tree.clone(self.tree, candidate)
   return candidate
+end
+
+function Instance:_cancel_watch_refresh()
+  local request = self._watch_refresh_request
+  if not request then return false end
+  request.completed = true
+  self._watch_refresh_request = nil
+  self._watch_refresh_generation = self._watch_refresh_generation + 1
+  self:_mark_watch_pending()
+  return true
+end
+
+function Instance:_finish_watch_refresh(request, err)
+  if request.completed then return end
+  request.completed = true
+  if self._watch_refresh_request == request then self._watch_refresh_request = nil end
+  if err ~= nil then
+    self:_mark_watch_pending()
+    self:_report_async_error("watch refresh failed for " .. request.path .. ": " .. tostring(err))
+  end
+end
+
+function Instance:_commit_watch_refresh(request, candidate, prepared)
+  if request.completed or self._watch_refresh_request ~= request
+      or self._watch_refresh_generation ~= request.generation
+      or request.tree_generation ~= self._tree_generation
+      or not self:_watch_commit_safe(request.entry, request) then
+    self:_cancel_watch_refresh()
+    return
+  end
+  if vim.api.nvim_buf_get_changedtick(self.bufnr) ~= request.changedtick
+      or vim.bo[self.bufnr].modified ~= request.modified then
+    self:_finish_watch_refresh(request, "buffer changed during directory refresh")
+    return
+  end
+
+  local buffer_snapshot = buffer.snapshot(self)
+  local old = {
+    tree = self.tree, root_node = self.root_node, nodes_by_id = self.nodes_by_id,
+    nodes_by_path = self.nodes_by_path, next_node_id = self._next_node_id,
+    real_root = self.real_root, result = self.result, error = self.error, view = self.view,
+  }
+  self.tree = candidate.tree
+  self.tree.instance = self
+  self.root_node = candidate.root_node
+  self.nodes_by_id = candidate.nodes_by_id
+  self.nodes_by_path = candidate.nodes_by_path
+  self._next_node_id = candidate._next_node_id
+  self.real_root = candidate.real_root
+  self.result = self:_refresh_result(candidate)
+  self.error = nil
+
+  local ok, commit_result = pcall(buffer.commit, self, prepared)
+  if not ok or commit_result == false then
+    local commit_err = ok and "buffer projection commit failed" or commit_result
+    self.tree = old.tree
+    self.root_node = old.root_node
+    self.nodes_by_id = old.nodes_by_id
+    self.nodes_by_path = old.nodes_by_path
+    self._next_node_id = old.next_node_id
+    self.real_root = old.real_root
+    self.result = old.result
+    self.error = old.error
+    self.view = old.view
+    candidate.tree.instance = candidate
+    local restore_ok, restore_err = pcall(buffer.restore, self, buffer_snapshot)
+    if not restore_ok then
+      commit_err = tostring(commit_err) .. "; rollback failed: " .. tostring(restore_err)
+    end
+    self:_finish_watch_refresh(request, commit_err)
+    return
+  end
+
+  for _, node in pairs(old.nodes_by_id) do node.row_extmark = nil end
+  request.completed = true
+  if self._watch_refresh_request == request then self._watch_refresh_request = nil end
+  self._tree_generation = self._tree_generation + 1
+  self.needs_refresh = request.had_pending
+    or self._watch_event_generation > request.watch_event_generation
+  self:_sync_watchers(false)
+  if self.needs_refresh then self:_schedule_watch_followup() end
+end
+
+function Instance:_start_watch_directory_refresh(entry, event_generation)
+  self._watch_refresh_generation = self._watch_refresh_generation + 1
+  local request = {
+    generation = self._watch_refresh_generation,
+    tree_generation = self._tree_generation,
+    entry = entry,
+    path = entry.path,
+    node_id = entry.node_id,
+    changedtick = vim.api.nvim_buf_get_changedtick(self.bufnr),
+    modified = vim.bo[self.bufnr].modified,
+    pending_generation = self._watch_pending_generation,
+    had_pending = self.needs_refresh,
+    watch_event_generation = event_generation,
+    completed = false,
+  }
+  self._watch_refresh_request = request
+  self.needs_refresh = true
+
+  local candidate_ok, candidate = pcall(self._new_refresh_candidate, self)
+  if not candidate_ok then self:_finish_watch_refresh(request, candidate); return end
+  local node = candidate.nodes_by_id[request.node_id]
+  if not node or node.path ~= request.path or node.kind ~= "directory"
+      or not candidate:_active_directory(node) then
+    self:_finish_watch_refresh(request, "watched directory is no longer active")
+    return
+  end
+  node.load_generation = (node.load_generation or 0) + 1
+  local load_generation = node.load_generation
+  node.load_state = "refreshing"
+  local finished = false
+  local function done(err, children, real_path)
+    if finished then return end
+    finished = true
+    vim.schedule(function()
+      if request.completed or self._watch_refresh_request ~= request
+          or self._watch_refresh_generation ~= request.generation then return end
+      if not self:_watch_commit_safe(entry, request) then
+        self:_cancel_watch_refresh()
+        return
+      end
+      if candidate.nodes_by_id[request.node_id] ~= node
+          or node.load_generation ~= load_generation then
+        self:_finish_watch_refresh(request, "directory generation was superseded")
+        return
+      end
+      if err ~= nil then self:_finish_watch_refresh(request, err); return end
+      local reconcile_ok, reconcile_err = pcall(function()
+        candidate.tree:reconcile(node, children or {}, function(a, b)
+          return candidate.current_sort(
+            candidate:_entry(node), candidate:_entry(a), candidate:_entry(b)
+          )
+        end)
+        if real_path then node.real_path = real_path end
+      end)
+      if not reconcile_ok then self:_finish_watch_refresh(request, reconcile_err); return end
+      local prepared_ok, prepared = pcall(candidate._prepare_projection, candidate, true)
+      if not prepared_ok then self:_finish_watch_refresh(request, prepared); return end
+      self:_commit_watch_refresh(request, candidate, prepared)
+    end)
+  end
+  local adapter_ok, adapter_err = pcall(
+    self.manager:get_fs_adapter().load, request.path, done
+  )
+  if not adapter_ok then done(adapter_err) end
 end
 
 function Instance:_refresh_result(candidate)
@@ -987,8 +1249,12 @@ function Instance:_commit_refresh_candidate(request, candidate, prepared)
   end
 
   for _, node in pairs(old.nodes_by_id) do node.row_extmark = nil end
-  self.needs_refresh = false
+  local followup = self._watch_event_generation > request.watch_event_generation
+  self.needs_refresh = followup
+  self._tree_generation = self._tree_generation + 1
+  self:_sync_watchers(true)
   self:_finish_refresh_request(request, nil)
+  if followup then self:_schedule_watch_followup() end
 end
 
 function Instance:_start_atomic_refresh(force, on_complete, write_token)
@@ -1002,6 +1268,7 @@ function Instance:_start_atomic_refresh(force, on_complete, write_token)
     completed = false,
     active_paths = self:_active_expanded_paths(),
     write_token = write_token,
+    watch_event_generation = self._watch_event_generation,
   }
   self._refresh_request = request
   self.needs_refresh = true
@@ -1142,9 +1409,38 @@ function Instance:refresh(opts)
   if vim.bo[self.bufnr].modified and not force then
     fail("buffer is modified; pass force = true to discard changes", 2)
   end
+  self:_cancel_watch_refresh()
 
   self:_start_atomic_refresh(force, opts.on_complete)
   return nil
+end
+
+function Instance:_on_visibility_enter()
+  if self._destroyed or not self:_is_visible() then return end
+  if self.state == "ready-hidden" then self.state = "ready-visible" end
+  if self.state ~= "ready-visible" or not self.needs_refresh
+      or self._pending_visibility_refresh or self._refresh_request
+      or self._watch_refresh_request or vim.bo[self.bufnr].modified
+      or (self.actions and self.actions.write) then return end
+  if self._execution and not mutation_execute.is_terminal(self._execution) then return end
+  for _, node in pairs(self.nodes_by_id) do
+    if node.kind == "directory"
+        and (node.load_state == "loading" or node.load_state == "refreshing") then return end
+  end
+  self._pending_visibility_refresh = true
+  local ok, err = pcall(self.refresh, self, { on_complete = function(refresh_err)
+    if self._destroyed then return end
+    self._pending_visibility_refresh = false
+    if refresh_err ~= nil then
+      self.needs_refresh = true
+      self:_report_async_error(refresh_err)
+    end
+  end })
+  if not ok then
+    self._pending_visibility_refresh = false
+    self.needs_refresh = true
+    self:_report_async_error(err)
+  end
 end
 
 function Instance:open(_layout)
@@ -1153,6 +1449,7 @@ function Instance:open(_layout)
   buffer.apply_window_options(self)
   if self.state == "ready-hidden" then self.state = "ready-visible" end
   if self._pending_reveal then self:_apply_pending_reveal() end
+  self:_on_visibility_enter()
   return self
 end
 
@@ -1186,6 +1483,7 @@ function Instance:_start_execution(plan, handlers)
   if self._execution and not mutation_execute.is_terminal(self._execution) then
     fail("an execution is already in progress", 3)
   end
+  self:_cancel_watch_refresh()
   local execution
   execution = mutation_execute.start(
     self, plan, handlers, self.manager:get_mutation_adapter(), function(completed)
@@ -1206,7 +1504,13 @@ end
 
 function Instance:_execute_write(token, plan, handlers)
   self:_require_write_capability(token)
-  return self:_start_execution(plan, handlers)
+  self:_suspend_watchers_for_write(token)
+  local ok, execution = pcall(self._start_execution, self, plan, handlers)
+  if not ok then
+    self:_sync_watchers(false)
+    error(execution, 0)
+  end
+  return execution
 end
 
 function Instance:destroy()
@@ -1232,6 +1536,8 @@ function Instance:destroy()
   self._reveal_generation = self._reveal_generation + 1
   self._pending_reveal = nil
   self:_cancel_pending_callbacks()
+  self:_cancel_watch_refresh()
+  self._watchers:stop_all()
   buffer.teardown(self)
   if vim.api.nvim_buf_is_valid(self.bufnr) then
     vim.api.nvim_buf_delete(self.bufnr, { force = true })
@@ -1262,6 +1568,13 @@ function Instance.new(manager, root, effective)
     _refresh_generation = 0,
     _refresh_request = nil,
     _initial_refresh_request = nil,
+    _watch_refresh_generation = 0,
+    _watch_refresh_request = nil,
+    _watch_pending_generation = 0,
+    _watch_event_generation = 0,
+    _watch_followup_scheduled = false,
+    _tree_generation = 0,
+    _pending_visibility_refresh = false,
     _execution = nil,
     _reveal_generation = 0,
     _pending_reveal = nil,
@@ -1293,6 +1606,7 @@ function Instance.new(manager, root, effective)
   end
 
   self.tree = Tree.new(self, root)
+  self._watchers = Watch.new(self, manager:get_watch_adapter())
   buffer.setup(self)
   self:_set_lines({ self:_loading_line() })
   manager:register(self)

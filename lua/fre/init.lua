@@ -3,6 +3,7 @@ local mutation_fs = require("fre.mutation.fs")
 local Instance = require("fre.instance")
 local manager_module = require("fre.manager")
 local path = require("fre.path")
+local watch = require("fre.watch")
 
 local M = {}
 
@@ -57,6 +58,15 @@ end
 
 function M._reset_mutation_adapter()
   manager_module.default:set_mutation_adapter(mutation_fs.default)
+end
+
+-- Internal test seam for deterministic fs-event and debounce behavior.
+function M._set_watch_adapter(adapter)
+  manager_module.default:set_watch_adapter(adapter)
+end
+
+function M._reset_watch_adapter()
+  manager_module.default:set_watch_adapter(watch.default)
 end
 
 return M
