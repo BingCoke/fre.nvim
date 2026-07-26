@@ -1,4 +1,5 @@
 local columns = require("fre.columns")
+local window = require("fre.window")
 
 local M = {}
 
@@ -235,45 +236,10 @@ local function validate_mapping(value, path, active)
   active[value] = nil
 end
 
-local layout_fields = {
-  position = true,
-  size = true,
-  width = true,
-  height = true,
-  row = true,
-  col = true,
-  border = true,
-}
-
-local positions = {
-  current = true,
-  left = true,
-  right = true,
-  top = true,
-  bottom = true,
-  float = true,
-}
-
-local function validate_layout(value, path)
-  expect_table(value, path)
-  check_known_keys(value, layout_fields, path)
-  if value.position ~= nil then
-    expect_type(value.position, "string", path .. ".position")
-    if not positions[value.position] then
-      fail(path .. ".position is not supported")
-    end
-  end
-  for _, field in ipairs({ "size", "width", "height", "row", "col" }) do
-    if value[field] ~= nil then
-      expect_nonnegative_number(value[field], path .. "." .. field)
-    end
-  end
-  if value.border ~= nil then
-    local border_type = type(value.border)
-    if border_type ~= "string" and border_type ~= "table" then
-      fail(path .. ".border must be a string or table")
-    end
-  end
+local function validate_layout(value, path, effective)
+  local opts = { path = path, partial = not effective }
+  local ok, err = pcall(window.normalize, value, opts)
+  if not ok then fail(tostring(err):gsub("^fre%.window:%s*", ""), 4) end
 end
 
 local function validate_columns(value, path)
@@ -374,7 +340,7 @@ local function validate_common(config, setup)
   validate_columns(config.columns, "columns")
   expect_type(config.use_mapping_default, "boolean", "use_mapping_default")
   validate_mapping(config.mapping, "mapping")
-  validate_layout(config.layout, "layout")
+  validate_layout(config.layout, "layout", true)
   validate_buffer(config.buffer, "buffer")
   validate_window(config.window, "window")
 
@@ -435,7 +401,9 @@ function M.resolve_setup(opts, ignore_default_file_explorer)
     result.use_mapping_default = copy(opts.use_mapping_default)
   end
   result.mapping = merge_mapping(result.mapping, opts.mapping)
-  result.layout = merge_record(result.layout, opts.layout, layout_fields)
+  local layout_ok, layout_result = pcall(window.merge_layout, result.layout, opts.layout, { path = "layout" })
+  if not layout_ok then fail(tostring(layout_result):gsub("^fre%.window:%s*", ""), 3) end
+  result.layout = layout_result
 
   if opts.gc ~= nil then
     expect_table(opts.gc, "gc")
@@ -561,7 +529,9 @@ function M.resolve_instance(setup_defaults, opts, predecessor)
     result.use_mapping_default = copy(opts.use_mapping_default)
   end
   result.mapping = merge_mapping(result.mapping, opts.mapping)
-  result.layout = merge_record(result.layout, opts.layout, layout_fields)
+  local layout_ok, layout_result = pcall(window.merge_layout, result.layout, opts.layout, { path = "layout" })
+  if not layout_ok then fail(tostring(layout_result):gsub("^fre%.window:%s*", ""), 3) end
+  result.layout = layout_result
 
   if opts.gc ~= nil then
     expect_table(opts.gc, "gc")

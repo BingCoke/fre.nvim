@@ -5,6 +5,7 @@ local mutation_execute = require("fre.mutation.execute")
 local mutation_prepare = require("fre.mutation.prepare")
 local Tree = require("fre.tree")
 local Watch = require("fre.watch")
+local window = require("fre.window")
 
 local Instance = {}
 Instance.__index = Instance
@@ -832,27 +833,16 @@ function Instance:get_pos(snapshot_path)
   return { row, decoded.path_range.start_byte }
 end
 
-function Instance:_display_window()
-  local current = vim.api.nvim_get_current_win()
-  local tabpage = vim.api.nvim_get_current_tabpage()
-  local chosen
-  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
-    if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == self.bufnr then
-      if winid == current then return winid end
-      if not chosen or winid < chosen then chosen = winid end
-    end
-  end
-  return chosen
-end
-
-function Instance:_apply_pending_reveal()
+function Instance:_apply_pending_reveal(winid)
   local request = self._pending_reveal
   if not request or request.generation ~= self._reveal_generation or self._destroyed then
     return false
   end
   local position = self:get_pos(request.relative)
-  local winid = self:_display_window()
-  if not position or not winid then return false end
+  winid = winid or window.select(self)
+  if not position or not winid or not vim.api.nvim_win_is_valid(winid)
+      or vim.api.nvim_win_get_tabpage(winid) ~= request.tabpage
+      or vim.api.nvim_win_get_buf(winid) ~= self.bufnr then return false end
   vim.api.nvim_win_set_cursor(winid, position)
   if self._pending_reveal == request then self._pending_reveal = nil end
   return true
@@ -880,6 +870,7 @@ function Instance:reveal(snapshot_path)
   self._reveal_generation = self._reveal_generation + 1
   local request = {
     generation = self._reveal_generation,
+    tabpage = vim.api.nvim_get_current_tabpage(),
     relative = relative,
     absolute = absolute,
     active = true,
@@ -1443,30 +1434,28 @@ function Instance:_on_visibility_enter()
   end
 end
 
-function Instance:open(_layout)
+function Instance:open(layout)
   if self._destroyed then fail("instance is destroyed", 2) end
-  vim.api.nvim_set_current_buf(self.bufnr)
-  buffer.apply_window_options(self)
-  if self.state == "ready-hidden" then self.state = "ready-visible" end
-  if self._pending_reveal then self:_apply_pending_reveal() end
+  local winid = window.open(self, layout)
+  if self._pending_reveal then self:_apply_pending_reveal(winid) end
   self:_on_visibility_enter()
   return self
 end
 
 function Instance:hidden()
   if self._destroyed then fail("instance is destroyed", 2) end
-  if #vim.fn.win_findbuf(self.bufnr) == 0 and self.state == "ready-visible" then
-    self.state = "ready-hidden"
-  end
-  return true
+  return window.hidden(self)
 end
 
 function Instance:toggle(layout)
   if self._destroyed then fail("instance is destroyed", 2) end
-  if vim.api.nvim_get_current_buf() == self.bufnr then
-    return self:hidden()
+  local result = window.toggle(self, layout)
+  if type(result) == "number" then
+    if self._pending_reveal then self:_apply_pending_reveal(result) end
+    self:_on_visibility_enter()
+    return self
   end
-  return self:open(layout)
+  return result
 end
 
 function Instance:prepare()
@@ -1578,6 +1567,7 @@ function Instance.new(manager, root, effective)
     _execution = nil,
     _reveal_generation = 0,
     _pending_reveal = nil,
+    _last_layout_by_tab = {},
     _next_node_id = 1,
     nodes_by_id = {},
     nodes_by_path = {},

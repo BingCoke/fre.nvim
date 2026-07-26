@@ -92,6 +92,51 @@ describe("fre configuration", function()
     assert.is_true(second.window.options.cursorline)
   end)
 
+  it("merges layouts by position family and rejects explicitly irrelevant fields", function()
+    local manager = new_manager()
+    manager:setup({ layout = { position = "right" } })
+    assert.are.same({ position = "right", size = 40 }, manager:get_setup_defaults().layout)
+
+    local invalid_setup = {
+      { position = "current", size = 1 },
+      { position = "left", width = 20 },
+      { width = 20 },
+      { position = "float", size = 10, width = 20, height = 5 },
+      { position = "float" },
+    }
+    local committed = manager:get_setup_defaults()
+    for _, layout in ipairs(invalid_setup) do
+      assert_error_contains("layout", function() manager:setup({ layout = layout }) end)
+      assert.are.same(committed, manager:get_setup_defaults())
+    end
+
+    manager:setup({
+      layout = { position = "float", width = 40, height = 12, row = 2, border = "single" },
+    })
+    assert.are.same({
+      position = "float", width = 40, height = 12, row = 2, border = "single",
+    }, manager:get_setup_defaults().layout)
+    local inherited = manager:resolve_instance_config({ layout = { width = 50 } })
+    assert.are.same({
+      position = "float", width = 50, height = 12, row = 2, border = "single",
+    }, inherited.layout)
+    assert_error_contains("layout.size", function()
+      manager:resolve_instance_config({ layout = { size = 8 } })
+    end)
+
+    local left_manager = new_manager()
+    assert_error_contains("layout.width", function()
+      left_manager:resolve_instance_config({ layout = { width = 20 } })
+    end)
+    assert_error_contains("layout.width is required", function()
+      left_manager:resolve_instance_config({ layout = { position = "float", height = 8 } })
+    end)
+    local switched = left_manager:resolve_instance_config({
+      layout = { position = "float", width = 30, height = 8 },
+    })
+    assert.are.same({ position = "float", width = 30, height = 8 }, switched.layout)
+  end)
+
   it("locks the first valid explorer decision and silently ignores later values", function()
     local manager = new_manager()
     assert.is_nil(manager:get_default_file_explorer())

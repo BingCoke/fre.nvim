@@ -1,4 +1,5 @@
 local columns = require("fre.columns")
+local window = require("fre.window")
 
 local M = {}
 
@@ -98,14 +99,6 @@ local function clamp_cursor(instance, insert_mode)
   local boundary = insert_mode and decoded.path_range.start_byte
     or decoded.visible_range.start_byte
   if cursor[2] < boundary then vim.api.nvim_win_set_cursor(0, { row, boundary }) end
-end
-
-local function apply_window_options(instance, winid)
-  if not vim.api.nvim_win_is_valid(winid)
-      or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return end
-  for key, value in pairs(instance.config.window.options or {}) do
-    vim.api.nvim_set_option_value(key, value, { win = winid })
-  end
 end
 
 local function parse_columns(row, source, node, suffix, marker_end)
@@ -521,7 +514,7 @@ function M.project(instance, projection, render_path)
 end
 
 function M.apply_window_options(instance)
-  for _, winid in ipairs(vim.fn.win_findbuf(instance.bufnr)) do apply_window_options(instance, winid) end
+  window.apply_all(instance)
 end
 
 function M.setup(instance)
@@ -556,13 +549,24 @@ function M.setup(instance)
 
   vim.api.nvim_create_autocmd("BufEnter", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
-    callback = function() instance:_on_visibility_enter() end,
+    callback = function()
+      if not instance._window_transition then instance:_on_visibility_enter() end
+    end,
   })
   vim.api.nvim_create_autocmd("BufWinEnter", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function()
-      apply_window_options(instance, vim.api.nvim_get_current_win())
+      local winid = vim.api.nvim_get_current_win()
+      window.apply_all(instance)
+      if instance._window_transition then return end
       instance:_on_visibility_enter()
+      if instance._pending_reveal then instance:_apply_pending_reveal(winid) end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWinLeave", {
+    group = instance._buffer_augroup, buffer = instance.bufnr,
+    callback = function()
+      vim.schedule(function() window.sync_visibility(instance) end)
     end,
   })
   vim.api.nvim_create_autocmd("CursorMoved", {
