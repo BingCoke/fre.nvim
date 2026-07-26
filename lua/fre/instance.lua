@@ -1614,87 +1614,157 @@ function Instance:destroy()
   return self:_finish_destroy()
 end
 
+local function invalidate_failed_constructor(self)
+  self._destroyed = true
+  for _, field in ipairs({
+    "_attempt", "_refresh_generation", "_watch_refresh_generation",
+    "_watch_event_generation", "_tree_generation", "_reveal_generation",
+  }) do
+    if type(self[field]) == "number" then self[field] = self[field] + 1 end
+  end
+  if self.root_node and type(self.root_node.load_generation) == "number" then
+    self.root_node.load_generation = self.root_node.load_generation + 1
+  end
+  if self._pending_reveal then self._pending_reveal.active = false end
+  for _, callback in ipairs(self._ready_callbacks or {}) do callback.active = false end
+  self._ready_callbacks = {}
+end
+
+local function remove_failed_indexes(manager, self)
+  pcall(manager.remove, manager, self)
+  if manager.instances_by_id and manager.instances_by_id[self.id] == self then
+    manager.instances_by_id[self.id] = nil
+  end
+  for bufnr, indexed in pairs(manager.instances_by_buf or {}) do
+    if indexed == self then manager.instances_by_buf[bufnr] = nil end
+  end
+  for _, group in pairs(manager.groups or {}) do
+    if group.instances and group.instances[self.id] == self then
+      group.instances[self.id] = nil
+    end
+  end
+end
+
+local function wipe_failed_buffer(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then return true end
+  local _, delete_err = pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
+      vim.cmd("noautocmd bwipeout!")
+    end)
+    if not ok then delete_err = err end
+  end
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    local ok, err = pcall(vim.cmd, "noautocmd bwipeout! " .. tostring(bufnr))
+    if not ok then delete_err = err end
+  end
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    return false, delete_err or "buffer remained valid"
+  end
+  return true
+end
+
+local function cleanup_failed_constructor(manager, self, bufnr)
+  if self._constructor_cleanup_done then return true end
+  self._constructor_cleanup_done = true
+  invalidate_failed_constructor(self)
+
+  local gc_ok, gc_controller = pcall(manager.get_gc_controller, manager)
+  if not gc_ok then gc_controller = manager._gc end
+  if gc_controller then pcall(gc_controller.stop, gc_controller, self) end
+  if self._watchers then pcall(self._watchers.stop_all, self._watchers) end
+  pcall(buffer.teardown, self)
+  if self._buffer_augroup then
+    pcall(vim.api.nvim_del_augroup_by_id, self._buffer_augroup)
+    self._buffer_augroup = nil
+  end
+  pcall(mapping.teardown, self)
+  for _, item in ipairs(self._installed_mappings or {}) do
+    pcall(vim.keymap.del, item.mode, item.lhs, { buffer = bufnr })
+  end
+  self._installed_mappings = nil
+  self._mapping_installed = nil
+  remove_failed_indexes(manager, self)
+  return wipe_failed_buffer(bufnr)
+end
+
 function Instance.new(manager, root, effective, expansion)
   local bufnr = vim.api.nvim_create_buf(false, true)
   local self = setmetatable({
     manager = manager,
-    id = manager:allocate_id(),
     bufnr = bufnr,
-    root = root,
-    config = copy(effective),
-    state = "creating",
-    error = nil,
-    result = nil,
-    real_root = nil,
-    current_sort = effective.sort,
-    current_hidden_file = effective.hidden_file,
-    _attempt = 0,
-    _attempt_done = {},
-    _ready_callbacks = {},
     _destroyed = false,
-    _refresh_generation = 0,
-    _refresh_request = nil,
-    _initial_refresh_request = nil,
-    _watch_refresh_generation = 0,
-    _watch_refresh_request = nil,
-    _watch_pending_generation = 0,
-    _watch_event_generation = 0,
-    _watch_followup_scheduled = false,
-    _tree_generation = 0,
-    _pending_visibility_refresh = false,
-    _execution = nil,
-    _reveal_generation = 0,
-    _pending_reveal = nil,
-    _inheritance_trie = expansion,
-    _last_layout_by_tab = {},
-    _next_node_id = 1,
-    nodes_by_id = {},
-    nodes_by_path = {},
-    view = { baseline = {} },
-    needs_refresh = false,
   }, Instance)
-  vim.api.nvim_buf_set_name(bufnr, "fre://" .. tostring(self.id))
 
-  for key, value in pairs(required_options) do
-    vim.bo[bufnr][key] = value
-  end
-  for key, value in pairs(self.config.buffer.options or {}) do
-    vim.bo[bufnr][key] = value
-  end
-  vim.bo[bufnr].filetype = "fre"
-  vim.b[bufnr].fre = {
-    version = 1,
-    instance_id = self.id,
-    root = self.root,
-    gc_group = self.config.gc.group,
-  }
-  for key, value in pairs(self.config.buffer.variables or {}) do
-    if key ~= "fre" then
-      vim.b[bufnr][key] = copy(value)
+  local ok, result = xpcall(function()
+    self.id = manager:allocate_id()
+    self.root = root
+    self.config = copy(effective)
+    self.state = "creating"
+    self.error = nil
+    self.result = nil
+    self.real_root = nil
+    self.current_sort = effective.sort
+    self.current_hidden_file = effective.hidden_file
+    self._attempt = 0
+    self._attempt_done = {}
+    self._ready_callbacks = {}
+    self._refresh_generation = 0
+    self._refresh_request = nil
+    self._initial_refresh_request = nil
+    self._watch_refresh_generation = 0
+    self._watch_refresh_request = nil
+    self._watch_pending_generation = 0
+    self._watch_event_generation = 0
+    self._watch_followup_scheduled = false
+    self._tree_generation = 0
+    self._pending_visibility_refresh = false
+    self._execution = nil
+    self._reveal_generation = 0
+    self._pending_reveal = nil
+    self._inheritance_trie = expansion
+    self._last_layout_by_tab = {}
+    self._next_node_id = 1
+    self.nodes_by_id = {}
+    self.nodes_by_path = {}
+    self.view = { baseline = {} }
+    self.needs_refresh = false
+
+    vim.api.nvim_buf_set_name(bufnr, "fre://" .. tostring(self.id))
+    for key, value in pairs(required_options) do
+      vim.bo[bufnr][key] = value
     end
-  end
+    for key, value in pairs(self.config.buffer.options or {}) do
+      vim.bo[bufnr][key] = value
+    end
+    vim.bo[bufnr].filetype = "fre"
+    vim.b[bufnr].fre = {
+      version = 1,
+      instance_id = self.id,
+      root = self.root,
+      gc_group = self.config.gc.group,
+    }
+    for key, value in pairs(self.config.buffer.variables or {}) do
+      if key ~= "fre" then vim.b[bufnr][key] = copy(value) end
+    end
 
-  self.tree = Tree.new(self, root)
-  self._watchers = Watch.new(self, manager:get_watch_adapter())
-  buffer.setup(self)
-  local mapping_ok, mapping_err = pcall(mapping.setup, self)
-  if not mapping_ok then
-    buffer.teardown(self)
-    self._watchers:stop_all()
-    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
-    error(mapping_err, 0)
+    self.tree = Tree.new(self, root)
+    self._watchers = Watch.new(self, manager:get_watch_adapter())
+    buffer.setup(self)
+    mapping.setup(self)
+    self:_set_lines({ self:_loading_line() })
+    manager:register(self)
+    self:_start_load(true)
+    return self
+  end, function(err) return err end)
+
+  if ok then return result end
+  local cleaned, cleanup_err = cleanup_failed_constructor(manager, self, bufnr)
+  if not cleaned then
+    error(tostring(result) .. "; cleanup failed: instance buffer " .. tostring(bufnr)
+      .. " survived: " .. tostring(cleanup_err), 0)
   end
-  self:_set_lines({ self:_loading_line() })
-  local register_ok, register_err = pcall(manager.register, manager, self)
-  if not register_ok then
-    buffer.teardown(self)
-    mapping.teardown(self)
-    self._watchers:stop_all()
-    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
-    error(register_err, 0)
-  end
-  self:_start_load(true)
-  return self
+  error(result, 0)
 end
 
 return Instance

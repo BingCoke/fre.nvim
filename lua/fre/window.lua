@@ -398,7 +398,7 @@ local function restore_window_options(winid, snapshot)
   end
 end
 
-function M.sync_visibility(instance)
+local function observe_visibility(instance)
   if instance._destroyed then return end
   local visible = false
   if vim.api.nvim_buf_is_valid(instance.bufnr) then
@@ -416,6 +416,10 @@ function M.sync_visibility(instance)
   end
   if instance.manager then instance.manager:gc_visibility_changed(instance) end
   return visible
+end
+
+function M.sync_visibility(instance)
+  return observe_visibility(instance)
 end
 
 local function save_view(winid)
@@ -438,14 +442,19 @@ end
 
 local function snapshot_destination(instance, winid)
   local bufnr = vim.api.nvim_win_get_buf(winid)
+  local tabpage = vim.api.nvim_win_get_tabpage(winid)
   return {
     winid = winid,
     bufnr = bufnr,
+    tabpage = tabpage,
     bufhidden = vim.api.nvim_get_option_value("bufhidden", { buf = bufnr }),
     view = save_view(winid),
     options = snapshot_window_options(instance, winid),
     metadata = snapshot_metadata(instance, winid),
     focus = vim.api.nvim_get_current_win(),
+    instance_state = instance.state,
+    layout_history_present = instance._last_layout_by_tab ~= nil,
+    layout_history = instance._last_layout_by_tab and copy(instance._last_layout_by_tab) or nil,
   }
 end
 
@@ -468,9 +477,17 @@ end
 local function restore_destination(instance, snapshot)
   local winid = snapshot.winid
   if vim.api.nvim_win_is_valid(winid) then
+    local current_ok, current = pcall(vim.api.nvim_win_get_buf, winid)
     if vim.api.nvim_buf_is_valid(snapshot.bufnr)
-        and vim.api.nvim_win_get_buf(winid) ~= snapshot.bufnr then
+        and current_ok and current ~= snapshot.bufnr then
       pcall(vim.api.nvim_win_set_buf, winid, snapshot.bufnr)
+      local restored_ok, restored = pcall(vim.api.nvim_win_get_buf, winid)
+      if vim.api.nvim_win_is_valid(winid)
+          and (not restored_ok or restored ~= snapshot.bufnr) then
+        pcall(vim.api.nvim_win_call, winid, function()
+          vim.cmd("noautocmd buffer " .. tostring(snapshot.bufnr))
+        end)
+      end
     end
     if snapshot.protected and vim.api.nvim_buf_is_valid(snapshot.bufnr) then
       pcall(vim.api.nvim_set_option_value, "bufhidden", snapshot.bufhidden, { buf = snapshot.bufnr })
@@ -480,6 +497,12 @@ local function restore_destination(instance, snapshot)
     restore_metadata(instance, winid, snapshot.metadata)
     restore_view(winid, snapshot.view)
   end
+  if snapshot.layout_history_present then
+    instance._last_layout_by_tab = copy(snapshot.layout_history)
+  else
+    instance._last_layout_by_tab = nil
+  end
+  instance.state = snapshot.instance_state
   if vim.api.nvim_win_is_valid(snapshot.focus) then
     pcall(vim.api.nvim_set_current_win, snapshot.focus)
   end
@@ -655,14 +678,15 @@ function M.replace(instance, winid)
       local current = { position = "current" }
       set_metadata(instance, winid, current, current)
       instance._last_layout_by_tab = instance._last_layout_by_tab or {}
-      instance._last_layout_by_tab[vim.api.nvim_win_get_tabpage(winid)] = current
+      instance._last_layout_by_tab[snapshot.tabpage] = current
     end
+    M.sync_visibility(instance)
   end)
   if not ok then
-    restore_destination(instance, snapshot)
+    pcall(restore_destination, instance, snapshot)
+    pcall(observe_visibility, instance)
     error(err, 0)
   end
-  M.sync_visibility(instance)
   return winid
 end
 

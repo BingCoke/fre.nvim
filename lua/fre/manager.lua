@@ -3,6 +3,7 @@ local gc = require("fre.gc")
 local fs = require("fre.fs")
 local mutation_fs = require("fre.mutation.fs")
 local watch = require("fre.watch")
+local takeover = require("fre.takeover")
 
 local Manager = {}
 Manager.__index = Manager
@@ -22,7 +23,8 @@ local function new_group(capacity)
   }
 end
 
-function Manager.new()
+function Manager.new(opts)
+  opts = opts or {}
   local defaults = config.resolve_setup()
   local groups = {}
   for name, capacity in next, defaults.gc.groups do
@@ -41,6 +43,9 @@ function Manager.new()
     groups = groups,
   }, Manager)
   self._gc = gc.new(self)
+  if opts.takeover ~= nil then
+    self._takeover = opts.takeover(self)
+  end
   return self
 end
 
@@ -155,6 +160,9 @@ function Manager:setup(opts)
     self._default_file_explorer = candidate.default_file_explorer
   end
   self._gc:enforce_all()
+  if first_setup and candidate.default_file_explorer and self._takeover then
+    self._takeover:enable()
+  end
   return self:get_setup_defaults()
 end
 
@@ -254,7 +262,7 @@ end
 
 local M = {
   new = Manager.new,
-  default = Manager.new(),
+  default = Manager.new({ takeover = takeover.new }),
 }
 
 return M

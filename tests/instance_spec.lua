@@ -1,4 +1,7 @@
 local buffer = require("fre.buffer")
+local Instance = require("fre.instance")
+local manager_module = require("fre.manager")
+local mapping = require("fre.mapping")
 local fre = require("fre")
 local path = require("fre.path")
 local fs = require("tests.helpers.fs")
@@ -388,5 +391,122 @@ describe("fre async hidden instances", function()
     assert.is_nil(fre.get_instance(bufnr))
     assert.is_nil(fre.get_instance_by_id(id))
     assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
+  end)
+
+  it("rolls back every partial constructor stage while permanently consuming allocated IDs", function()
+    local timers = { created = 0, stopped = 0, closed = 0 }
+    local manager = manager_module.new()
+    manager:set_gc_adapter({
+      now = function() return 0 end,
+      new_timer = function()
+        timers.created = timers.created + 1
+        return {}
+      end,
+      timer_start = function(handle, _, callback)
+        handle.callback = callback
+        return true
+      end,
+      timer_stop = function(handle)
+        if not handle.stopped then
+          handle.stopped = true
+          timers.stopped = timers.stopped + 1
+        end
+      end,
+      close = function(handle)
+        if not handle.closed then
+          handle.closed = true
+          timers.closed = timers.closed + 1
+        end
+      end,
+      schedule = vim.schedule,
+    })
+    manager:setup({
+      default_file_explorer = false,
+      columns = {},
+      gc = { ttl_ms = 100 },
+    })
+    local root = path.absolute(fixture.root)
+    local effective = manager:resolve_instance_config({ root = root }, nil)
+
+    local stages = {
+      {
+        name = "buffer setup",
+        install = function()
+          local original = buffer.setup
+          buffer.setup = function(instance)
+            original(instance)
+            error("injected buffer setup constructor fault")
+          end
+          return function() buffer.setup = original end
+        end,
+      },
+      {
+        name = "mapping setup",
+        install = function()
+          local original = mapping.setup
+          mapping.setup = function(instance)
+            original(instance)
+            error("injected mapping setup constructor fault")
+          end
+          return function() mapping.setup = original end
+        end,
+      },
+      {
+        name = "registration",
+        install = function()
+          local original = manager.register
+          manager.register = function(target, instance)
+            original(target, instance)
+            error("injected registration constructor fault")
+          end
+          return function() manager.register = nil end
+        end,
+      },
+      {
+        name = "load start",
+        install = function()
+          local original = Instance._start_load
+          Instance._start_load = function(instance, ...)
+            original(instance, ...)
+            error("injected load start constructor fault")
+          end
+          return function() Instance._start_load = original end
+        end,
+      },
+    }
+
+    for _, stage in ipairs(stages) do
+      local pending
+      manager:set_fs_adapter({ load = function(_, done) pending = done end })
+      local before_buffers = vim.api.nvim_list_bufs()
+      local failed_id = manager._next_id
+      local restore = stage.install()
+      local ok, err = pcall(Instance.new, manager, root, effective, nil)
+      restore()
+
+      assert.is_false(ok, stage.name)
+      assert.is_truthy(tostring(err):find("injected " .. stage.name, 1, true), tostring(err))
+      assert.are.equal(failed_id + 1, manager._next_id)
+      assert.are.same(before_buffers, vim.api.nvim_list_bufs())
+      assert.is_nil(manager:find_by_id(failed_id))
+      for _, indexed in pairs(manager.instances_by_buf) do
+        assert.are_not.equal(failed_id, indexed.id)
+      end
+      for _, group in pairs(manager.groups) do assert.is_nil(group.instances[failed_id]) end
+      assert.is_false(pcall(vim.api.nvim_get_autocmds, { group = "FreBuffer" .. failed_id }))
+      for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+        assert.are_not.equal("fre://" .. failed_id, vim.api.nvim_buf_get_name(bufnr))
+      end
+      if pending then
+        pending(nil, {})
+        vim.wait(20, function() return false end, 5)
+        assert.is_nil(manager:find_by_id(failed_id))
+        assert.are.same(before_buffers, vim.api.nvim_list_bufs())
+      end
+    end
+
+    assert.are.equal(2, timers.created)
+    assert.are.equal(2, timers.stopped)
+    assert.are.equal(2, timers.closed)
   end)
 end)
