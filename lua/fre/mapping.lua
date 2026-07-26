@@ -122,7 +122,17 @@ function M.setup(instance)
     end
     error(err, 0)
   end
+  instance._installed_mappings = installed
   instance._mapping_installed = true
+end
+
+function M.teardown(instance)
+  for index = #(instance._installed_mappings or {}), 1, -1 do
+    local item = instance._installed_mappings[index]
+    pcall(vim.keymap.del, item.mode, item.lhs, { buffer = instance.bufnr })
+  end
+  instance._installed_mappings = nil
+  instance._mapping_installed = nil
 end
 
 return M

@@ -1,4 +1,5 @@
 local fs = require("fre.fs")
+local gc = require("fre.gc")
 local mutation_fs = require("fre.mutation.fs")
 local inheritance = require("fre.inheritance")
 local Instance = require("fre.instance")
@@ -70,6 +71,15 @@ end
 
 function M._reset_watch_adapter()
   manager_module.default:set_watch_adapter(watch.default)
+end
+
+-- Internal deterministic clock/timer/scheduler seam for lifecycle tests.
+function M._set_gc_adapter(adapter)
+  manager_module.default:set_gc_adapter(adapter)
+end
+
+function M._reset_gc_adapter()
+  manager_module.default:set_gc_adapter(gc.default)
 end
 
 return M

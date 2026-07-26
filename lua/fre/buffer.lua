@@ -569,6 +569,12 @@ function M.setup(instance)
       vim.schedule(function() window.sync_visibility(instance) end)
     end,
   })
+  vim.api.nvim_create_autocmd("BufModifiedSet", {
+    group = instance._buffer_augroup, buffer = instance.bufnr,
+    callback = function()
+      if not instance._destroyed then instance.manager:gc_reconsider(instance, true) end
+    end,
+  })
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function() clamp_cursor(instance, false) end,

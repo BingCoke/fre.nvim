@@ -28,6 +28,9 @@ local function fail(message, level)
 end
 
 local function require_ready(instance)
+  if instance._destroyed or instance.state == "destroying" or instance.state == "destroyed" then
+    fail("instance is destroyed", 4)
+  end
   if instance.state == "creating" or instance.state == "load-failed" then
     fail("instance is not ready", 4)
   end
@@ -188,9 +191,6 @@ end
 
 function Instance:_schedule_callback(callback, err)
   vim.schedule(function()
-    if self._destroyed then
-      return
-    end
     self:_call_callback(callback, err)
   end)
 end
@@ -260,6 +260,7 @@ function Instance:_finish_initial(token, generation, err, children, real_root)
       inheritance.start(self)
     end
   end
+  self.manager:gc_visibility_changed(self)
   -- This function already runs on the main loop. Existing observers complete
   -- before FreReady so reentrant event handlers cannot suppress them.
   for _, callback in ipairs(callbacks) do
@@ -372,6 +373,7 @@ function Instance:_acquire_write_lock()
     token.released = true
     error(err, 0)
   end
+  self.manager:gc_reconsider(self, false)
   return token
 end
 
@@ -387,6 +389,7 @@ function Instance:_release_write_lock(token)
   if next(self.actions) == nil then self.actions = nil end
   if not ok then self:_report_async_error(err) end
   self:_schedule_watch_followup()
+  if not self._destroyed then self.manager:gc_reconsider(self, true) end
   return true
 end
 
@@ -507,8 +510,9 @@ function Instance:_schedule_watch_followup()
   if self._destroyed or not self.needs_refresh or self._watch_followup_scheduled then return end
   self._watch_followup_scheduled = true
   vim.schedule(function()
+    if self._destroyed then return end
     self._watch_followup_scheduled = false
-    if not self._destroyed and self.needs_refresh then self:_on_visibility_enter() end
+    if self.needs_refresh then self:_on_visibility_enter() end
   end)
 end
 
@@ -971,8 +975,8 @@ local function schedule_refresh_completion(instance, callback, err)
   vim.schedule(function()
     if callback then
       local ok, callback_err = pcall(callback, err)
-      if not ok then instance:_report_async_error(callback_err) end
-    elseif err ~= nil then
+      if not ok and not instance._destroyed then instance:_report_async_error(callback_err) end
+    elseif err ~= nil and not instance._destroyed then
       instance:_report_async_error(err)
     end
   end)
@@ -1426,7 +1430,8 @@ function Instance:refresh(opts)
 end
 
 function Instance:_on_visibility_enter()
-  if self._destroyed or not self:_is_visible() then return end
+  if self._destroyed then return end
+  if not self.manager:gc_visibility_changed(self) then return end
   if self.state == "ready-hidden" then self.state = "ready-visible" end
   if self.state ~= "ready-visible" or not self.needs_refresh
       or self._pending_visibility_refresh or self._refresh_request
@@ -1478,6 +1483,7 @@ function Instance:toggle(layout)
 end
 
 function Instance:prepare()
+  if self._destroyed then fail("instance is destroyed", 2) end
   if self.actions and self.actions.write then fail("instance is write-locked", 2) end
   return mutation_prepare.prepare(self)
 end
@@ -1496,9 +1502,11 @@ function Instance:_start_execution(plan, handlers)
   execution = mutation_execute.start(
     self, plan, handlers, self.manager:get_mutation_adapter(), function(completed)
       if self._execution == completed then self._execution = nil end
+      if not self._destroyed then self.manager:gc_reconsider(self, true) end
     end
   )
   self._execution = execution
+  self.manager:gc_reconsider(self, false)
   return execution
 end
 
@@ -1521,18 +1529,27 @@ function Instance:_execute_write(token, plan, handlers)
   return execution
 end
 
-function Instance:destroy()
-  if self._destroyed or self.state == "destroying" then
-    return nil
-  end
-  if self.actions and self.actions.write then fail("instance is write-locked", 2) end
-  if self._execution and not mutation_execute.is_terminal(self._execution) then
-    fail("cannot destroy an instance with an active execution", 2)
-  end
+function Instance:_start_destroy()
+  local manager = self.manager
   self.state = "destroying"
   self._destroyed = true
+  manager:get_gc_controller():stop(self)
+
   self._attempt = self._attempt + 1
   self._refresh_generation = self._refresh_generation + 1
+  self._watch_refresh_generation = self._watch_refresh_generation + 1
+  self._watch_event_generation = self._watch_event_generation + 1
+  self._tree_generation = self._tree_generation + 1
+  self._reveal_generation = self._reveal_generation + 1
+  if self._pending_reveal then self._pending_reveal.active = false end
+  self._pending_reveal = nil
+  self._pending_visibility_refresh = false
+
+  local ready_callbacks = self._ready_callbacks
+  self._ready_callbacks = {}
+  for _, callback in ipairs(ready_callbacks) do
+    self:_schedule_callback(callback, "instance was destroyed before becoming ready")
+  end
   if self._refresh_request then
     self:_finish_refresh_request(self._refresh_request, "instance was destroyed during refresh")
   end
@@ -1541,18 +1558,60 @@ function Instance:destroy()
       self._initial_refresh_request, "instance was destroyed during refresh"
     )
   end
-  self._reveal_generation = self._reveal_generation + 1
-  self._pending_reveal = nil
-  self:_cancel_pending_callbacks()
-  self:_cancel_watch_refresh()
-  self._watchers:stop_all()
-  buffer.teardown(self)
-  if vim.api.nvim_buf_is_valid(self.bufnr) then
-    vim.api.nvim_buf_delete(self.bufnr, { force = true })
+  if self._watch_refresh_request then self._watch_refresh_request.completed = true end
+  self._watch_refresh_request = nil
+  for _, node in pairs(self.nodes_by_id or {}) do
+    if node.kind == "directory" then
+      node.load_generation = (node.load_generation or 0) + 1
+      node._load_waiters = {}
+    end
   end
-  self.manager:remove(self)
+
+  if self._watchers then pcall(self._watchers.stop_all, self._watchers) end
+  pcall(buffer.teardown, self)
+  pcall(mapping.teardown, self)
+end
+
+function Instance:_finish_destroy()
+  local manager = self.manager
+  local bufnr = self.bufnr
+  local delete_error
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    local ok, err = pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+    if not ok then delete_error = err end
+  end
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
+      vim.cmd("noautocmd bwipeout!")
+    end)
+    if not ok then delete_error = err end
+  end
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    error("fre: failed to delete instance buffer: " .. tostring(delete_error), 2)
+  end
+
+  manager:remove(self)
+  local retained = { id = true, root = true, bufnr = true, state = true, _destroyed = true }
+  for key in pairs(self) do
+    if not retained[key] then self[key] = nil end
+  end
   self.state = "destroyed"
   return nil
+end
+
+function Instance:destroy()
+  if self.state ~= "destroying" and self.state ~= "destroyed" then
+    if self.actions and self.actions.write then fail("instance is write-locked", 2) end
+    if self._execution and not mutation_execute.is_terminal(self._execution) then
+      fail("cannot destroy an instance with an active execution", 2)
+    end
+  end
+  if self.state == "destroying" then return self:_finish_destroy() end
+  if self._destroyed or self.state == "destroyed" then
+    fail("instance is destroyed", 2)
+  end
+  self:_start_destroy()
+  return self:_finish_destroy()
 end
 
 function Instance.new(manager, root, effective, expansion)
@@ -1626,7 +1685,14 @@ function Instance.new(manager, root, effective, expansion)
     error(mapping_err, 0)
   end
   self:_set_lines({ self:_loading_line() })
-  manager:register(self)
+  local register_ok, register_err = pcall(manager.register, manager, self)
+  if not register_ok then
+    buffer.teardown(self)
+    mapping.teardown(self)
+    self._watchers:stop_all()
+    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+    error(register_err, 0)
+  end
   self:_start_load(true)
   return self
 end

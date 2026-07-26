@@ -414,6 +414,7 @@ function M.sync_visibility(instance)
   elseif not visible and instance.state == "ready-visible" then
     instance.state = "ready-hidden"
   end
+  if instance.manager then instance.manager:gc_visibility_changed(instance) end
   return visible
 end
 

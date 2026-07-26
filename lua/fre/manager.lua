@@ -1,4 +1,5 @@
 local config = require("fre.config")
+local gc = require("fre.gc")
 local fs = require("fre.fs")
 local mutation_fs = require("fre.mutation.fs")
 local watch = require("fre.watch")
@@ -27,7 +28,7 @@ function Manager.new()
   for name, capacity in next, defaults.gc.groups do
     groups[name] = new_group(capacity)
   end
-  return setmetatable({
+  local self = setmetatable({
     _next_id = 1,
     _consumed_ids = {},
     _setup_defaults = defaults,
@@ -39,6 +40,8 @@ function Manager.new()
     instances_by_buf = {},
     groups = groups,
   }, Manager)
+  self._gc = gc.new(self)
+  return self
 end
 
 function Manager:allocate_id()
@@ -100,6 +103,30 @@ function Manager:set_watch_adapter(adapter)
   self._watch_adapter = adapter
 end
 
+function Manager:get_gc_controller()
+  return self._gc
+end
+
+function Manager:set_gc_adapter(adapter)
+  self._gc:set_adapter(adapter)
+end
+
+function Manager:is_gc_eligible(instance)
+  return self._gc:is_eligible(instance)
+end
+
+function Manager:gc_visibility_changed(instance)
+  return self._gc:visibility_changed(instance)
+end
+
+function Manager:gc_reconsider(instance, deferred)
+  if deferred then
+    self._gc:defer_reconsider(instance)
+  else
+    self._gc:reconsider(instance)
+  end
+end
+
 function Manager:setup(opts)
   local first_setup = self._default_file_explorer == nil
   local candidate = config.resolve_setup(opts, not first_setup)
@@ -127,6 +154,7 @@ function Manager:setup(opts)
   if first_setup then
     self._default_file_explorer = candidate.default_file_explorer
   end
+  self._gc:enforce_all()
   return self:get_setup_defaults()
 end
 
@@ -168,6 +196,14 @@ function Manager:register(instance)
   self.instances_by_id[instance.id] = instance
   self.instances_by_buf[instance.bufnr] = instance
   group.instances[instance.id] = instance
+  local ok, err = pcall(self._gc.on_register, self._gc, instance)
+  if not ok then
+    self._gc:stop(instance)
+    self.instances_by_id[instance.id] = nil
+    self.instances_by_buf[instance.bufnr] = nil
+    group.instances[instance.id] = nil
+    error(err, 0)
+  end
   return instance
 end
 
@@ -199,6 +235,8 @@ function Manager:remove(instance_or_id)
   if not instance or self.instances_by_id[instance.id] ~= instance then
     return nil
   end
+
+  if not instance._destroyed then self._gc:stop(instance) end
 
   self.instances_by_id[instance.id] = nil
   for bufnr, indexed in next, self.instances_by_buf do
