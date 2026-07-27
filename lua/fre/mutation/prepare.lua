@@ -146,7 +146,7 @@ function M.prepare(instance)
   for row = 1, line_count do
     local decoded = buffer.decode(instance, row)
     if decoded.synthetic then
-      -- Navigation rows are display-only and never participate in filesystem plans.
+      -- Synthetic decoded rows never participate in filesystem plans.
     elseif decoded.marked then
       validate_kind(decoded.entry.kind, row, decoded.entry.relative_path)
       local absolute, relative = target_for_row(instance, row, decoded)

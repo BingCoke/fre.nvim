@@ -841,13 +841,12 @@ function Instance:get_pos(snapshot_path)
   if not node or not self.view or not self.view.baseline or self.view.baseline[node.id] == nil then
     return nil
   end
-  local marker = buffer.marker(self.id, node.id)
   local hint = buffer.hint_row(self, node)
-  if hint and buffer.row_has_marker(self, hint, marker) then
+  if hint and buffer.row_matches_identity(self, hint, self.id, node.id) then
     local decoded = buffer.decode(self, hint)
     return { hint, decoded.path_range.start_byte }
   end
-  local matches = buffer.find_marker_rows(self, marker)
+  local matches = buffer.find_identity_rows(self, self.id, node.id)
   if #matches == 0 then
     return nil
   end

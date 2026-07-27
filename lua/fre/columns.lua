@@ -68,6 +68,9 @@ local function validate_descriptor(descriptor, name)
   if not alignments[descriptor.align] then
     fail(name .. ".align must be left, center, or right", 4)
   end
+  if type(descriptor.navigable) ~= "boolean" then
+    fail(name .. ".navigable must be a boolean", 4)
+  end
   if type(descriptor.render) ~= "function" then
     fail(name .. ".render must be a function", 4)
   end
@@ -86,8 +89,8 @@ local function descriptor(opts, defaults)
   if type(opts) ~= "table" then opts = {} end
   local result = copy(opts)
   for key, value in pairs(defaults or {}) do
-    if key == "align" then
-      if result.align == nil then result.align = value end
+    if key == "align" or key == "navigable" then
+      if result[key] == nil then result[key] = value end
     else
       result[key] = value
     end
@@ -165,7 +168,7 @@ function M.icon(opts)
   if type(opts) ~= "table" then fail("icon options must be a table", 2) end
   local provider = resolve_icon_provider(opts.provider)
   return descriptor(opts, {
-    id = "icon", align = "left", metadata = { "kind" },
+    id = "icon", align = "left", navigable = false, metadata = { "kind" },
     render = function(entry, ctx) return icon_value(entry, provider, ctx) end,
     parse = function(suffix) return parse_token(suffix, "%S+", "icon") end,
     equals = function(entry, value, ctx)
@@ -219,7 +222,7 @@ function M.permissions(opts)
     return permission_text(metadata(ctx, "mode"))
   end
   return descriptor(opts, {
-    id = "permissions", align = "left", metadata = { "mode" },
+    id = "permissions", align = "left", navigable = true, metadata = { "mode" },
     render = function(_, ctx) return expected(ctx) end,
     parse = function(suffix, ctx)
       if ctx and ctx.synthetic then return parse_token(suffix, "%-", "permissions") end
@@ -245,7 +248,7 @@ end
 function M.size(opts)
   if opts ~= nil and type(opts) ~= "table" then fail("size options must be a table", 2) end
   return descriptor(opts, {
-    id = "size", align = "right", metadata = { "size" },
+    id = "size", align = "right", navigable = true, metadata = { "size" },
     render = function(_, ctx) return size_text(metadata(ctx, "size")) end,
     parse = function(suffix) return parse_token(suffix, "%S+", "size") end,
     equals = function(_, value, ctx)
@@ -267,6 +270,7 @@ function M.mtime(opts)
   local result = copy(opts)
   result.id = "mtime"
   result.align = result.align or "left"
+  if result.navigable == nil then result.navigable = true end
   result.format = format
   result.metadata = { "mtime" }
   result._fre_column = COLUMN_MARK
@@ -300,6 +304,7 @@ function M.custom(opts)
   local result = copy(opts)
   result._fre_column = COLUMN_MARK
   if result.align == nil then result.align = "left" end
+  if result.navigable == nil then result.navigable = true end
   return validate_descriptor(result, "custom descriptor")
 end
 
@@ -317,6 +322,16 @@ end
 
 function M.is_descriptor(value)
   return type(value) == "table" and value._fre_column == COLUMN_MARK
+end
+
+function M.align(text, width, actual_width, align)
+  local padding = width - actual_width
+  if align == "right" then return string.rep(" ", padding) .. text, padding end
+  if align == "center" then
+    local left = math.floor(padding / 2)
+    return string.rep(" ", left) .. text .. string.rep(" ", padding - left), left
+  end
+  return text .. string.rep(" ", padding), 0
 end
 
 function M.render_text(descriptor_value, entry, ctx)
