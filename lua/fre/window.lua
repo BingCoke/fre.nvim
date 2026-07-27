@@ -371,7 +371,7 @@ function M.apply_window_options(instance, winid)
   if not winid or not vim.api.nvim_win_is_valid(winid)
       or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return false end
   for key, value in pairs(instance.config.window.options or {}) do
-    vim.api.nvim_set_option_value(key, value, { win = winid })
+    vim.api.nvim_set_option_value(key, value, { scope = "local", win = winid })
   end
   return true
 end
@@ -386,7 +386,7 @@ end
 local function snapshot_window_options(instance, winid)
   local result = {}
   for key in pairs(instance.config.window.options or {}) do
-    result[key] = vim.api.nvim_get_option_value(key, { win = winid })
+    result[key] = vim.api.nvim_get_option_value(key, { scope = "local", win = winid })
   end
   return result
 end
@@ -394,7 +394,7 @@ end
 local function restore_window_options(winid, snapshot)
   if not vim.api.nvim_win_is_valid(winid) then return end
   for key, value in pairs(snapshot) do
-    pcall(vim.api.nvim_set_option_value, key, value, { win = winid })
+    pcall(vim.api.nvim_set_option_value, key, value, { scope = "local", win = winid })
   end
 end
 

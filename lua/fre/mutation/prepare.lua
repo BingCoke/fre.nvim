@@ -13,9 +13,12 @@ local function fail_row(row, message, level)
   fail("row " .. tostring(row) .. ": " .. message, level or 4)
 end
 
-local function validate_kind(kind, row)
+local function validate_kind(kind, row, snapshot_path)
   if supported_kinds[kind] then return end
   local message = "unsupported snapshot kind " .. tostring(kind)
+  if snapshot_path and snapshot_path ~= "" then
+    message = message .. " for " .. snapshot_path
+  end
   if row then fail_row(row, message) else fail(message) end
 end
 
@@ -133,13 +136,19 @@ function M.prepare(instance)
   local baseline = instance.view.baseline
   local ordered_baseline = baseline_order(instance)
   local windows = path.is_windows(instance.root)
+  local function path_key(value)
+    local normalized = path.normalize(value, { windows = windows })
+    return windows and normalized:lower() or normalized
+  end
   local occurrences, rows = {}, {}
   local line_count = vim.api.nvim_buf_line_count(instance.bufnr)
 
   for row = 1, line_count do
     local decoded = buffer.decode(instance, row)
-    if decoded.marked then
-      validate_kind(decoded.entry.kind, row)
+    if decoded.synthetic then
+      -- Navigation rows are display-only and never participate in filesystem plans.
+    elseif decoded.marked then
+      validate_kind(decoded.entry.kind, row, decoded.entry.relative_path)
       local absolute, relative = target_for_row(instance, row, decoded)
       local occurrence = {
         row = row, node_id = decoded.node_id, kind = decoded.entry.kind,
@@ -260,7 +269,7 @@ function M.prepare(instance)
   for _, id in ipairs(classification_order) do
     local node = instance.nodes_by_id[id]
     if node == nil then fail("projected baseline references missing local node " .. tostring(id), 3) end
-    validate_kind(node.kind)
+    validate_kind(node.kind, nil, node.path)
     local source = path.normalize(baseline[id], { windows = windows })
     local source_relative = assert(path.relative(instance.root, source))
     local found = sorted_occurrences(occurrences[id], windows)
@@ -386,6 +395,69 @@ function M.prepare(instance)
     end
   end
 
+  local function vacancy_for(node)
+    local current = node
+    while current do
+      local intent = intents[current.id]
+      if intent and intent.vacancy then return intent.vacancy end
+      current = current.parent
+    end
+    return nil
+  end
+
+  local known_entries, known_nodes = {}, {}
+  for _, node in pairs(instance.nodes_by_id or {}) do
+    local key = path_key(node.path)
+    known_entries[key] = node.kind
+    known_nodes[key] = node
+  end
+
+  local target_producers = {}
+  for _, action in ipairs(actions) do
+    if action.to then
+      target_producers[path_key(action.to)] = action
+    end
+  end
+
+  for _, item in ipairs(rows) do
+    if item.new and item.action then
+      local components = {}
+      for component in item.target_relative:gmatch("[^/]+") do
+        components[#components + 1] = component
+      end
+      local parent_dependency
+      for depth = 1, #components - 1 do
+        local relative = table.concat(vim.list_slice(components, 1, depth), "/")
+        local absolute = path.resolve(instance.root, relative)
+        local key = path_key(absolute)
+        local existing_kind = known_entries[key]
+        local existing_node = known_nodes[key]
+        local producer = target_producers[key]
+        if producer and producer.kind ~= "directory" then
+          fail_row(item.row, "parent path " .. relative .. "/ is planned as " .. producer.kind)
+        end
+        local planned_vacancy = existing_node and vacancy_for(existing_node)
+        if not producer and (existing_kind ~= "directory" or planned_vacancy) then
+          producer = add_action({
+            type = "create_directory", to = absolute, to_relative = relative,
+            kind = "directory", row = item.row, implicit_parent = true,
+          }, item.row, absolute)
+          target_producers[key] = producer
+          known_entries[key] = "directory"
+        end
+        if producer then
+          if parent_dependency and producer ~= parent_dependency then
+            add_dependency(producer, parent_dependency, "target-container")
+          end
+          parent_dependency = producer
+        end
+      end
+      if parent_dependency and item.action ~= parent_dependency then
+        add_dependency(item.action, parent_dependency, "target-container")
+      end
+    end
+  end
+
   -- Targets inside a source subtree must be established before a whole-entry
   -- copy/move carries them. Targets inside a produced directory run afterwards.
   for _, action in ipairs(actions) do
@@ -394,10 +466,11 @@ function M.prepare(instance)
       for _, producer in ipairs(actions) do
         if producer ~= action
             and producer.kind == "directory"
-            and (producer.type == "copy" or producer.type == "move")
+            and (producer.type == "create_directory"
+              or producer.type == "copy" or producer.type == "move")
             and path.contains(producer.to, action.to) then
           has_target_container = true
-          break
+          add_dependency(action, producer, "target-container")
         end
       end
       for _, id in ipairs(classification_order) do
@@ -480,16 +553,6 @@ function M.prepare(instance)
     end
   end
 
-  local function vacancy_for(node)
-    local current = node
-    while current do
-      local intent = intents[current.id]
-      if intent and intent.vacancy then return intent.vacancy end
-      current = current.parent
-    end
-    return nil
-  end
-
   local snapshot = {}
   for _, id in ipairs(sorted_node_ids(instance.nodes_by_id)) do
     local node = instance.nodes_by_id[id]
@@ -543,8 +606,7 @@ function M.prepare(instance)
   })
 
   local function virtual_key(value)
-    local normalized = path.normalize(value, { windows = windows })
-    return windows and normalized:lower() or normalized
+    return path_key(value)
   end
 
   local virtual = {}

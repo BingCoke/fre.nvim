@@ -1,6 +1,7 @@
 local config = require("fre.config")
 local default_ui = require("fre.write_ui")
 local mapping = require("fre.mapping")
+local path = require("fre.path")
 local window = require("fre.window")
 
 local M = {}
@@ -49,6 +50,14 @@ local function entry_path(ctx)
   return entry_from(ctx).absolute_path
 end
 
+local function directory_action_target(ctx)
+  local instance = instance_from(ctx)
+  if ctx.entry == nil then return instance, nil end
+  local entry = entry_from(ctx)
+  if entry.kind ~= "directory" then return instance, nil end
+  return instance, entry.absolute_path
+end
+
 local function no_options(opts, name)
   exact_opts(opts, {}, name)
 end
@@ -59,6 +68,13 @@ local function validate_target(winid)
     fail("target window is not valid", 4)
   end
   return winid
+end
+
+local function navigation_target(ctx, instance)
+  if ctx.row_kind ~= "navigation" then return nil, false end
+  if ctx.source_instance_id and ctx.source_instance_id ~= instance.id then return nil, true end
+  if ctx.navigation_kind == "root" then return nil, true end
+  return path.parent(instance.root), true
 end
 
 local function child_options(instance, overrides, root)
@@ -151,22 +167,30 @@ end
 
 function M.expand(ctx, opts)
   no_options(opts, "expand")
-  return instance_from(ctx):expand(entry_path(ctx))
+  local instance, target = directory_action_target(ctx)
+  if not target then return nil end
+  return instance:expand(target)
 end
 
 function M.collapse(ctx, opts)
   no_options(opts, "collapse")
-  return instance_from(ctx):collapse(entry_path(ctx))
+  local instance, target = directory_action_target(ctx)
+  if not target then return nil end
+  return instance:collapse(target)
 end
 
 function M.toggle_expand(ctx, opts)
   no_options(opts, "toggle_expand")
-  return instance_from(ctx):toggle_expand(entry_path(ctx))
+  local instance, target = directory_action_target(ctx)
+  if not target then return nil end
+  return instance:toggle_expand(target)
 end
 
 function M.reveal(ctx, opts)
   no_options(opts, "reveal")
-  return instance_from(ctx):reveal(entry_path(ctx))
+  local instance = instance_from(ctx)
+  if ctx.entry == nil then return nil end
+  return instance:reveal(entry_path(ctx))
 end
 
 function M.open(ctx, opts)
@@ -211,14 +235,17 @@ end
 
 function M.select(ctx, opts)
   local instance = instance_from(ctx)
-  local entry = entry_from(ctx)
   opts = exact_opts(opts, { target_winid = true, instance = true }, "select")
   local target = validate_target(opts.target_winid or ctx.winid)
-  local prepared = child_options(instance, opts.instance, entry.absolute_path)
-  if entry.kind ~= "directory" then
+  local root, navigation = navigation_target(ctx, instance)
+  if navigation and not root then return nil end
+  local entry = navigation and nil or entry_from(ctx)
+  if entry and entry.kind ~= "directory" then
+    child_options(instance, opts.instance, entry.absolute_path)
     return replace_with_file(instance, target, entry.absolute_path)
   end
 
+  local prepared = child_options(instance, opts.instance, root or entry.absolute_path)
   local child = require("fre").new(prepared)
   local ok, err = pcall(window.replace, child, target)
   if not ok then
@@ -232,10 +259,12 @@ end
 
 function M.tab_select(ctx, opts)
   local instance = instance_from(ctx)
-  local entry = entry_from(ctx)
   opts = exact_opts(opts, { instance = true }, "tab_select")
   validate_target(ctx.winid)
-  local prepared = child_options(instance, opts.instance, entry.absolute_path)
+  local root, navigation = navigation_target(ctx, instance)
+  if navigation and not root then return nil end
+  local entry = navigation and nil or entry_from(ctx)
+  local prepared = child_options(instance, opts.instance, root or entry.absolute_path)
   local caller_tab = vim.api.nvim_get_current_tabpage()
   local caller_win = vim.api.nvim_get_current_win()
   local tabs_before = snapshot_tabs()
@@ -246,7 +275,7 @@ function M.tab_select(ctx, opts)
   local ok, result = pcall(function()
     vim.cmd("tabnew")
     local target = vim.api.nvim_get_current_win()
-    if entry.kind == "directory" then
+    if navigation or entry.kind == "directory" then
       child = require("fre").new(prepared)
       window.replace(child, target)
       child:_on_visibility_enter()
@@ -267,13 +296,15 @@ end
 
 function M.split_select(ctx, opts)
   local instance = instance_from(ctx)
-  local entry = entry_from(ctx)
   opts = exact_opts(opts, { layout = true, instance = true }, "split_select")
   validate_target(ctx.winid)
   if opts.layout == nil then fail("split_select.layout is required", 3) end
-  local prepared = child_options(instance, opts.instance, entry.absolute_path)
+  local root, navigation = navigation_target(ctx, instance)
+  if navigation and not root then return nil end
+  local entry = navigation and nil or entry_from(ctx)
+  local prepared = child_options(instance, opts.instance, root or entry.absolute_path)
   window.prepare_split(opts.layout)
-  if entry.kind == "directory" then
+  if navigation or entry.kind == "directory" then
     local child = require("fre").new(prepared)
     local ok, err = pcall(child.open, child, config.copy(opts.layout))
     if not ok then

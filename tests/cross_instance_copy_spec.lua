@@ -80,10 +80,12 @@ local function assert_error(row, fragment, callback)
   return text
 end
 
-local function token_column(id, prefix)
+local function token_column(id, prefix, highlight)
   return columns.custom({
     id = id,
-    render = function(entry) return prefix .. entry.instance_id .. "-" .. entry.kind end,
+    render = function(entry)
+      return prefix .. entry.instance_id .. "-" .. entry.kind, highlight
+    end,
     parse = function(suffix)
       local value, rest = suffix:match("^ *(%S+) +(.*)$")
       return value, rest
@@ -188,7 +190,7 @@ describe("fre ticket 13 cross-instance copy", function()
 
   it("uses source descriptors, widths, Entry context, and semantic validation", function()
     local source_columns = {
-      token_column("source_kind", "SRC-"),
+      token_column("source_kind", "SRC-", "FreSourceKind"),
       token_column("source_again", "LONG-SOURCE-"),
     }
     local target_columns = { token_column("target_kind", "TARGET-") }
@@ -208,6 +210,22 @@ describe("fre ticket 13 cross-instance copy", function()
       decoded.fields[1].id, decoded.fields[2].id,
     })
     assert.are.equal(source.id, decoded.entry.instance_id)
+    local highlighted
+    wait_for(function()
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
+        target.bufnr, -1, 0, -1, { details = true }
+      )) do
+        if mark[2] == 1 and mark[4].hl_group == "FreSourceKind" then
+          highlighted = mark
+          return true
+        end
+      end
+      return false
+    end)
+    assert.are.equal(decoded.column_ranges[1].start_byte, highlighted[3])
+    assert.are.equal(
+      highlighted[3] + #decoded.column_values.source_kind, highlighted[4].end_col
+    )
     assert.are.same({
       {
         type = "copy", from = fixture:path("source", "a.txt"),

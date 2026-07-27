@@ -346,7 +346,7 @@ describe("fre ticket 10 prepare basic mutations", function()
 
     set_lines(instance, { original })
     instance.nodes_by_id[buffer.decode(instance, 1).node_id].kind = "other"
-    assert_error("row 1: unsupported snapshot kind other", function() instance:prepare() end)
+    assert_error("row 1: unsupported snapshot kind other for a.txt", function() instance:prepare() end)
   end)
 
   it("plans a foreign marker as a copy from its source snapshot", function()

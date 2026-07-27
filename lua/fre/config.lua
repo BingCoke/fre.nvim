@@ -53,6 +53,7 @@ local function builtins()
     columns = {
       columns.icon(),
       columns.permissions(),
+      columns.size(),
       columns.mtime({ format = "%Y-%m-%d %H:%M" }),
     },
     gc = {

@@ -1,3 +1,4 @@
+local buffer = require("fre.buffer")
 local manager_module = require("fre.manager")
 
 local M = {}
@@ -47,6 +48,7 @@ function M.context(expected_instance)
   local cursor = vim.api.nvim_win_get_cursor(winid)
   local mode = vim.api.nvim_get_mode().mode
   local row, col = cursor[1], cursor[2]
+  local decoded = buffer.decode(instance, row)
   return {
     instance = instance,
     bufnr = bufnr,
@@ -55,7 +57,10 @@ function M.context(expected_instance)
     mode = mode,
     row = row,
     col = col,
-    entry = instance:get_entry(row),
+    row_kind = decoded and decoded.row_kind or nil,
+    navigation_kind = decoded and decoded.navigation_kind or nil,
+    source_instance_id = decoded and decoded.source_instance_id or nil,
+    entry = decoded and decoded.entry or nil,
     range = visual_range(mode, row, col),
   }
 end

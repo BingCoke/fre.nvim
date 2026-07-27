@@ -143,10 +143,185 @@ describe("fre metadata buffer rows", function()
     assert.are.equal("LEFT MID RIGHT bbbbb.txt", second_suffix)
   end)
 
-  it("keeps physical columns and concealed identity in ordinary yanks", function()
-    local instance = ready({ ["a.txt"] = "x" })
-    instance:open()
+  it("keeps exact provider highlights through copy move delete undo and redo", function()
+    vim.api.nvim_set_hl(0, "FreTestIcon", { fg = "#ff3366" })
+    local glyph = ""
+    local icon = columns.icon({
+      provider = function() return glyph, "FreTestIcon" end,
+    })
+    local instance = ready({ ["a.txt"] = "x" }, { columns = { icon } })
+    instance:open({ position = "current" })
+
+    local function icon_marks()
+      local result = {}
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
+        instance.bufnr, -1, 0, -1, { details = true }
+      )) do
+        if mark[4].hl_group == "FreTestIcon" then result[#result + 1] = mark end
+      end
+      table.sort(result, function(left, right) return left[2] < right[2] end)
+      return result
+    end
+
+    local function assert_icon_marks(expected)
+      assert.is_true(vim.wait(1000, function()
+        local marks = icon_marks()
+        if #marks ~= expected then return false end
+        for row, mark in ipairs(marks) do
+          if mark[2] ~= row - 1 or mark[4].end_col <= mark[3] then return false end
+        end
+        return true
+      end, 10), vim.inspect(icon_marks()))
+      return icon_marks()
+    end
+
+    assert_icon_marks(1)
     vim.api.nvim_win_set_cursor(0, { 1, buffer.decode(instance, 1).visible_range.start_byte })
+    vim.cmd.normal({ args = { "yyp" }, bang = true })
+    assert.are.equal(2, #lines(instance))
+    local marks = assert_icon_marks(2)
+    for row, mark in ipairs(marks) do
+      local decoded = buffer.decode(instance, row)
+      assert.are.equal(decoded.column_ranges[1].start_byte, mark[3])
+      assert.are.equal(decoded.column_ranges[1].start_byte + #glyph, mark[4].end_col)
+    end
+
+    vim.api.nvim_win_set_cursor(0, { 2, buffer.decode(instance, 2).visible_range.start_byte })
+    vim.cmd.normal({ args = { "yyp" }, bang = true })
+    assert.are.equal(3, #lines(instance))
+    assert_icon_marks(3)
+
+    local copied = buffer.decode(instance, 2)
+    set_line(instance, 2, lines(instance)[2]:sub(1, copied.path_range.start_byte) .. "copy.lua")
+    assert_icon_marks(3)
+    for _ = 1, 3 do
+      vim.api.nvim_win_set_cursor(
+        0, { 2, buffer.decode(instance, 2).visible_range.start_byte }
+      )
+      vim.cmd.normal({ args = { "ddp" }, bang = true })
+    end
+    assert_icon_marks(3)
+
+    vim.api.nvim_win_set_cursor(0, { 3, 0 })
+    vim.cmd.normal({ args = { "dd" }, bang = true })
+    assert.are.equal(2, #lines(instance))
+    assert_icon_marks(2)
+  end)
+
+  it("redecorates EOF deletions through undo and redo", function()
+    local icon = columns.icon({
+      provider = function() return "X", "FreTestIcon" end,
+    })
+    local instance = ready({
+      ["a.txt"] = "a", ["b.txt"] = "b", ["c.txt"] = "c", ["d.txt"] = "d",
+    }, { columns = { icon } })
+    instance:open({ position = "current" })
+
+    local function highlight_marks()
+      local result = {}
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
+        instance.bufnr, -1, 0, -1, { details = true }
+      )) do
+        if mark[4].hl_group == "FreTestIcon" then result[#result + 1] = mark end
+      end
+      return result
+    end
+
+    local function assert_highlights(expected)
+      assert.is_true(vim.wait(1000, function()
+        local marks = highlight_marks()
+        if #marks ~= expected then return false end
+        for _, mark in ipairs(marks) do
+          if mark[4].end_col <= mark[3] then return false end
+        end
+        return true
+      end, 10), vim.inspect(highlight_marks()))
+    end
+
+    assert_highlights(4)
+    vim.api.nvim_win_set_cursor(0, { 4, 0 })
+    vim.api.nvim_feedkeys("dd", "xt", false)
+    assert.are.equal(3, #lines(instance))
+    assert_highlights(3)
+    vim.cmd("silent undo")
+    assert.are.equal(4, #lines(instance))
+    assert_highlights(4)
+    vim.cmd("silent redo")
+    assert.are.equal(3, #lines(instance))
+    assert_highlights(3)
+    vim.cmd("silent undo")
+    assert_highlights(4)
+
+    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    vim.api.nvim_feedkeys("dG", "xt", false)
+    assert.are.equal(1, #lines(instance))
+    assert_highlights(1)
+    vim.cmd("silent undo")
+    assert.are.equal(4, #lines(instance))
+    assert_highlights(4)
+    vim.cmd("silent redo")
+    assert.are.equal(1, #lines(instance))
+    assert_highlights(1)
+  end)
+
+  it("rolls back lines view and highlights when decoration commit fails", function()
+    local icon = columns.icon({
+      provider = function() return "X", "FreTestIcon" end,
+    })
+    local instance = ready({ ["a.txt"] = "x" }, { columns = { icon } })
+    local before_lines = lines(instance)
+    local before_view = instance.view
+
+    local function highlight_state()
+      local result = {}
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
+        instance.bufnr, -1, 0, -1, { details = true }
+      )) do
+        local details = mark[4]
+        if details.hl_group == "FreTestIcon" then
+          result[#result + 1] = {
+            row = mark[2], col = mark[3], end_col = details.end_col,
+            hl_group = details.hl_group, priority = details.priority,
+          }
+        end
+      end
+      return result
+    end
+
+    local before_highlights = highlight_state()
+    local prepared = buffer.prepare(instance, instance.view.projection)
+    local original_set_extmark = vim.api.nvim_buf_set_extmark
+    local injected = false
+    vim.api.nvim_buf_set_extmark = function(bufnr, namespace, row, col, opts)
+      if not injected and opts and opts.hl_group == "FreTestIcon" then
+        injected = true
+        error("injected highlight commit failure")
+      end
+      return original_set_extmark(bufnr, namespace, row, col, opts)
+    end
+
+    local test_ok, test_err = xpcall(function()
+      local commit_ok, commit_err = pcall(buffer.commit, instance, prepared)
+      assert.is_false(commit_ok)
+      assert.is_truthy(tostring(commit_err):find(
+        "injected highlight commit failure", 1, true
+      ))
+    end, debug.traceback)
+    vim.api.nvim_buf_set_extmark = original_set_extmark
+    if not test_ok then error(test_err) end
+
+    assert.is_true(injected)
+    assert.are.same(before_lines, lines(instance))
+    assert.are.equal(before_view, instance.view)
+    assert.are.same(before_highlights, highlight_state())
+  end)
+
+  it("conceals physical identity on screen while preserving it in ordinary yanks", function()
+    local instance = ready({ ["a.txt"] = "x" })
+    instance:open({ position = "current" })
+    local decoded = buffer.decode(instance, 1)
+    local marker = buffer.marker(instance.id, decoded.entry.node_id)
+    vim.api.nvim_win_set_cursor(0, { 1, decoded.visible_range.start_byte })
     vim.cmd.normal({ args = { "yy" }, bang = true })
     local yanked = vim.fn.getreg('"')
     local physical = lines(instance)[1]
@@ -154,6 +329,20 @@ describe("fre metadata buffer rows", function()
     assert.are.equal(string.char(31), yanked:sub(1, 1))
     assert.is_truthy(yanked:find(" f ", 1, true) or yanked:find("\31f "))
     assert.is_truthy(yanked:find("a.txt", 1, true))
+
+    assert.are.equal(3, vim.wo.conceallevel)
+    assert.are.equal("nvic", vim.wo.concealcursor)
+    for column = 1, #marker do
+      assert.are.equal(1, vim.fn.synconcealed(1, column)[1], "marker byte " .. column)
+    end
+    vim.api.nvim__redraw({ flush = true })
+    local screen = {}
+    for column = 1, vim.api.nvim_win_get_width(0) do
+      screen[#screen + 1] = vim.fn.screenstring(1, column)
+    end
+    local visible = table.concat(screen)
+    assert.is_nil(visible:find("fre:", 1, true))
+    assert.is_truthy(visible:find("a.txt", 1, true), visible)
   end)
 
   it("accepts layout whitespace but rejects semantic metadata and kind suffix changes", function()

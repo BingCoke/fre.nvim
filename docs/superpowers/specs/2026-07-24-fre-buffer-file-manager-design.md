@@ -39,7 +39,7 @@ Fre must provide:
 7. Best-effort cancellation of active mutation work, with reconciliation owned by the default write workflow.
 8. Correct move scheduling, including cycles such as `a -> b` and `b -> a`.
 9. Local filesystem watching for root and active expanded directories.
-10. Instance GC by hidden TTL and per-group maximum instance count.
+10. Instance GC by hidden TTL and per-group capacity over GC-considered hidden instances.
 11. New-instance inheritance of expansion state, current sort function, and hidden-file state.
 12. Window primitives supporting left, right, top, bottom, and floating layouts.
 13. Function-based actions and function-based buffer-local mappings.
@@ -124,7 +124,7 @@ A single-use handle returned by `instance:execute()`. It exposes cancellation an
 12. `execute(plan)` trusts caller data, performs supplied operations in order, and owns no presentation or reconciliation.
 13. `actions.write` owns readiness, locking, confirmation, progress presentation, and filesystem reconciliation.
 14. Directory actions remain one Plan operation; move is exactly one rename with no implicit fallback.
-15. Automatic GC protects visible and modified instances; explicit destruction may force-discard when execution is terminal.
+15. Automatic GC first builds an eligible hidden-instance set: visible, write-locked, and nonterminal-execution instances are ignored, and modified instances are ignored unless their effective GC policy sets `include_modified = true`; explicit destruction may force-discard when execution is terminal.
 16. Neovim's actual windows are the source of truth for instance visibility.
 17. Filesystem conflicts and partial effects surface naturally during execution; Fre does not roll them back.
 
@@ -273,6 +273,7 @@ require("fre").setup({
 
   gc = {
     ttl_ms = 60_000,
+    include_modified = false,
     default_group = "default",
     groups = {
       default = 10,
@@ -326,6 +327,7 @@ local instance = require("fre").new({
 
   gc = {
     ttl_ms = 10_000,
+    include_modified = true,
     group = "project",
   },
 
@@ -346,13 +348,13 @@ Configuration merging is field-specific:
 - Scalar and function fields replace the inherited value.
 - `columns` and every other sequence replace wholesale.
 - `mapping`, `buffer.options`, `buffer.variables`, `window.options`, and other named maps merge by key. User `mapping` mode tables merge by mode and LHS across setup and then new; they never contain the separate built-in mapping base.
-- Nested records merge only at these explicitly listed record fields: `gc.ttl_ms`, `gc.default_group`, `gc.groups`, `gc.group`, `layout.position`, `layout.size`, `layout.width`, `layout.height`, `layout.row`, `layout.col`, and `layout.border`. No generic recursive deep merge is used.
+- Nested records merge only at these explicitly listed record fields: `gc.ttl_ms`, `gc.include_modified`, `gc.default_group`, `gc.groups`, `gc.group`, `layout.position`, `layout.size`, `layout.width`, `layout.height`, `layout.row`, `layout.col`, and `layout.border`. No generic recursive deep merge is used.
 - `setup.gc.groups` is the Manager-owned map from group name to capacity. `new.gc.group` selects one group, and `setup.gc.default_group` supplies the omitted instance group.
-- Effective instance configuration stores only `gc = { ttl_ms, group }`. `setup.gc.groups` is forbidden in `new()`, and group capacity cannot otherwise be overridden per instance.
+- Effective instance configuration stores only `gc = { ttl_ms, include_modified, group }`. `setup.gc.groups` is forbidden in `new()`, and group capacity cannot otherwise be overridden per instance. `setup.gc.include_modified` supplies the default and `new.gc.include_modified` may override it for that instance.
 - Effective `use_mapping_default` is the final setup/new boolean. Effective `mapping` contains only the snapshotted user override maps. Buffer mapping installation derives a separate installed map exactly once: start from the internal built-in base only when that boolean is true, then overlay the user maps by mode and LHS. When false, install only the user maps.
 - `default_file_explorer` is a setup-only Manager boolean and is forbidden in `new()`. It never appears in effective instance configuration.
 
-The first `setup(opts)` starts from the exact built-ins in Section 8, applies the rules above, validates the result, atomically stores defaults for future instances, and permanently records the effective `default_file_explorer` value for this Neovim process. Every later `setup(opts)` silently discards its `default_file_explorer` field before validation and retains the first value; all other fields still reset from exact built-ins. Before committing, Manager rejects any candidate `gc.groups` map that omits a group referenced by a live instance. A valid setup atomically replaces future-instance defaults and capacities, then enforces capacity once while protecting visible and modified instances. Existing instances retain their snapshotted effective configurations.
+The first `setup(opts)` starts from the exact built-ins in Section 8, applies the rules above, validates the result, atomically stores defaults for future instances, and permanently records the effective `default_file_explorer` value for this Neovim process. Every later `setup(opts)` silently discards its `default_file_explorer` field before validation and retains the first value; all other fields still reset from exact built-ins. Before committing, Manager rejects any candidate `gc.groups` map that omits a group referenced by a live instance. A valid setup atomically replaces future-instance defaults and capacities, then enforces capacity once against the filtered GC-considered population using each live instance's snapshotted `gc.include_modified` policy. Existing instances retain their snapshotted effective configurations.
 
 `new(opts)` starts from the current setup defaults, applies the same field-specific rules, resolves the new-only `root` and `inherit` fields, validates the result, and snapshots the effective configuration. It rejects `default_file_explorer` as a setup-only field. `instance.config.mapping` therefore exposes only copied user override maps, never installed built-ins. Mutable setup or caller tables are never shared with the instance, buffer mappings, or later setup/new calls.
 
@@ -376,7 +378,7 @@ Expansion is copied from the predecessor using the path-based inheritance algori
 
 The following are not inherited from the predecessor:
 
-- GC TTL or group.
+- GC TTL, modified-instance inclusion policy, or group.
 - Columns.
 - Mappings.
 - Buffer options or extra variables.
@@ -451,7 +453,7 @@ The `load-failed -> creating` transition is an explicit `instance:refresh()` ret
 9. Start the asynchronous initial load, which resolves `real_root`, requires that it exists as a directory, and only then lists and watches it.
 10. Begin expansion-state restoration when a predecessor exists.
 11. Treat the instance as hidden until a window displays the buffer.
-12. Enforce group capacity after registration while excluding this newly registering instance from that pass.
+12. Enforce group capacity after registration, counting this newly registering instance when it otherwise passes the GC filter but excluding it from destruction selection during that pass.
 
 The constructor returns before asynchronous real-root resolution and root loading finish. The buffer displays a non-protocol loading row while creating. Success commits the first projection and baseline, transitions to ready-hidden or ready-visible, calls current `when_ready` observers with `nil`, and emits `User FreReady`.
 
@@ -459,7 +461,7 @@ Failure displays a non-protocol error row, transitions to `load-failed`, calls o
 
 ### Destroying
 
-`destroy()` is the single cleanup path used by explicit destruction, TTL GC, and group-capacity GC. Its first precondition is that this instance has no active Execution in any nonterminal state. If that precondition fails, `destroy()` synchronously raises a direct Vim error and changes nothing: it does not terminalize the Execution, defer destruction, pin GC, or create detached state. Automatic GC also filters visible and modified instances before calling this path.
+`destroy()` is the single cleanup path used by explicit destruction, TTL GC, and group-capacity GC. Its first precondition is that this instance has no active Execution in any nonterminal state and no active write lock. If either precondition fails, `destroy()` synchronously raises a direct Vim error and changes nothing: it does not terminalize the Execution, release the lock, defer destruction, pin GC, or create detached state. Automatic GC applies its shared eligibility filter before calling this path, so ignored instances never reach `destroy()`.
 
 When the precondition passes, destruction performs:
 
@@ -803,7 +805,7 @@ Consequences:
 - Custom render/parse/equality behavior must be deterministic and satisfy the progress-making literal-suffix contract.
 - Custom columns can use node metadata and instance context.
 
-The built-in icon column uses generic Fre icons by entry kind. Users who want extension-specific icons can implement a custom column using any icon provider.
+The built-in icon column defaults to the `auto` provider: it uses `nvim-web-devicons` when available and otherwise falls back to generic `d/f/l` icons by entry kind. Callers can force ASCII, require `nvim-web-devicons`, disable provider lookup, or supply a deterministic provider function; provider output is still ordinary read-only column text with optional extmark highlighting.
 
 ## 17. Hidden-file State
 
@@ -956,7 +958,7 @@ Inheritance is a creation-time snapshot. Later expand/collapse operations in eit
 
 ## 21. Modified-buffer and Execution Interaction Policy
 
-The editable buffer is the only unsaved draft. While `modified` is true, expand, collapse, toggle-expand, `refresh()` without force, sort, hidden-file/filter changes, and reveal that would change projection fail. `instance:refresh({ force = true })`, window operations, selection of existing snapshot entries, `get_entry`, `get_pos`, explicit force-discard destroy, and `prepare()` remain available. Automatic GC is not available for a modified instance.
+The editable buffer is the only unsaved draft. While `modified` is true, expand, collapse, toggle-expand, `refresh()` without force, sort, hidden-file/filter changes, and reveal that would change projection fail. `instance:refresh({ force = true })`, window operations, selection of existing snapshot entries, `get_entry`, `get_pos`, explicit force-discard destroy, and `prepare()` remain available. Automatic GC ignores a modified instance before TTL and capacity evaluation unless its effective `gc.include_modified` is `true`; a write-locked instance is always ignored.
 
 `actions.write` requires a normally editable buffer. Before prepare it snapshots only the prior `modifiable` value, makes the buffer nonmodifiable, and owns the write lock through confirmation, execution, reconciliation, and unlock. During that lock, text edits, another write, projection changes, refresh, destroy, and another Execution are rejected; navigation, lookup, window operations, and selection remain available.
 
@@ -1254,28 +1256,29 @@ Directory reads may finish concurrently, but buffer mutations are queued per ins
 
 ## 28. Garbage Collection
 
-GC has two independent policies: hidden TTL per instance and maximum live instances per configured group. Existing configuration shapes and zero-disable semantics remain unchanged.
+GC has two independent policies: hidden TTL per instance and per-group capacity over GC-considered hidden instances. Both policies use one eligibility filter before evaluating TTL or capacity: visible, write-locked, and nonterminal-execution instances are ignored; a modified instance is ignored when its effective `gc.include_modified` is `false`. Ignored instances do not contribute to the capacity count. `gc.include_modified` defaults to `false`, and the existing zero-disable semantics remain unchanged.
 
 ### Visibility
 
 An instance is visible when `vim.fn.win_findbuf(instance.bufnr)` returns at least one valid window. Manager stores no visibility index. When the first window appears, Fre clears `hidden_since` and invalidates the TTL deadline. When the last window disappears, it records `hidden_since`, schedules TTL when enabled, and enforces group capacity.
 
-A never-opened instance starts hidden. The instance being registered is excluded from its own creation-time capacity candidate set, so `new()` cannot destroy the object it is returning. If all older candidates are visible or modified, temporary overflow is allowed and capacity is reconsidered on the next ordinary trigger.
+A never-opened instance starts hidden. During its creation-time capacity pass, the newly registering instance contributes to the filtered capacity count when it otherwise passes the eligibility filter, but it is excluded from destruction selection. If the count exceeds capacity, Manager destroys the oldest older eligible instance, so `new()` cannot destroy the object it is returning and no deferred overflow state is required.
 
 ### TTL and group capacity
 
 - `ttl_ms > 0` attempts automatic destruction after that continuous hidden duration; zero disables TTL.
-- `setup.gc.groups[name] > 0` caps the group; zero disables capacity GC.
-- Showing an instance resets its hidden interval.
-- Capacity selects the oldest eligible hidden instance by `hidden_since`, with creation sequence as the deterministic tie-breaker.
-- Visible, modified, newly registering, and nonterminal-execution instances are not automatic GC candidates.
+- `setup.gc.groups[name] > 0` caps the number of GC-considered hidden instances retained in that group; zero disables capacity GC.
+- `gc.include_modified = false` removes a modified instance before both TTL evaluation and capacity counting. `true` leaves it in the filtered population when every other eligibility rule passes and therefore permits automatic force-discard of its unsaved text.
+- Showing an instance resets its hidden interval and removes it from the GC-considered population.
+- Capacity rebuilds the filtered population, then destroys the oldest eligible instance by `hidden_since`, with creation sequence as the deterministic tie-breaker, until the filtered count is at or below capacity.
+- A newly registering instance is protected only from selection during its own creation-time pass; it still participates in that pass's filtered count when otherwise eligible.
 - TTL and capacity are independent; both zero means manual lifetime.
 
 An unknown group passed to `new()` is a configuration error. A repeated `setup()` that omits or changes away a group still referenced by any live instance is rejected atomically; defaults and capacity maps remain unchanged. Existing groups can be removed after their last instance is destroyed.
 
 ### Modified buffers and explicit destruction
 
-Automatic TTL and capacity GC never discard a modified buffer. It drops that candidate and considers the next eligible hidden instance for capacity. Explicit `destroy()` remains a force-discard operation when no Execution is active. Any destruction attempt during a nonterminal Execution fails without changing the instance.
+With the default `gc.include_modified = false`, a modified instance is ignored completely by automatic TTL and capacity GC: it neither contributes to the capacity count nor becomes a destruction candidate. When an instance's effective value is `true`, a hidden modified instance participates normally in both policies when it is not write-locked and has no nonterminal Execution; automatic destruction force-discards its unsaved text. Explicit `destroy()` remains a force-discard operation regardless of this option when no Execution or write lock is active. Any destruction attempt during a nonterminal Execution or active write lock fails without changing the instance.
 
 ## 29. User Extension Through Buffer Data
 
@@ -1345,7 +1348,7 @@ The source instance and node must remain live until prepare resolves them. Once 
 
 ### New rows, shadowing, and conflicts
 
-Unmarked rows ending in `/` produce `create_directory`; other unmarked rows produce empty `create_file`. A directory action always remains one Plan operation. Prepare never expands a directory into descendant operations.
+Unmarked rows ending in `/` produce `create_directory`; other unmarked rows produce empty `create_file`. For a nested unmarked target, prepare emits deduplicated `create_directory` operations for missing lexical ancestors and orders them before the leaf create. These ancestors are visible Plan operations, not executor-side `mkdir -p`. A directory action always remains one Plan operation, and prepare never expands a directory into descendant-content operations.
 
 A parent directory delete shadows redundant descendant deletes and unchanged descendants whose final result remains in that subtree. Descendant moves or copies preserving data outside it remain explicit and are ordered first.
 
@@ -1574,8 +1577,8 @@ Tests prioritize the normal end-to-end buffer file-manager workflow. Temporary r
 - Root and expanded-node events use their directory refresh boundaries; collapse releases watchers and re-expansion recreates them.
 - Modified/hidden/locked events set rather than lose `needs_refresh`; stale load generations cannot patch the buffer.
 - TTL and capacity zero-disable semantics remain independent.
-- Visible and modified instances are protected from automatic GC.
-- A newly registered hidden instance cannot evict itself; temporary overflow resolves on a later eligible trigger.
+- The shared GC filter removes visible, write-locked, and nonterminal-execution instances before capacity counting; it also removes modified instances by default and includes them only with `gc.include_modified = true`.
+- A newly registered hidden instance participates in the filtered count but cannot evict itself; when collection is required, the oldest older eligible instance is removed in the same pass.
 - Repeated setup atomically rejects removal of a group used by a live instance.
 - Explicit destroy may discard modified text but cannot collide with a nonterminal Execution.
 
@@ -1598,7 +1601,7 @@ The design is implemented successfully when all of the following are observable:
 13. Parse/confirmation cancellation preserves the draft; after execution starts, successful reconciliation replaces it with filesystem truth after every terminal outcome.
 14. Reconciliation failure reports directly, unlocks, leaves `needs_refresh`, and permits recovery through `instance:refresh({ force = true })`.
 15. Public `refresh()` defaults to non-force and rejects modified text; `refresh({ force = true })` explicitly discards it without prompting after atomic success. Both synchronously reject creating, destroying, destroyed, and write-locked instances; load-failed refresh retries initial loading; optional `on_complete(err)` observes async completion exactly once. Watcher events retain a pending refresh signal instead of being lost.
-16. Automatic GC protects visible and modified instances, cannot self-evict a new instance, and repeated setup cannot orphan a live GC group.
+16. Automatic GC computes TTL and capacity only from its filtered hidden-instance population, ignores modified instances unless their effective `gc.include_modified` is true, cannot self-evict a new instance, and repeated setup cannot orphan a live GC group.
 17. Default prepare emits normalized root-contained targets, while direct caller Plans are explicitly trusted and receive no execute-time root sandbox.
 18. Actual filesystem, watcher, refresh, configuration, and handler failures surface under the documented error rules.
 
@@ -1613,7 +1616,7 @@ This design intentionally accepts:
 - Whole-directory filesystem primitives may have partial effects, while Plan and progress expose only the one directory operation.
 - Once default write execution begins, successful reconciliation discards the stale draft even after failure or cancellation.
 - Reconciliation can fail; `needs_refresh` plus public `instance:refresh({ force = true })` is the recovery path rather than a transaction or merge system.
-- Automatic GC may exceed capacity temporarily to protect visible, modified, or newly registering instances.
+- Group capacity limits only the filtered GC-considered hidden-instance population; visible, write-locked, nonterminal-execution, and ignored modified instances do not count toward it.
 - Real columns and `vim.trim()` make alignment and boundary whitespace normalization part of successful write behavior.
 - Stable markers are not automatically repaired; damaged identities can become errors or explicit delete-plus-create intent.
 - Cross-instance copy requires the source to remain live only until prepare resolves its absolute path.

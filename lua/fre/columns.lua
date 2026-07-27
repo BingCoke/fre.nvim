@@ -1,7 +1,7 @@
 local M = {}
 
 local COLUMN_MARK = "fre-column-v1"
-local supported_metadata = { kind = true, mode = true, mtime = true }
+local supported_metadata = { kind = true, mode = true, size = true, mtime = true }
 local alignments = { left = true, center = true, right = true }
 
 local function fail(message, level)
@@ -100,10 +100,56 @@ local function metadata(ctx, field)
   return ctx and ctx.metadata and ctx.metadata[field]
 end
 
-local function icon_value(kind)
-  -- Keep the default protocol ASCII and font-independent while retaining a
-  -- distinct, stable marker for each supported filesystem kind.
-  return ({ directory = "d", file = "f", symlink = "l" })[kind] or "?"
+local ascii_icons = { directory = "d", file = "f", symlink = "l" }
+local nerd_icons = { directory = "", symlink = "" }
+
+local function devicons_provider(devicons)
+  return function(entry)
+    if nerd_icons[entry.kind] then
+      return nerd_icons[entry.kind],
+        entry.kind == "directory" and "FreDirectoryIcon" or "FreSymlinkIcon"
+    end
+    if entry.kind ~= "file" then return "?", "FreUnsupportedIcon" end
+    local icon, highlight = devicons.get_icon(entry.name, nil, {
+      default = true,
+      strict = true,
+    })
+    return icon or "", highlight or "FreFileIcon"
+  end
+end
+
+local function resolve_icon_provider(value)
+  if value == false or value == "ascii" then return nil end
+  if type(value) == "function" then return value end
+  if value ~= nil and value ~= "auto" and value ~= "nvim-web-devicons" then
+    fail("icon.provider must be auto, ascii, nvim-web-devicons, false, or a function", 4)
+  end
+  local ok, devicons = pcall(require, "nvim-web-devicons")
+  if ok and type(devicons) == "table" and type(devicons.get_icon) == "function" then
+    return devicons_provider(devicons)
+  end
+  if value == "nvim-web-devicons" then
+    fail("icon.provider nvim-web-devicons is unavailable", 4)
+  end
+  return nil
+end
+
+local function icon_value(entry, provider, ctx)
+  if provider then
+    local icon, highlight = provider(entry, ctx)
+    if icon ~= nil then
+      if type(icon) ~= "string" or icon == "" then
+        error("icon provider must return a non-empty string or nil")
+      end
+      if highlight ~= nil and type(highlight) ~= "string" then
+        error("icon provider highlight must be a string or nil")
+      end
+      return icon, highlight
+    end
+  end
+  local icon = ascii_icons[entry.kind]
+  if icon then return icon end
+  return "?", "FreUnsupportedIcon"
 end
 
 local function parse_token(input, pattern, label)
@@ -115,12 +161,17 @@ local function parse_token(input, pattern, label)
 end
 
 function M.icon(opts)
-  if opts ~= nil and type(opts) ~= "table" then fail("icon options must be a table", 2) end
+  if opts == nil then opts = {} end
+  if type(opts) ~= "table" then fail("icon options must be a table", 2) end
+  local provider = resolve_icon_provider(opts.provider)
   return descriptor(opts, {
     id = "icon", align = "left", metadata = { "kind" },
-    render = function(entry) return icon_value(entry.kind) end,
-    parse = function(suffix) return parse_token(suffix, "[dfl?]", "icon") end,
-    equals = function(entry, value) return value == icon_value(entry.kind) end,
+    render = function(entry, ctx) return icon_value(entry, provider, ctx) end,
+    parse = function(suffix) return parse_token(suffix, "%S+", "icon") end,
+    equals = function(entry, value, ctx)
+      local expected = icon_value(entry, provider, ctx)
+      return value == expected
+    end,
   })
 end
 
@@ -163,16 +214,42 @@ end
 
 function M.permissions(opts)
   if opts ~= nil and type(opts) ~= "table" then fail("permissions options must be a table", 2) end
+  local function expected(ctx)
+    if ctx and ctx.synthetic then return "-" end
+    return permission_text(metadata(ctx, "mode"))
+  end
   return descriptor(opts, {
     id = "permissions", align = "left", metadata = { "mode" },
-    render = function(_, ctx) return permission_text(metadata(ctx, "mode")) end,
-    parse = function(suffix)
+    render = function(_, ctx) return expected(ctx) end,
+    parse = function(suffix, ctx)
+      if ctx and ctx.synthetic then return parse_token(suffix, "%-", "permissions") end
       local value, rest = parse_token(suffix, "[rwxstST%-][rwxstST%-][rwxstST%-][rwxstST%-][rwxstST%-][rwxstST%-][rwxstST%-][rwxstST%-][rwxstST%-]", "permissions")
       if not permission_mode(value) then error("invalid permissions column") end
       return value, rest
     end,
     equals = function(_, value, ctx)
-      return permission_mode(value) == (tonumber(metadata(ctx, "mode")) or 0) % 4096
+      return value == expected(ctx)
+    end,
+  })
+end
+
+local function size_text(value)
+  local size = tonumber(value)
+  if size == nil then return "-" end
+  if size < 1000 then return tostring(math.floor(size)) end
+  if size < 1000000 then return string.format("%.1fk", size / 1000) end
+  if size < 1000000000 then return string.format("%.1fM", size / 1000000) end
+  return string.format("%.1fG", size / 1000000000)
+end
+
+function M.size(opts)
+  if opts ~= nil and type(opts) ~= "table" then fail("size options must be a table", 2) end
+  return descriptor(opts, {
+    id = "size", align = "right", metadata = { "size" },
+    render = function(_, ctx) return size_text(metadata(ctx, "size")) end,
+    parse = function(suffix) return parse_token(suffix, "%S+", "size") end,
+    equals = function(_, value, ctx)
+      return value == size_text(metadata(ctx, "size"))
     end,
   })
 end
@@ -193,23 +270,27 @@ function M.mtime(opts)
   result.format = format
   result.metadata = { "mtime" }
   result._fre_column = COLUMN_MARK
-  result.render = function(_, ctx)
+  local function expected(ctx)
+    if ctx and ctx.synthetic then return "-" end
     return os.date(ctx.descriptor.format, mtime_seconds(metadata(ctx, "mtime")))
   end
+  result.render = function(_, ctx)
+    return expected(ctx)
+  end
   result.parse = function(suffix, ctx)
-    local expected = os.date(ctx.descriptor.format, mtime_seconds(metadata(ctx, "mtime")))
+    local rendered = expected(ctx)
     local leading = suffix:match("^( *)") or ""
     local start = #leading + 1
-    local value = suffix:sub(start, start + #expected - 1)
-    local separator = suffix:sub(start + #expected):match("^( +)")
-    if value == "" or #value ~= #expected or not separator then
+    local value = suffix:sub(start, start + #rendered - 1)
+    local separator = suffix:sub(start + #rendered):match("^( +)")
+    if value == "" or #value ~= #rendered or not separator then
       error("malformed mtime column")
     end
-    local consumed = #leading + #expected + #separator
+    local consumed = #leading + #rendered + #separator
     return value, suffix:sub(consumed + 1)
   end
   result.equals = function(_, value, ctx)
-    return value == os.date(ctx.descriptor.format, mtime_seconds(metadata(ctx, "mtime")))
+    return value == expected(ctx)
   end
   return validate_descriptor(result)
 end

@@ -46,7 +46,7 @@ describe("fre columns", function()
 
   it("renders, parses, and compares built-in semantic values", function()
     for kind, expected in pairs({ directory = "d", file = "f", symlink = "l" }) do
-      local descriptor = columns.icon()
+      local descriptor = columns.icon({ provider = false })
       local kind_entry = vim.tbl_extend("force", {}, entry, { kind = kind })
       local ctx = context(descriptor, kind_entry, { kind = kind })
       local text = descriptor.render(kind_entry, ctx)
@@ -56,6 +56,18 @@ describe("fre columns", function()
       assert.are.equal("path", remaining)
       assert.is_true(descriptor.equals(kind_entry, value, ctx))
       assert.is_false(descriptor.equals(kind_entry, kind == "file" and "d" or "f", ctx))
+    end
+
+    local unsupported = vim.tbl_extend("force", {}, entry, { kind = "char" })
+    for _, descriptor in ipairs({
+      columns.icon({ provider = false }),
+      columns.icon({ provider = function() return nil end }),
+    }) do
+      local icon, highlight = descriptor.render(
+        unsupported, context(descriptor, unsupported, { kind = "char" })
+      )
+      assert.are.equal("?", icon)
+      assert.are.equal("FreUnsupportedIcon", highlight)
     end
 
     local permissions = columns.permissions()
@@ -77,6 +89,52 @@ describe("fre columns", function()
     assert.are.equal("path", mtime_rest)
     assert.is_true(mtime.equals(entry, mtime_value, mtime_ctx))
     assert.is_false(mtime.equals(entry, rendered:gsub("^.", "9"), mtime_ctx))
+  end)
+
+  it("uses nvim-web-devicons with directory and symlink glyphs", function()
+    local previous_loaded = package.loaded["nvim-web-devicons"]
+    local previous_preload = package.preload["nvim-web-devicons"]
+    local calls = 0
+    package.loaded["nvim-web-devicons"] = nil
+    package.preload["nvim-web-devicons"] = function()
+      return {
+        get_icon = function(name, extension, opts)
+          calls = calls + 1
+          assert.are.equal("init.lua", name)
+          assert.is_nil(extension)
+          assert.are.same({ default = true, strict = true }, opts)
+          return "", "DevIconLua"
+        end,
+      }
+    end
+
+    local ok, err = xpcall(function()
+      local descriptor = columns.icon({ provider = "nvim-web-devicons" })
+      local cases = {
+        { kind = "file", name = "init.lua", icon = "", highlight = "DevIconLua" },
+        { kind = "directory", name = "lua", icon = "", highlight = "FreDirectoryIcon" },
+        { kind = "symlink", name = "init-link", icon = "", highlight = "FreSymlinkIcon" },
+        { kind = "char", name = "device", icon = "?", highlight = "FreUnsupportedIcon" },
+      }
+      for _, case in ipairs(cases) do
+        local icon_entry = vim.tbl_extend("force", {}, entry, {
+          kind = case.kind, name = case.name,
+        })
+        local ctx = context(descriptor, icon_entry, { kind = case.kind })
+        local icon, highlight = descriptor.render(icon_entry, ctx)
+        assert.are.equal(case.icon, icon)
+        assert.are.equal(case.highlight, highlight)
+        local value, remaining = descriptor.parse(" " .. icon .. "  path", ctx)
+        assert.are.equal(icon, value)
+        assert.are.equal("path", remaining)
+        assert.is_true(descriptor.equals(icon_entry, value, ctx))
+      end
+      assert.are.equal(2, calls)
+    end, debug.traceback)
+
+    package.loaded["nvim-web-devicons"] = previous_loaded
+    package.preload["nvim-web-devicons"] = previous_preload
+    if not ok then error(err) end
   end)
 
   it("validates custom identities, alignment, metadata, and callbacks", function()
@@ -127,6 +185,7 @@ describe("fre columns", function()
       columns.validate({ { id = "raw" } })
     end)
     error_contains("icon options must be a table", function() columns.icon("bad") end)
+    error_contains("icon.provider", function() columns.icon({ provider = 42 }) end)
     error_contains("permissions options must be a table", function() columns.permissions("bad") end)
     error_contains("mtime.format must be a non-empty string", function()
       columns.mtime({ format = "" })

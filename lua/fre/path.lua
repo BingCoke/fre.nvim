@@ -365,6 +365,18 @@ local function parent_and_name(path)
   return M.normalize(parent), name
 end
 
+function M.parent(path)
+  check_string(path)
+  local normalized = M.normalize(path)
+  if not M.is_absolute(normalized) then
+    fail("path must be absolute")
+  end
+  local parsed = parse_normalized(normalized)
+  if #parsed.components == 0 then return nil end
+  local parent = parent_and_name(normalized)
+  return parent
+end
+
 local function is_occupied(candidate, occupied)
   if occupied == nil then
     return false

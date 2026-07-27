@@ -81,6 +81,7 @@ function Instance:_column_context(node, entry, descriptor, index, is_last)
     metadata = {
       kind = node.kind,
       mode = tonumber(node.mode) or 0,
+      size = node.stat and tonumber(node.stat.size) or nil,
       mtime = mtime,
     },
   }
