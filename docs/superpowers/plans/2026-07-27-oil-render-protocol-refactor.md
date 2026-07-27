@@ -18,6 +18,7 @@
 - Node ID zero is the only navigation sentinel; real instance and node IDs remain positive.
 - One render uses one width snapshot, so every canonical row in that projection has an equal marker length.
 - Identity is an internal structural field; configured custom columns support dynamic text and `left`, `center`, or `right` projection alignment; path remains the unbounded final field.
+- Projection column widths may grow or shrink. Cursor restoration must preserve the same field content position rather than a raw byte/display column or an offset into alignment padding.
 - Initial display, parent navigation, and reveal anchor at path start. Later Normal, Visual, and Insert movement may enter navigable visible metadata but never the concealed identity or leading non-navigable icon.
 - Read-only metadata changes are rejected at write preparation, not while the user is moving or typing.
 - Do not overwrite a modified buffer to migrate marker width.
@@ -239,9 +240,10 @@ Second pass:
 - format the unified marker;
 - call `columns.align()` for each retained chunk;
 - join one-space separators and final path;
-- derive highlights and per-identity templates from the final bytes;
+- derive highlights and per-identity row templates from the final bytes;
+- record each aligned field's physical range, exact rendered-content range, leading padding, trailing padding, and separator range in that row template;
 - use template key `0` for navigation instead of a separate navigation template table;
-- retain `marker_widths`, `marker_generation`, `column_widths`, `row_offset = 1`, baseline, projection, and visible nodes in the prepared result.
+- retain `marker_widths`, `marker_generation`, `column_widths`, `row_templates`, `row_offset = 1`, baseline, projection, and visible nodes in the prepared result.
 
 - [ ] **Step 5: Implement the inverse streaming parser**
 
@@ -254,6 +256,7 @@ Record each field as:
   id = descriptor.id,
   value = value,
   range = { start_byte = ..., end_byte = ... },
+  content_range = { start_byte = ..., end_byte = ... },
   separator_range = { start_byte = ..., end_byte = ... },
   navigable = descriptor.navigable,
   align = descriptor.align,
@@ -261,7 +264,7 @@ Record each field as:
 }
 ```
 
-Set `navigable_range.start_byte` to the first navigable configured field, or path start when every descriptor is non-navigable. Set its end to path end.
+For canonical marked rows, source `content_range` from the identity's prepared row template after verifying that its physical field range matches the parsed field range. This preserves intentional content versus alignment padding without re-running render callbacks. If no matching template exists (for example, a hand-edited malformed row), fall back to the parsed physical range. Set `navigable_range.start_byte` to the first navigable configured field, or path start when every descriptor is non-navigable. Set its end to path end.
 
 - [ ] **Step 6: Reduce `buffer.lua` to integration wrappers**
 
@@ -389,19 +392,23 @@ git commit -m "fix: route navigation by row semantics"
 
 **Interfaces:**
 - Consumes: decoded `fields`, `path_range`, and `navigable_range` from Task 2.
-- Produces: `row.cursor_anchor(decoded, col) -> { field_id, display_offset }`.
-- Produces: `row.cursor_column(decoded, anchor) -> byte_col`.
+- Produces: `row.cursor_anchor(decoded, col) -> { field_id, zone, display_offset }`.
+- Produces: `row.cursor_column(decoded, anchor) -> byte_col`, preserving content-relative position across column growth and shrinkage.
 - Produces: `buffer.place_initial_cursor(instance, winid) -> boolean`.
 - Produces: `buffer.constrain_cursor(instance, winid) -> nil` using the first navigable field, not path-only enforcement.
 
 - [ ] **Step 1: Add semantic cursor anchor helpers to `row.lua`**
 
-Map a byte column to descriptor ID or `path`, plus display-cell offset from that field's physical start. Map the anchor back by scanning UTF-8 byte boundaries until the requested display-cell offset is reached. Padding belongs to its field. Separators map to the nearest preceding navigable field end.
+Map a byte column to descriptor ID or `path`, a zone (`content`, `leading_padding`, or `trailing_padding`), and a display-cell offset. For `content`, measure from `content_range.start_byte`; for leading padding, measure backward from content start; for trailing padding, measure forward from content end. Separators map to the nearest preceding navigable field's content end.
+
+Map the anchor back through the new row template by scanning UTF-8 byte boundaries. This is required for projection widths that grow or shrink: a cursor on a right- or center-aligned value must remain on the same content character even when leading padding changes.
 
 Fallbacks are deterministic:
 
 - missing descriptor after reconfiguration -> path start;
-- offset wider than the new field -> field end;
+- content offset wider than the new rendered content -> content end;
+- vanished leading/trailing padding -> nearest content boundary;
+- row template unavailable -> physical field range with a clamped offset;
 - undecodable row -> raw row/column fallback owned by buffer.
 
 - [ ] **Step 2: Capture and restore semantic positions in buffer commits**
@@ -653,8 +660,9 @@ Use the current working tree in a real Neovim session and verify these exact int
 5. Editing a read-only metadata token is allowed as draft text and `:write` reports the row/column metadata error.
 6. `<CR>` on `../` opens the lexical parent; `<CR>` on `/` is a no-op.
 7. A custom dynamic-width column aligns left, center, and right according to its descriptor while initial cursor remains at path.
-8. Creating enough IDs to grow a field width changes clean projections uniformly; a modified buffer retains its old marker bytes until its next successful write/refresh.
-9. Leaving Fre for a normal file restores prior window-local options.
+8. With the cursor on a metadata content character, adding/removing a wider row grows/shrinks the projection column without moving the cursor into padding or onto another content character.
+9. Creating enough IDs to grow a field width changes clean projections uniformly; a modified buffer retains its old marker bytes until its next successful write/refresh.
+10. Leaving Fre for a normal file restores prior window-local options.
 
 Record exact failures before changing code; do not layer additional fixes without tracing them back to the responsible task boundary.
 
