@@ -1,10 +1,7 @@
 local fs = require("fre.fs")
 local gc = require("fre.gc")
 local mutation_fs = require("fre.mutation.fs")
-local inheritance = require("fre.inheritance")
-local Instance = require("fre.instance")
 local manager_module = require("fre.manager")
-local path = require("fre.path")
 local watch = require("fre.watch")
 
 local M = {}
@@ -14,24 +11,7 @@ function M.setup(opts)
 end
 
 function M.new(opts)
-  if type(opts) ~= "table" then
-    error("fre: new options must be a table", 2)
-  end
-  if opts.root == nil then
-    error("fre: root is required", 2)
-  end
-  if type(opts.root) ~= "string" then
-    error("fre: root must be a string", 2)
-  end
-  if opts.root == "" then
-    error("fre: root must not be empty", 2)
-  end
-
-  local root = path.absolute(opts.root)
-  local snapshot = inheritance.snapshot(opts.inherit)
-  local expansion = snapshot and inheritance.compile(snapshot, root) or nil
-  local effective = manager_module.default:resolve_instance_config(opts, opts.inherit)
-  return Instance.new(manager_module.default, root, effective, expansion)
+  return manager_module.default:create_instance(opts)
 end
 
 function M.get_instance(bufnr)

@@ -61,6 +61,7 @@ function Tree.new(instance, root_path)
     children_order = {},
   }
   self.root = root
+  instance.manager:observe_node_id(root.id)
   instance._next_node_id = 1
   instance.root_node = root
   instance.nodes_by_id = { [root.id] = root }
@@ -118,7 +119,9 @@ end
 
 function Tree:_allocate_id()
   self.instance._next_node_id = self.instance._next_node_id + 1
-  return self.instance._next_node_id
+  local id = self.instance._next_node_id
+  self.instance.manager:observe_node_id(id)
+  return id
 end
 
 function Tree:_new_node(parent, entry)

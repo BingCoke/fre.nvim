@@ -16,6 +16,10 @@ local function positive_integer(value)
   return type(value) == "number" and value > 0 and value % 1 == 0
 end
 
+local function decimal_width(id)
+  return #tostring(id)
+end
+
 local function new_group(capacity)
   return {
     capacity = capacity,
@@ -33,6 +37,8 @@ function Manager.new(opts)
   local self = setmetatable({
     _next_id = 1,
     _consumed_ids = {},
+    _marker_widths = { instance = 3, node = 3, generation = 1 },
+    _marker_width_refresh_scheduled = false,
     _setup_defaults = defaults,
     _default_file_explorer = nil,
     _fs_adapter = fs.default,
@@ -49,10 +55,74 @@ function Manager.new(opts)
   return self
 end
 
+function Manager:_schedule_marker_width_refresh()
+  if self._marker_width_refresh_scheduled then return end
+  self._marker_width_refresh_scheduled = true
+  vim.schedule(function()
+    self._marker_width_refresh_scheduled = false
+    local generation = self._marker_widths.generation
+    for _, instance in pairs(self.instances_by_id) do
+      if type(instance._on_marker_width_changed) == "function" then
+        local ok, err = pcall(instance._on_marker_width_changed, instance, generation)
+        if not ok and type(instance._report_async_error) == "function" then
+          pcall(instance._report_async_error, instance, err)
+        end
+      end
+    end
+  end)
+end
+
+function Manager:_observe_marker_id(field, id)
+  if type(id) ~= "number" or id < 0 or id % 1 ~= 0 then
+    fail(field .. " marker ID must be a non-negative integer")
+  end
+  local width = math.max(3, decimal_width(id))
+  if width <= self._marker_widths[field] then return false end
+  self._marker_widths[field] = width
+  self._marker_widths.generation = self._marker_widths.generation + 1
+  self:_schedule_marker_width_refresh()
+  return true
+end
+
 function Manager:allocate_id()
   local id = self._next_id
   self._next_id = id + 1
+  self:_observe_marker_id("instance", id)
   return id
+end
+
+function Manager:observe_node_id(id)
+  return self:_observe_marker_id("node", id)
+end
+
+function Manager:get_marker_widths()
+  return {
+    instance = self._marker_widths.instance,
+    node = self._marker_widths.node,
+    generation = self._marker_widths.generation,
+  }
+end
+
+function Manager:create_instance(opts)
+  if type(opts) ~= "table" then
+    error("fre: new options must be a table", 2)
+  end
+  if opts.root == nil then
+    error("fre: root is required", 2)
+  end
+  if type(opts.root) ~= "string" then
+    error("fre: root must be a string", 2)
+  end
+  if opts.root == "" then
+    error("fre: root must not be empty", 2)
+  end
+
+  local root = require("fre.path").absolute(opts.root)
+  local inheritance = require("fre.inheritance")
+  local snapshot = inheritance.snapshot(opts.inherit)
+  local expansion = snapshot and inheritance.compile(snapshot, root) or nil
+  local effective = self:resolve_instance_config(opts, opts.inherit)
+  return require("fre.instance").new(self, root, effective, expansion)
 end
 
 function Manager:get_setup_defaults()

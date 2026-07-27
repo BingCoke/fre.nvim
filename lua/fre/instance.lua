@@ -1723,12 +1723,14 @@ function Instance.new(manager, root, effective, expansion)
     self._execution = nil
     self._reveal_generation = 0
     self._pending_reveal = nil
+    self._marker_width_stale = false
+    self._pending_initial_cursor = {}
     self._inheritance_trie = expansion
     self._last_layout_by_tab = {}
     self._next_node_id = 1
     self.nodes_by_id = {}
     self.nodes_by_path = {}
-    self.view = { baseline = {} }
+    self.view = { baseline = {}, marker_generation = 0 }
     self.needs_refresh = false
 
     vim.api.nvim_buf_set_name(bufnr, "fre://" .. tostring(self.id))

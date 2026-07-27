@@ -8,8 +8,7 @@ local Takeover = {}
 Takeover.__index = Takeover
 
 local function create_instance(manager, root)
-  local effective = manager:resolve_instance_config({ root = root }, nil)
-  return require("fre.instance").new(manager, root, effective, nil)
+  return manager:create_instance({ root = root })
 end
 
 local function replace_window(instance, winid)
