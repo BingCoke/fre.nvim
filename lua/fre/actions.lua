@@ -70,11 +70,18 @@ local function validate_target(winid)
   return winid
 end
 
-local function navigation_target(ctx, instance)
-  if ctx.row_kind ~= "navigation" then return nil, false end
-  if ctx.source_instance_id and ctx.source_instance_id ~= instance.id then return nil, true end
-  if ctx.navigation_kind == "root" then return nil, true end
-  return path.parent(instance.root), true
+local function selection_target(ctx, instance)
+  if ctx.row_kind == "navigation" then
+    if ctx.source_instance_id ~= instance.id or ctx.navigation_kind == "root" then
+      return { kind = "noop" }
+    end
+    return { kind = "directory", root = assert(path.parent(instance.root)) }
+  end
+  local entry = entry_from(ctx)
+  if entry.kind == "directory" then
+    return { kind = "directory", root = entry.absolute_path, entry = entry }
+  end
+  return { kind = "file", path = entry.absolute_path, entry = entry }
 end
 
 local function child_options(instance, overrides, root)
@@ -85,7 +92,6 @@ local function child_options(instance, overrides, root)
   local result = config.copy(overrides)
   result.root = root
   result.inherit = instance
-  instance.manager:resolve_instance_config(result, instance)
   return result
 end
 
@@ -236,18 +242,16 @@ end
 function M.select(ctx, opts)
   local instance = instance_from(ctx)
   opts = exact_opts(opts, { target_winid = true, instance = true }, "select")
-  local target = validate_target(opts.target_winid or ctx.winid)
-  local root, navigation = navigation_target(ctx, instance)
-  if navigation and not root then return nil end
-  local entry = navigation and nil or entry_from(ctx)
-  if entry and entry.kind ~= "directory" then
-    child_options(instance, opts.instance, entry.absolute_path)
-    return replace_with_file(instance, target, entry.absolute_path)
+  local target_winid = validate_target(opts.target_winid or ctx.winid)
+  local target = selection_target(ctx, instance)
+  if target.kind == "noop" then return nil end
+  if target.kind == "file" then
+    return replace_with_file(instance, target_winid, target.path)
   end
 
-  local prepared = child_options(instance, opts.instance, root or entry.absolute_path)
-  local child = require("fre").new(prepared)
-  local ok, err = pcall(window.replace, child, target)
+  local prepared = child_options(instance, opts.instance, target.root)
+  local child = instance.manager:create_instance(prepared)
+  local ok, err = pcall(window.replace, child, target_winid)
   if not ok then
     pcall(child.destroy, child)
     error(err, 0)
@@ -261,28 +265,29 @@ function M.tab_select(ctx, opts)
   local instance = instance_from(ctx)
   opts = exact_opts(opts, { instance = true }, "tab_select")
   validate_target(ctx.winid)
-  local root, navigation = navigation_target(ctx, instance)
-  if navigation and not root then return nil end
-  local entry = navigation and nil or entry_from(ctx)
-  local prepared = child_options(instance, opts.instance, root or entry.absolute_path)
+  local target = selection_target(ctx, instance)
+  if target.kind == "noop" then return nil end
   local caller_tab = vim.api.nvim_get_current_tabpage()
   local caller_win = vim.api.nvim_get_current_win()
   local tabs_before = snapshot_tabs()
   local buffers_before = snapshot_buffers()
   local child
+  if target.kind == "directory" then
+    local prepared = child_options(instance, opts.instance, target.root)
+    child = instance.manager:create_instance(prepared)
+  end
   local file_bufnr
   local file_created
   local ok, result = pcall(function()
     vim.cmd("tabnew")
-    local target = vim.api.nvim_get_current_win()
-    if navigation or entry.kind == "directory" then
-      child = require("fre").new(prepared)
-      window.replace(child, target)
+    local target_winid = vim.api.nvim_get_current_win()
+    if child then
+      window.replace(child, target_winid)
       child:_on_visibility_enter()
       return child
     end
-    file_bufnr, file_created = file_buffer(entry.absolute_path)
-    vim.api.nvim_win_set_buf(target, file_bufnr)
+    file_bufnr, file_created = file_buffer(target.path)
+    vim.api.nvim_win_set_buf(target_winid, file_bufnr)
     return file_bufnr
   end)
   if not ok then
@@ -299,13 +304,12 @@ function M.split_select(ctx, opts)
   opts = exact_opts(opts, { layout = true, instance = true }, "split_select")
   validate_target(ctx.winid)
   if opts.layout == nil then fail("split_select.layout is required", 3) end
-  local root, navigation = navigation_target(ctx, instance)
-  if navigation and not root then return nil end
-  local entry = navigation and nil or entry_from(ctx)
-  local prepared = child_options(instance, opts.instance, root or entry.absolute_path)
+  local target = selection_target(ctx, instance)
+  if target.kind == "noop" then return nil end
   window.prepare_split(opts.layout)
-  if navigation or entry.kind == "directory" then
-    local child = require("fre").new(prepared)
+  if target.kind == "directory" then
+    local prepared = child_options(instance, opts.instance, target.root)
+    local child = instance.manager:create_instance(prepared)
     local ok, err = pcall(child.open, child, config.copy(opts.layout))
     if not ok then
       pcall(child.destroy, child)
@@ -314,7 +318,7 @@ function M.split_select(ctx, opts)
     return child
   end
 
-  local bufnr, created = file_buffer(entry.absolute_path)
+  local bufnr, created = file_buffer(target.path)
   local ok, result = pcall(window.split_buffer, bufnr, config.copy(opts.layout))
   if not ok then
     cleanup_file_buffer(bufnr, created)

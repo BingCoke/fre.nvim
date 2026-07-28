@@ -34,14 +34,25 @@ end
 
 function M.context(expected_instance)
   local bufnr = vim.api.nvim_get_current_buf()
-  local instance = manager_module.default:find_by_buf(bufnr)
-  if not instance or instance._destroyed
-      or instance.state == "destroying" or instance.state == "destroyed"
-      or not vim.api.nvim_buf_is_valid(instance.bufnr) then
-    fail("current buffer is not a live Fre instance", 2)
-  end
-  if expected_instance ~= nil and instance ~= expected_instance then
-    fail("current buffer does not match the mapped Fre instance", 2)
+  local instance
+  if expected_instance ~= nil then
+    instance = expected_instance
+    if bufnr ~= instance.bufnr then
+      fail("current buffer does not match the mapped Fre instance", 2)
+    end
+    if instance._destroyed
+        or instance.state == "destroying" or instance.state == "destroyed"
+        or not vim.api.nvim_buf_is_valid(instance.bufnr)
+        or instance.manager:find_by_buf(bufnr) ~= instance then
+      fail("current buffer is not a live Fre instance", 2)
+    end
+  else
+    instance = manager_module.default:find_by_buf(bufnr)
+    if not instance or instance._destroyed
+        or instance.state == "destroying" or instance.state == "destroyed"
+        or not vim.api.nvim_buf_is_valid(instance.bufnr) then
+      fail("current buffer is not a live Fre instance", 2)
+    end
   end
 
   local winid = vim.api.nvim_get_current_win()
