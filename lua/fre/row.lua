@@ -148,8 +148,13 @@ local function navigation_callback_entry(source, navigation_kind)
   return entry
 end
 
-local function template_for(source, node_id)
-  local templates = source.view and source.view.row_templates
+local function active_layout(source, override)
+  if override and override.source_instance_id == source.id then return override end
+  return source.view
+end
+
+local function template_for(layout, node_id)
+  local templates = layout and layout.row_templates
   return templates and templates[node_id] or nil
 end
 
@@ -158,7 +163,7 @@ local function same_range(left, right)
     and left.end_byte == right.end_byte
 end
 
-local function display_width_boundary(row_number, descriptor, text, width)
+local function display_width_boundary(text, width)
   local boundary = 0
   local character_count = vim.fn.strchars(text)
   for character_index = 1, character_count do
@@ -166,11 +171,32 @@ local function display_width_boundary(row_number, descriptor, text, width)
     if vim.fn.strdisplaywidth(text:sub(1, candidate)) > width then break end
     boundary = candidate
   end
-  if vim.fn.strdisplaywidth(text:sub(1, boundary)) ~= width then
-    fail_row(row_number, "column " .. descriptor.id
-      .. " does not fill its projected display width")
-  end
+  if vim.fn.strdisplaywidth(text:sub(1, boundary)) ~= width then return nil end
   return boundary
+end
+
+local function resolve_layout(descriptors, suffix, marker_end, layout)
+  local widths = layout and layout.column_widths
+  if type(widths) ~= "table" then return nil end
+  local owned, consumed = {}, 0
+  for index, descriptor in ipairs(descriptors) do
+    local width = widths[index]
+    if type(width) ~= "number" or width < 0 then return nil end
+    local boundary = display_width_boundary(suffix:sub(consumed + 1), width)
+    if boundary == nil or suffix:sub(consumed + boundary + 1, consumed + boundary + 1) ~= " " then
+      return nil
+    end
+    local physical_start = marker_end + consumed
+    local physical_end = physical_start + boundary
+    owned[index] = {
+      chunk = suffix:sub(consumed + 1, consumed + boundary + 1),
+      physical_range = { start_byte = physical_start, end_byte = physical_end },
+      separator_range = { start_byte = physical_end, end_byte = physical_end + 1 },
+      width = width,
+    }
+    consumed = consumed + boundary + 1
+  end
+  return { fields = owned, consumed = consumed }
 end
 
 local function parse_columns(row_number, source, node, suffix, marker_end, opts)
@@ -183,17 +209,19 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
   else
     callback_entry = source:_entry(node)
   end
-  local template = template_for(source, opts.node_id)
+  local layout = active_layout(source, opts.layout_override)
+  local resolved = resolve_layout(descriptors, suffix, marker_end, layout)
+  local template = resolved and template_for(layout, opts.node_id) or nil
   local consumed = 0
-  local layout_consumed = 0
   local first_navigable
   for index, descriptor in ipairs(descriptors) do
-    local unconsumed = suffix:sub(consumed + 1)
+    local owned = resolved and resolved.fields[index]
+    local parser_input = owned and owned.chunk or suffix:sub(consumed + 1)
     local ctx = source:_column_context(
       node, callback_entry, descriptor, index, index == #descriptors
     )
     if navigation_kind then ctx = navigation_context(ctx, navigation_kind) end
-    local ok, value, remaining = pcall(descriptor.parse, unconsumed, ctx)
+    local ok, value, remaining = pcall(descriptor.parse, parser_input, ctx)
     if not ok then
       fail_row(row_number, "column " .. descriptor.id .. " parser failed: " .. tostring(value))
     end
@@ -203,46 +231,35 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
     if type(remaining) ~= "string" then
       fail_row(row_number, "column " .. descriptor.id .. " parser must return a suffix string")
     end
-    if #remaining >= #unconsumed then
+    if #remaining >= #parser_input then
       fail_row(row_number, "column " .. descriptor.id .. " parser made no progress")
     end
-    local amount = #unconsumed - #remaining
-    if unconsumed:sub(amount + 1) ~= remaining then
+    local amount = #parser_input - #remaining
+    if parser_input:sub(amount + 1) ~= remaining then
       fail_row(row_number, "column " .. descriptor.id .. " parser returned a non-literal suffix")
     end
-    local consumed_text = unconsumed:sub(1, amount)
+    if owned and remaining ~= "" then
+      fail_row(row_number, "column " .. descriptor.id
+        .. " parser did not consume its exact layout chunk")
+    end
+    local consumed_text = parser_input:sub(1, amount)
     local separator = consumed_text:match("( +)$")
     if not separator then
       fail_row(row_number, "column " .. descriptor.id .. " parser did not consume its separator")
     end
-    local parser_start = marker_end + consumed
+    local parser_start = owned and owned.physical_range.start_byte or marker_end + consumed
     local parser_end = parser_start + amount
     local field_range = { start_byte = parser_start, end_byte = parser_end }
-    local width = source.view and source.view.column_widths[index] or nil
     local physical_range
     local separator_range
-    if width ~= nil then
-      local physical_start = marker_end + layout_consumed
-      local boundary = display_width_boundary(
-        row_number, descriptor, suffix:sub(layout_consumed + 1), width
-      )
-      local physical_end = physical_start + boundary
-      if suffix:sub(layout_consumed + boundary + 1, layout_consumed + boundary + 1) ~= " " then
-        fail_row(row_number, "column " .. descriptor.id
-          .. " is missing its layout separator")
-      end
-      if parser_end < physical_end + 1 then
-        fail_row(row_number, "column " .. descriptor.id
-          .. " parser did not reach its layout separator")
-      end
-      physical_range = { start_byte = physical_start, end_byte = physical_end }
-      separator_range = { start_byte = physical_end, end_byte = physical_end + 1 }
-      layout_consumed = layout_consumed + boundary + 1
+    local width = layout and layout.column_widths and layout.column_widths[index] or nil
+    if owned then
+      physical_range = owned.physical_range
+      separator_range = owned.separator_range
     else
       local separator_start = parser_end - #separator
       physical_range = { start_byte = parser_start, end_byte = separator_start }
       separator_range = { start_byte = separator_start, end_byte = parser_end }
-      layout_consumed = consumed + amount
     end
     local template_field = template and template.fields and template.fields[index]
     local content_range = physical_range
@@ -282,13 +299,14 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
     end
     consumed = consumed + amount
   end
+  local path_consumed = resolved and resolved.consumed or consumed
   return {
     values = values,
     ranges = ranges,
     separators = separators,
     fields = fields,
-    path_suffix = suffix:sub(consumed + 1),
-    path_offset = marker_end + consumed,
+    path_suffix = suffix:sub(path_consumed + 1),
+    path_offset = marker_end + path_consumed,
     first_navigable = first_navigable,
   }
 end
@@ -352,6 +370,7 @@ function M.decode(instance, row_number, line, opts)
       navigation_kind = navigation_kind,
       node_id = decoded_marker.node_id,
       validate_metadata = opts.validate_metadata ~= false,
+      layout_override = opts.layout_override,
     }
   )
   local proposed_path, path_range = trim_range(parsed.path_suffix, parsed.path_offset)
@@ -545,8 +564,15 @@ function M.prepare(instance, projection, render_path, opts)
   end
 
   if opts.validate then
+    local validation_layout = {
+      source_instance_id = instance.id,
+      column_widths = widths,
+      row_templates = row_templates,
+    }
     for row_number, item in ipairs(rendered) do
-      local decoded = M.decode(instance, row_number, lines[row_number])
+      local decoded = M.decode(instance, row_number, lines[row_number], {
+        layout_override = validation_layout,
+      })
       if item.synthetic then
         if not decoded.synthetic or decoded.navigation_kind ~= item.navigation_kind
             or decoded.proposed_path ~= item.path then
