@@ -342,6 +342,9 @@ end
 
 local function set_metadata(instance, winid, layout, effective)
   local current = raw_metadata(instance, winid) or {}
+  if current.bufnr == instance.bufnr and current.option_transfer ~= nil then
+    fail("outgoing option pairing was not sanitized before layout commit", 3)
+  end
   vim.api.nvim_win_set_var(winid, metadata_name(instance), {
     bufnr = instance.bufnr,
     layout = copy(layout),
@@ -427,6 +430,13 @@ end
 local function transferred_option_owner(instance, winid)
   local owner, owner_metadata
   local source_name = metadata_name(instance)
+  local source_ok, source_identity = pcall(
+    vim.api.nvim_buf_get_var, instance.bufnr, "fre"
+  )
+  local exact_source_name = source_ok and type(source_identity) == "table"
+    and type(source_identity.instance_id) == "number"
+    and "fre_layout_" .. tostring(source_identity.instance_id) or nil
+  if exact_source_name ~= source_name then return nil end
   local variables = vim.api.nvim_win_call(winid, function()
     return vim.fn.getwinvar(0, "")
   end)
@@ -438,6 +448,9 @@ local function transferred_option_owner(instance, winid)
         and type(transfer) == "table"
         and transfer.source_bufnr == instance.bufnr
         and transfer.source_name == source_name
+        and transfer.pairing_winid == winid
+        and transfer.destination_bufnr == metadata.bufnr
+        and transfer.destination_name == name
         and vim.api.nvim_buf_is_valid(metadata.bufnr) then
       local ok, identity = pcall(vim.api.nvim_buf_get_var, metadata.bufnr, "fre")
       local exact_name = ok and type(identity) == "table"
@@ -466,20 +479,63 @@ local function snapshot_window_options(instance, winid, previous_options)
   return result
 end
 
-local function inherited_options(winid)
-  local _, metadata = option_owner(nil, winid)
-  return metadata and copy(metadata.previous_options) or nil
+local function inherited_option_owner(winid)
+  local owner, metadata = option_owner(nil, winid)
+  if not owner then return nil end
+  return {
+    previous_options = copy(metadata.previous_options),
+    source_bufnr = owner.bufnr,
+    source_name = owner.name,
+  }
 end
 
-function M.prepare(instance, winid, inherited_previous)
-  if not winid or not vim.api.nvim_win_is_valid(winid) then return false end
+local function validate_inherited_option_owner(winid, inherited_owner)
+  if type(inherited_owner) ~= "table"
+      or type(inherited_owner.previous_options) ~= "table"
+      or type(inherited_owner.source_bufnr) ~= "number"
+      or type(inherited_owner.source_name) ~= "string" then
+    fail("inherited option owner descriptor is malformed", 3)
+  end
+  if not winid or not vim.api.nvim_win_is_valid(winid)
+      or not vim.api.nvim_buf_is_valid(inherited_owner.source_bufnr)
+      or vim.api.nvim_win_get_buf(winid) ~= inherited_owner.source_bufnr then
+    fail("inherited option owner does not match the current split pairing", 3)
+  end
+  local ok, identity = pcall(
+    vim.api.nvim_buf_get_var, inherited_owner.source_bufnr, "fre"
+  )
+  local source_name = ok and type(identity) == "table"
+    and type(identity.instance_id) == "number"
+    and "fre_layout_" .. tostring(identity.instance_id) or nil
+  if source_name ~= inherited_owner.source_name then
+    fail("inherited option owner does not match the source buffer identity", 3)
+  end
+  return {
+    previous_options = copy(inherited_owner.previous_options),
+    source_bufnr = inherited_owner.source_bufnr,
+    source_name = inherited_owner.source_name,
+  }
+end
+
+function M.prepare(instance, winid, inherited_owner)
+  if inherited_owner ~= nil then
+    inherited_owner = validate_inherited_option_owner(winid, inherited_owner)
+  elseif not winid or not vim.api.nvim_win_is_valid(winid) then
+    return false
+  end
   local prepared = raw_metadata(instance, winid)
   if prepared and prepared.bufnr == instance.bufnr
       and type(prepared.previous_options) == "table" then return false end
   local owner, owner_metadata = option_owner(instance, winid)
+  if not owner and inherited_owner then
+    owner = {
+      bufnr = inherited_owner.source_bufnr,
+      name = inherited_owner.source_name,
+    }
+    owner_metadata = { previous_options = inherited_owner.previous_options }
+  end
 
-  local previous_options = owner_metadata and copy(owner_metadata.previous_options)
-    or copy(inherited_previous or {})
+  local previous_options = owner_metadata and copy(owner_metadata.previous_options) or {}
   local active_options = snapshot_window_options(instance, winid, previous_options)
   for key in pairs(instance.config.window.options or {}) do
     if previous_options[key] == nil then previous_options[key] = active_options[key] end
@@ -491,9 +547,12 @@ function M.prepare(instance, winid, inherited_previous)
   local transfer = owner and owner.bufnr ~= instance.bufnr and {
     source_bufnr = owner.bufnr,
     source_name = owner.name,
+    pairing_winid = winid,
+    destination_bufnr = instance.bufnr,
+    destination_name = target_name,
   } or nil
   local ok, err = pcall(function()
-    if owner and owner.name ~= target_name then clear_named_metadata(winid, owner.name) end
+    if owner_snapshot and owner_snapshot.present then clear_named_metadata(winid, owner.name) end
     set_option_metadata(instance, winid, previous_options, transfer)
   end)
   if not ok then
@@ -691,6 +750,22 @@ local function restore_destination_buffer(snapshot)
   end
 end
 
+local function sanitize_failed_destination(instance, snapshot)
+  if snapshot.bufnr == instance.bufnr
+      or not vim.api.nvim_win_is_valid(snapshot.winid) then return true end
+  local current_ok, current = pcall(vim.api.nvim_win_get_buf, snapshot.winid)
+  if not current_ok or current ~= instance.bufnr then return true end
+  local metadata = raw_metadata(instance, snapshot.winid)
+  if not metadata or metadata.bufnr ~= instance.bufnr
+      or type(metadata.previous_options) ~= "table" then return true end
+  local released, result = pcall(M.release, instance, snapshot.winid)
+  if not released then return false, tostring(result) end
+  if result ~= true then
+    return false, "exact failed destination ownership was not released"
+  end
+  return true
+end
+
 local function restore_destination(instance, snapshot)
   local errors = {}
   local function attempt(label, callback)
@@ -709,6 +784,11 @@ local function restore_destination(instance, snapshot)
   local winid = snapshot.winid
   local exact_source = false
   if vim.api.nvim_win_is_valid(winid) then
+    local sanitized, sanitize_err = sanitize_failed_destination(instance, snapshot)
+    if not sanitized then
+      errors[#errors + 1] = "failed destination option sanitation failed: "
+        .. tostring(sanitize_err)
+    end
     attempt("ownership metadata rollback failed", function()
       restore_snapshot_metadata(metadata_name(instance), snapshot.metadata)
     end)
@@ -882,7 +962,7 @@ end
 local function create_split(layout, effective, preferred, noautocmd)
   local tabpage = vim.api.nvim_get_current_tabpage()
   local anchor = assert(split_anchor(tabpage, preferred), "current tab has no ordinary window")
-  local previous_options = inherited_options(anchor)
+  local inherited_owner = inherited_option_owner(anchor)
   vim.api.nvim_set_current_win(anchor)
   local commands = {
     left = "topleft vertical split",
@@ -893,16 +973,59 @@ local function create_split(layout, effective, preferred, noautocmd)
   local command = commands[layout.position]
   vim.cmd(noautocmd and ("noautocmd " .. command) or command)
   local winid = vim.api.nvim_get_current_win()
+  if inherited_owner then
+    inherited_owner = validate_inherited_option_owner(winid, inherited_owner)
+  end
   resize_split(winid, layout, effective.size)
-  return winid, previous_options
+  return winid, inherited_owner
+end
+
+local function sanitize_inherited_split_pairing(winid, inherited_owner)
+  if not inherited_owner then return end
+  inherited_owner = validate_inherited_option_owner(winid, inherited_owner)
+  local active_options = {}
+  for key in pairs(inherited_owner.previous_options) do
+    active_options[key] = vim.api.nvim_get_option_value(
+      key, { scope = "local", win = winid }
+    )
+  end
+  local ok, err = pcall(function()
+    for key, value in pairs(inherited_owner.previous_options) do
+      validate_inherited_option_owner(winid, inherited_owner)
+      vim.api.nvim_set_option_value(key, value, { scope = "local", win = winid })
+    end
+  end)
+  if ok then return end
+
+  local rollback_errors = {}
+  local pairing_ok, pairing_err = pcall(
+    validate_inherited_option_owner, winid, inherited_owner
+  )
+  if pairing_ok then
+    for key, value in pairs(active_options) do
+      local restored, restore_err = pcall(function()
+        validate_inherited_option_owner(winid, inherited_owner)
+        vim.api.nvim_set_option_value(key, value, { scope = "local", win = winid })
+      end)
+      if not restored then
+        rollback_errors[#rollback_errors + 1] = key .. ": " .. tostring(restore_err)
+      end
+    end
+  else
+    rollback_errors[#rollback_errors + 1] = "pairing verification: " .. tostring(pairing_err)
+  end
+  if #rollback_errors > 0 then
+    error(tostring(err) .. "; split sanitation rollback failed: "
+      .. table.concat(rollback_errors, "; "), 0)
+  end
+  error(err, 0)
 end
 
 local function build_split_buffer(bufnr, layout, effective, preferred)
-  local winid, previous_options = create_split(layout, effective, preferred, true)
-  for key, value in pairs(previous_options or {}) do
-    vim.api.nvim_set_option_value(key, value, { scope = "local", win = winid })
-  end
+  local winid, inherited_owner = create_split(layout, effective, preferred, true)
+  sanitize_inherited_split_pairing(winid, inherited_owner)
   vim.api.nvim_win_set_buf(winid, bufnr)
+  assert_installed_buffer(winid, bufnr)
   return winid
 end
 
@@ -1116,9 +1239,9 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
         winid = build_float(layout, effective, scratch)
         M.prepare(instance, winid)
       else
-        local previous_options
-        winid, previous_options = create_split(layout, effective, caller_win, true)
-        M.prepare(instance, winid, previous_options)
+        local inherited_owner
+        winid, inherited_owner = create_split(layout, effective, caller_win, true)
+        M.prepare(instance, winid, inherited_owner)
       end
       vim.api.nvim_win_set_buf(winid, instance.bufnr)
       assert_installed_buffer(winid, instance.bufnr)
