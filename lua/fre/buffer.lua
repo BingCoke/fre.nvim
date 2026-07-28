@@ -475,7 +475,6 @@ function M.setup(instance)
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function()
       local winid = vim.api.nvim_get_current_win()
-      install_syntax(instance)
       window.apply_all(instance)
       clamp_cursor(instance, winid)
       if instance._window_transition then return end

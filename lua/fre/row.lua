@@ -135,8 +135,14 @@ end
 
 local function navigation_callback_entry(source, navigation_kind)
   local entry = source:_entry(source.root_node)
-  local label = navigation_kind == "parent" and ".." or "/"
-  entry.absolute_path = navigation_kind == "parent" and path.parent(source.root) or source.root
+  local label
+  if navigation_kind == "parent" then
+    label = ".."
+    entry.absolute_path = path.parent(source.root)
+  else
+    label = "/"
+    entry.absolute_path = source.root
+  end
   entry.relative_path = label
   entry.name = label
   return entry
@@ -192,11 +198,12 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
     local start_byte = marker_end + consumed
     local separator_start = start_byte + amount - #separator
     local field_range = { start_byte = start_byte, end_byte = start_byte + amount }
+    local physical_range = { start_byte = start_byte, end_byte = separator_start }
     local separator_range = { start_byte = separator_start, end_byte = start_byte + amount }
     local template_field = template and template.fields and template.fields[index]
-    local content_range = field_range
+    local content_range = physical_range
     if template_field and template_field.id == descriptor.id
-        and same_range(template_field.range, field_range) then
+        and same_range(template_field.physical_range, physical_range) then
       content_range = {
         start_byte = template_field.content_range.start_byte,
         end_byte = template_field.content_range.end_byte,
@@ -363,7 +370,7 @@ function M.prepare(instance, projection, render_path, opts)
   local descriptors = instance.config.columns or {}
   local marker_widths = instance.manager:get_marker_widths()
   local rendered, widths = {}, {}
-  for index = 1, #descriptors do widths[index] = 1 end
+  for index = 1, #descriptors do widths[index] = 0 end
 
   local function add_rendered(node, rendered_path, navigation_kind)
     local callback_entry = navigation_kind
@@ -393,9 +400,13 @@ function M.prepare(instance, projection, render_path, opts)
   end
 
   local navigation_kind = path.parent(instance.root) and "parent" or "root"
-  add_rendered(
-    instance.root_node, navigation_kind == "parent" and "../" or "/", navigation_kind
-  )
+  local navigation_path
+  if navigation_kind == "parent" then
+    navigation_path = "../"
+  else
+    navigation_path = "/"
+  end
+  add_rendered(instance.root_node, navigation_path, navigation_kind)
   for _, node in ipairs(nodes) do add_rendered(node, render_path(node), nil) end
 
   local lines, baseline, highlights, row_templates = {}, {}, {}, {}
