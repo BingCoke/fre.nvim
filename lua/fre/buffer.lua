@@ -366,10 +366,6 @@ function M.project(instance, projection, render_path)
   return M.commit(instance, prepared)
 end
 
-function M.apply_window_options(instance)
-  window.apply_all(instance)
-end
-
 local function row_highlight_templates(instance, line)
   local ok, identity = pcall(row.decode_marker, instance.manager, 0, line)
   if not ok then return nil end
@@ -485,29 +481,19 @@ local function attach_highlight_updates(instance)
   instance._highlight_attached = true
 end
 
-local function install_syntax(instance)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return end
-  vim.api.nvim_buf_call(instance.bufnr, function()
-    vim.cmd("syntax clear FreStableMarker")
-    vim.cmd([[syntax match FreStableMarker /^\%x1ffre:[0-9]\+:[0-9]\+\%x1f/ conceal]])
-  end)
-end
-
 function M.setup(instance)
   vim.api.nvim_set_hl(0, "FreStableMarker", { default = true, link = "Conceal" })
   vim.api.nvim_set_hl(0, "FreDirectoryIcon", { default = true, link = "Directory" })
   vim.api.nvim_set_hl(0, "FreSymlinkIcon", { default = true, link = "Special" })
   vim.api.nvim_set_hl(0, "FreFileIcon", { default = true, link = "Normal" })
   vim.api.nvim_set_hl(0, "FreUnsupportedIcon", { default = true, link = "DiagnosticWarn" })
-  install_syntax(instance)
+  vim.api.nvim_buf_call(instance.bufnr, function()
+    vim.cmd("runtime! syntax/fre.vim")
+  end)
   attach_highlight_updates(instance)
 
   local group_name = "FreBuffer" .. tostring(instance.id)
   instance._buffer_augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
-  vim.api.nvim_create_autocmd("Syntax", {
-    group = instance._buffer_augroup, buffer = instance.bufnr,
-    callback = function() install_syntax(instance) end,
-  })
   vim.api.nvim_create_autocmd("BufWriteCmd", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function(args)
@@ -539,7 +525,7 @@ function M.setup(instance)
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function()
       local winid = vim.api.nvim_get_current_win()
-      window.apply_all(instance)
+      window.prepare(instance, winid)
       if instance._window_transition then return end
       M.place_initial_cursor(instance, winid)
       instance:_on_visibility_enter()
@@ -553,6 +539,7 @@ function M.setup(instance)
       if instance._pending_initial_cursor then
         instance._pending_initial_cursor[winid] = nil
       end
+      window.release(instance, winid)
       vim.schedule(function() window.sync_visibility(instance) end)
     end,
   })

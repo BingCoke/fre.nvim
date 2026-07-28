@@ -1744,6 +1744,7 @@ function Instance.new(manager, root, effective, expansion)
       vim.bo[bufnr][key] = value
     end
     vim.bo[bufnr].filetype = "fre"
+    vim.bo[bufnr].syntax = "fre"
     vim.b[bufnr].fre = {
       version = 1,
       instance_id = self.id,

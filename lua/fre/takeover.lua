@@ -44,17 +44,6 @@ function Takeover:_take_over(bufnr, winid, name)
     and vim.api.nvim_win_get_buf(winid) == child.bufnr
 
   if not replaced or not replacement_visible then
-    local source_restored = vim.api.nvim_win_is_valid(winid)
-      and vim.api.nvim_win_get_buf(winid) == bufnr
-    if not source_restored and vim.api.nvim_win_is_valid(winid)
-        and vim.api.nvim_buf_is_valid(bufnr) then
-      pcall(vim.api.nvim_win_set_buf, winid, bufnr)
-      if vim.api.nvim_win_get_buf(winid) ~= bufnr then
-        pcall(vim.api.nvim_win_call, winid, function()
-          vim.cmd("noautocmd buffer " .. tostring(bufnr))
-        end)
-      end
-    end
     self:_destroy_failed_child(child)
     if not replaced then error(replace_err, 0) end
     error("fre: failed to replace directory buffer", 0)

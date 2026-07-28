@@ -321,39 +321,66 @@ local function metadata_name(instance)
   return "fre_layout_" .. tostring(instance.id)
 end
 
-local function get_metadata(instance, winid)
-  if not winid or not vim.api.nvim_win_is_valid(winid)
-      or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return nil end
-  local ok, value = pcall(vim.api.nvim_win_get_var, winid, metadata_name(instance))
+local function raw_named_metadata(winid, name)
+  if not winid or not vim.api.nvim_win_is_valid(winid) then return nil end
+  local ok, value = pcall(vim.api.nvim_win_get_var, winid, name)
   if not ok or type(value) ~= "table" then return nil end
   return value
 end
 
+local function raw_metadata(instance, winid)
+  return raw_named_metadata(winid, metadata_name(instance))
+end
+
+local function get_metadata(instance, winid)
+  if not winid or not vim.api.nvim_win_is_valid(winid)
+      or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return nil end
+  local metadata = raw_metadata(instance, winid)
+  if not metadata or metadata.bufnr ~= instance.bufnr then return nil end
+  return metadata
+end
+
 local function set_metadata(instance, winid, layout, effective)
+  local current = raw_metadata(instance, winid) or {}
   vim.api.nvim_win_set_var(winid, metadata_name(instance), {
+    bufnr = instance.bufnr,
     layout = copy(layout),
     effective = copy(effective),
+    previous_options = copy(current.previous_options or {}),
   })
 end
 
-local function clear_metadata(instance, winid)
-  if vim.api.nvim_win_is_valid(winid) then
-    pcall(vim.api.nvim_win_del_var, winid, metadata_name(instance))
-  end
+local function set_option_metadata(instance, winid, previous_options)
+  local current = raw_metadata(instance, winid) or {}
+  current.bufnr = instance.bufnr
+  current.previous_options = copy(previous_options)
+  vim.api.nvim_win_set_var(winid, metadata_name(instance), current)
 end
 
-local function snapshot_metadata(instance, winid)
-  local ok, value = pcall(vim.api.nvim_win_get_var, winid, metadata_name(instance))
+local function clear_named_metadata(winid, name)
+  vim.api.nvim_win_del_var(winid, name)
+end
+
+local function snapshot_named_metadata(winid, name)
+  local ok, value = pcall(vim.api.nvim_win_get_var, winid, name)
   return { present = ok, value = ok and copy(value) or nil }
 end
 
-local function restore_metadata(instance, winid, snapshot)
+local function snapshot_metadata(instance, winid)
+  return snapshot_named_metadata(winid, metadata_name(instance))
+end
+
+local function restore_named_metadata(winid, name, snapshot)
   if not vim.api.nvim_win_is_valid(winid) then return end
   if snapshot.present then
-    pcall(vim.api.nvim_win_set_var, winid, metadata_name(instance), copy(snapshot.value))
+    pcall(vim.api.nvim_win_set_var, winid, name, copy(snapshot.value))
   else
-    pcall(vim.api.nvim_win_del_var, winid, metadata_name(instance))
+    pcall(vim.api.nvim_win_del_var, winid, name)
   end
+end
+
+local function restore_metadata(instance, winid, snapshot)
+  restore_named_metadata(winid, metadata_name(instance), snapshot)
 end
 
 local function effective_layout(instance, winid)
@@ -372,34 +399,107 @@ function M.same_layout(instance, winid, effective)
 end
 
 function M.apply_window_options(instance, winid)
-  if not winid or not vim.api.nvim_win_is_valid(winid)
-      or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return false end
+  if not winid or not vim.api.nvim_win_is_valid(winid) then return false end
   for key, value in pairs(instance.config.window.options or {}) do
     vim.api.nvim_set_option_value(key, value, { scope = "local", win = winid })
   end
   return true
 end
 
-function M.apply_all(instance)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return end
-  for _, winid in ipairs(vim.fn.win_findbuf(instance.bufnr)) do
-    M.apply_window_options(instance, winid)
+local function option_owner(_, winid)
+  if not vim.api.nvim_win_is_valid(winid) then return nil end
+  local bufnr = vim.api.nvim_win_get_buf(winid)
+  local ok, identity = pcall(vim.api.nvim_buf_get_var, bufnr, "fre")
+  if not ok or type(identity) ~= "table" or type(identity.instance_id) ~= "number" then
+    return nil
   end
+  local name = "fre_layout_" .. tostring(identity.instance_id)
+  local metadata = raw_named_metadata(winid, name)
+  if not metadata or metadata.bufnr ~= bufnr
+      or type(metadata.previous_options) ~= "table" then return nil end
+  return { bufnr = bufnr, name = name }, metadata
 end
 
-local function snapshot_window_options(instance, winid)
+local function snapshot_window_options(instance, winid, previous_options)
+  local names = {}
+  for key in pairs(instance.config.window.options or {}) do names[key] = true end
+  for key in pairs(previous_options or {}) do names[key] = true end
   local result = {}
-  for key in pairs(instance.config.window.options or {}) do
-    result[key] = vim.api.nvim_get_option_value(key, { scope = "local", win = winid })
+  for key in pairs(names) do
+    result[key] = vim.api.nvim_get_option_value(
+      key, { scope = "local", win = winid }
+    )
   end
   return result
 end
 
 local function restore_window_options(winid, snapshot)
   if not vim.api.nvim_win_is_valid(winid) then return end
-  for key, value in pairs(snapshot) do
-    pcall(vim.api.nvim_set_option_value, key, value, { scope = "local", win = winid })
+  for key, value in pairs(snapshot or {}) do
+    pcall(vim.api.nvim_set_option_value, key, value, {
+      scope = "local", win = winid,
+    })
   end
+end
+
+local function inherited_options(winid)
+  local _, metadata = option_owner(nil, winid)
+  return metadata and copy(metadata.previous_options) or nil
+end
+
+function M.prepare(instance, winid, inherited_previous)
+  if not winid or not vim.api.nvim_win_is_valid(winid) then return false end
+  local prepared = raw_metadata(instance, winid)
+  if prepared and prepared.bufnr == instance.bufnr
+      and type(prepared.previous_options) == "table" then return false end
+  local owner, owner_metadata = option_owner(instance, winid)
+
+  local previous_options = owner_metadata and copy(owner_metadata.previous_options)
+    or copy(inherited_previous or {})
+  local active_options = snapshot_window_options(instance, winid, previous_options)
+  for key in pairs(instance.config.window.options or {}) do
+    if previous_options[key] == nil then previous_options[key] = active_options[key] end
+  end
+  local target_name = metadata_name(instance)
+  local target_metadata = snapshot_metadata(instance, winid)
+  local owner_snapshot = owner and owner.name ~= target_name
+    and snapshot_named_metadata(winid, owner.name) or nil
+  local ok, err = pcall(function()
+    for key, value in pairs(previous_options) do
+      vim.api.nvim_set_option_value(key, value, { scope = "local", win = winid })
+    end
+    M.apply_window_options(instance, winid)
+    if owner and owner.name ~= target_name then clear_named_metadata(winid, owner.name) end
+    set_option_metadata(instance, winid, previous_options)
+  end)
+  if not ok then
+    restore_window_options(winid, active_options)
+    restore_metadata(instance, winid, target_metadata)
+    if owner_snapshot then restore_named_metadata(winid, owner.name, owner_snapshot) end
+    error(err, 0)
+  end
+  return true
+end
+
+function M.release(instance, winid)
+  if not winid or not vim.api.nvim_win_is_valid(winid) then return false end
+  local metadata = raw_metadata(instance, winid)
+  if not metadata or metadata.bufnr ~= instance.bufnr
+      or type(metadata.previous_options) ~= "table" then return false end
+  local active_options = snapshot_window_options(instance, winid, metadata.previous_options)
+  local metadata_snapshot = snapshot_metadata(instance, winid)
+  local ok, err = pcall(function()
+    for key, value in pairs(metadata.previous_options) do
+      vim.api.nvim_set_option_value(key, value, { scope = "local", win = winid })
+    end
+    clear_named_metadata(winid, metadata_name(instance))
+  end)
+  if not ok then
+    restore_window_options(winid, active_options)
+    restore_metadata(instance, winid, metadata_snapshot)
+    error(err, 0)
+  end
+  return true
 end
 
 local function observe_visibility(instance)
@@ -447,14 +547,22 @@ end
 local function snapshot_destination(instance, winid)
   local bufnr = vim.api.nvim_win_get_buf(winid)
   local tabpage = vim.api.nvim_win_get_tabpage(winid)
+  local owner, owner_metadata = option_owner(instance, winid)
   return {
     winid = winid,
     bufnr = bufnr,
     tabpage = tabpage,
     bufhidden = vim.api.nvim_get_option_value("bufhidden", { buf = bufnr }),
     view = save_view(winid),
-    options = snapshot_window_options(instance, winid),
+    options = snapshot_window_options(
+      instance, winid, owner_metadata and owner_metadata.previous_options
+    ),
     metadata = snapshot_metadata(instance, winid),
+    owner = owner and owner.bufnr ~= instance.bufnr
+      and owner.name ~= metadata_name(instance) and owner or nil,
+    owner_metadata = owner and owner.bufnr ~= instance.bufnr
+      and owner.name ~= metadata_name(instance)
+      and snapshot_named_metadata(winid, owner.name) or nil,
     focus = vim.api.nvim_get_current_win(),
     instance_state = instance.state,
     layout_history_present = instance._last_layout_by_tab ~= nil,
@@ -481,6 +589,11 @@ end
 local function restore_destination(instance, snapshot)
   local winid = snapshot.winid
   if vim.api.nvim_win_is_valid(winid) then
+    restore_window_options(winid, snapshot.options)
+    restore_metadata(instance, winid, snapshot.metadata)
+    if snapshot.owner and snapshot.owner_metadata then
+      restore_named_metadata(winid, snapshot.owner.name, snapshot.owner_metadata)
+    end
     local current_ok, current = pcall(vim.api.nvim_win_get_buf, winid)
     if vim.api.nvim_buf_is_valid(snapshot.bufnr)
         and current_ok and current ~= snapshot.bufnr then
@@ -497,8 +610,6 @@ local function restore_destination(instance, snapshot)
       pcall(vim.api.nvim_set_option_value, "bufhidden", snapshot.bufhidden, { buf = snapshot.bufnr })
       snapshot.protected = nil
     end
-    restore_window_options(winid, snapshot.options)
-    restore_metadata(instance, winid, snapshot.metadata)
     restore_view(winid, snapshot.view)
   end
   if snapshot.layout_history_present then
@@ -541,6 +652,7 @@ local function remove_view(instance, winid, preserve_normal)
   if not vim.api.nvim_win_is_valid(winid)
       or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return true end
   local scratch
+  local snapshot
   local ok, err = pcall(function()
     if is_float(winid) then
       vim.api.nvim_win_close(winid, true)
@@ -549,6 +661,8 @@ local function remove_view(instance, winid, preserve_normal)
     local tabpage = vim.api.nvim_win_get_tabpage(winid)
     if preserve_normal or #normal_windows(tabpage) == 1 then
       scratch = scratch_buffer()
+      snapshot = snapshot_destination(instance, winid)
+      M.release(instance, winid)
       vim.api.nvim_win_set_buf(winid, scratch)
     else
       vim.api.nvim_win_close(winid, true)
@@ -556,10 +670,8 @@ local function remove_view(instance, winid, preserve_normal)
   end)
   local removed = not vim.api.nvim_win_is_valid(winid)
     or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr
-  if removed then
-    if vim.api.nvim_win_is_valid(winid) then clear_metadata(instance, winid) end
-    return true
-  end
+  if removed then return true end
+  if snapshot then pcall(restore_destination, instance, snapshot) end
   if scratch and vim.api.nvim_buf_is_valid(scratch) and #vim.fn.win_findbuf(scratch) == 0 then
     pcall(vim.api.nvim_buf_delete, scratch, { force = true })
   end
@@ -595,14 +707,13 @@ local function split_fix_option(layout)
 end
 
 local function set_split_fixed(winid, option, value)
-  vim.api.nvim_win_call(winid, function()
-    vim.cmd("noautocmd setlocal " .. (value and "" or "no") .. option)
-  end)
+  vim.api.nvim_set_option_value(option, value, { scope = "local", win = winid })
 end
 
-local function build_split_buffer(bufnr, layout, effective, preferred)
+local function create_split(layout, effective, preferred, noautocmd)
   local tabpage = vim.api.nvim_get_current_tabpage()
   local anchor = assert(split_anchor(tabpage, preferred), "current tab has no ordinary window")
+  local previous_options = inherited_options(anchor)
   vim.api.nvim_set_current_win(anchor)
   local commands = {
     left = "topleft vertical split",
@@ -610,14 +721,23 @@ local function build_split_buffer(bufnr, layout, effective, preferred)
     top = "topleft split",
     bottom = "botright split",
   }
-  vim.cmd(commands[layout.position])
+  local command = commands[layout.position]
+  vim.cmd(noautocmd and ("noautocmd " .. command) or command)
   local winid = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(winid, bufnr)
   resize_split(winid, layout, effective.size)
+  return winid, previous_options
+end
+
+local function build_split_buffer(bufnr, layout, effective, preferred)
+  local winid, previous_options = create_split(layout, effective, preferred, true)
+  for key, value in pairs(previous_options or {}) do
+    vim.api.nvim_set_option_value(key, value, { scope = "local", win = winid })
+  end
+  vim.api.nvim_win_set_buf(winid, bufnr)
   return winid
 end
 
-local function build_float(instance, layout, effective)
+local function build_float(layout, effective, scratch)
   local config = {
     relative = "editor",
     style = "minimal",
@@ -627,10 +747,10 @@ local function build_float(instance, layout, effective)
     col = effective.col,
   }
   if layout.border ~= nil then config.border = copy(layout.border) end
-  return vim.api.nvim_open_win(instance.bufnr, true, config)
+  return vim.api.nvim_open_win(scratch, true, config)
 end
 
-local function build_current(instance, preferred)
+local function build_current(preferred)
   local tabpage = vim.api.nvim_get_current_tabpage()
   local winid = preferred
   if not winid or not vim.api.nvim_win_is_valid(winid)
@@ -638,7 +758,6 @@ local function build_current(instance, preferred)
     winid = vim.api.nvim_get_current_win()
   end
   vim.api.nvim_set_current_win(winid)
-  vim.api.nvim_win_set_buf(winid, instance.bufnr)
   return winid
 end
 
@@ -677,9 +796,9 @@ function M.replace(instance, winid)
   instance._window_transition = true
   local ok, err = pcall(function()
     protect_destination_buffer(instance, snapshot)
+    M.prepare(instance, winid)
     vim.api.nvim_win_set_buf(winid, instance.bufnr)
     restore_destination_buffer(snapshot)
-    M.apply_window_options(instance, winid)
     if not is_float(winid) then
       local current = { position = "current" }
       set_metadata(instance, winid, current, current)
@@ -708,9 +827,9 @@ function M.replace_buffer(instance, winid, bufnr)
   local snapshot = snapshot_destination(instance, winid)
   local ok, err = pcall(function()
     protect_destination_buffer(instance, snapshot)
+    M.release(instance, winid)
     vim.api.nvim_win_set_buf(winid, bufnr)
     restore_destination_buffer(snapshot)
-    clear_metadata(instance, winid)
   end)
   if not ok then
     restore_destination(instance, snapshot)
@@ -770,13 +889,11 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
   local remembered = copy(layout)
   local newly_presented = false
   if selected and M.same_layout(instance, selected, effective) then
-    local previous_options = snapshot_window_options(instance, selected)
     local ok, result = pcall(function()
       vim.api.nvim_set_current_win(selected)
-      M.apply_window_options(instance, selected)
+      M.prepare(instance, selected)
     end)
     if not ok then
-      restore_window_options(selected, previous_options)
       if vim.api.nvim_win_is_valid(caller_win) then
         pcall(vim.api.nvim_set_current_win, caller_win)
       end
@@ -794,11 +911,12 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
     local snapshot = snapshot_destination(instance, destination)
     local ok, result = pcall(function()
       protect_destination_buffer(instance, snapshot)
-      winid = build_current(instance, destination)
+      winid = build_current(destination)
+      M.prepare(instance, winid)
+      vim.api.nvim_win_set_buf(winid, instance.bufnr)
       newly_presented = snapshot.bufnr ~= instance.bufnr
       restore_destination_buffer(snapshot)
       restore_view(winid, saved)
-      M.apply_window_options(instance, winid)
       set_metadata(instance, winid, layout, effective)
     end)
     if not ok then
@@ -818,27 +936,42 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
     local preserve_normal = selected and not is_float(selected)
       and #normal_windows(tabpage) == 1
     local fix_option, fixed_before
+    local scratch
     local ok, result = pcall(function()
       if layout.position == "float" then
-        winid = build_float(instance, layout, effective)
+        scratch = scratch_buffer()
+        winid = build_float(layout, effective, scratch)
+        M.prepare(instance, winid)
       else
-        winid = build_split_buffer(instance.bufnr, layout, effective, caller_win)
+        local previous_options
+        winid, previous_options = create_split(layout, effective, caller_win, true)
+        M.prepare(instance, winid, previous_options)
+      end
+      vim.api.nvim_win_set_buf(winid, instance.bufnr)
+      if scratch and vim.api.nvim_buf_is_valid(scratch)
+          and #vim.fn.win_findbuf(scratch) == 0 then
+        vim.api.nvim_buf_delete(scratch, { force = true })
       end
       newly_presented = true
       restore_view(winid, saved)
-      M.apply_window_options(instance, winid)
       set_metadata(instance, winid, layout, effective)
       if layout.position ~= "float" and split_size(winid, layout) ~= effective.size then
         fail("layout.size could not be materialized exactly", 4)
       end
       if selected and layout.position ~= "float" and not is_float(selected) then
         fix_option = split_fix_option(layout)
-        fixed_before = vim.api.nvim_get_option_value(fix_option, { win = winid })
+        fixed_before = vim.api.nvim_get_option_value(
+          fix_option, { scope = "local", win = winid }
+        )
         set_split_fixed(winid, fix_option, true)
       end
     end)
     if not ok then
       rollback_created_windows(tabpage, before, caller_win)
+      if scratch and vim.api.nvim_buf_is_valid(scratch)
+          and #vim.fn.win_findbuf(scratch) == 0 then
+        pcall(vim.api.nvim_buf_delete, scratch, { force = true })
+      end
       pcall(M.sync_visibility, instance)
       error(result, 0)
     end
