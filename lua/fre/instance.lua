@@ -1571,7 +1571,6 @@ function Instance:_start_destroy()
   end
 
   if self._watchers then pcall(self._watchers.stop_all, self._watchers) end
-  pcall(buffer.teardown, self)
   pcall(mapping.teardown, self)
 end
 
@@ -1585,7 +1584,7 @@ function Instance:_finish_destroy()
   end
   if vim.api.nvim_buf_is_valid(bufnr) then
     local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
-      vim.cmd("noautocmd bwipeout!")
+      vim.cmd("bwipeout!")
     end)
     if not ok then delete_error = err end
   end
@@ -1593,6 +1592,7 @@ function Instance:_finish_destroy()
     error("fre: failed to delete instance buffer: " .. tostring(delete_error), 2)
   end
 
+  pcall(buffer.teardown, self)
   manager:remove(self)
   local retained = { id = true, root = true, bufnr = true, state = true, _destroyed = true }
   for key in pairs(self) do
