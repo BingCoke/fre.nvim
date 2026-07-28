@@ -5,6 +5,7 @@ local M = {}
 
 local US = string.char(31)
 local PREFIX = US .. "fre:"
+local PARSER_GUARD = US .. "fre-parser-guard" .. US
 local MAX_EXACT_INTEGER = 9007199254740991
 
 local function fail(message, level)
@@ -216,7 +217,7 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
   local first_navigable
   for index, descriptor in ipairs(descriptors) do
     local owned = resolved and resolved.fields[index]
-    local parser_input = owned and owned.chunk or suffix:sub(consumed + 1)
+    local parser_input = owned and owned.chunk .. PARSER_GUARD or suffix:sub(consumed + 1)
     local ctx = source:_column_context(
       node, callback_entry, descriptor, index, index == #descriptors
     )
@@ -238,14 +239,14 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
     if parser_input:sub(amount + 1) ~= remaining then
       fail_row(row_number, "column " .. descriptor.id .. " parser returned a non-literal suffix")
     end
-    if owned and remaining ~= "" then
-      fail_row(row_number, "column " .. descriptor.id
-        .. " parser did not consume its exact layout chunk")
-    end
     local consumed_text = parser_input:sub(1, amount)
     local separator = consumed_text:match("( +)$")
     if not separator then
       fail_row(row_number, "column " .. descriptor.id .. " parser did not consume its separator")
+    end
+    if owned and remaining ~= PARSER_GUARD then
+      fail_row(row_number, "column " .. descriptor.id
+        .. " parser did not consume its exact layout chunk")
     end
     local parser_start = owned and owned.physical_range.start_byte or marker_end + consumed
     local parser_end = parser_start + amount
