@@ -158,14 +158,34 @@ local function same_range(left, right)
     and left.end_byte == right.end_byte
 end
 
+local function display_width_boundary(row_number, descriptor, text, width)
+  local boundary = 0
+  local character_count = vim.fn.strchars(text)
+  for character_index = 1, character_count do
+    local candidate = vim.str_byteindex(text, character_index)
+    if vim.fn.strdisplaywidth(text:sub(1, candidate)) > width then break end
+    boundary = candidate
+  end
+  if vim.fn.strdisplaywidth(text:sub(1, boundary)) ~= width then
+    fail_row(row_number, "column " .. descriptor.id
+      .. " does not fill its projected display width")
+  end
+  return boundary
+end
+
 local function parse_columns(row_number, source, node, suffix, marker_end, opts)
   local descriptors = source.config.columns or {}
   local values, ranges, separators, fields = {}, {}, {}, {}
   local navigation_kind = opts.navigation_kind
-  local callback_entry = navigation_kind
-    and navigation_callback_entry(source, navigation_kind) or source:_entry(node)
+  local callback_entry
+  if navigation_kind then
+    callback_entry = navigation_callback_entry(source, navigation_kind)
+  else
+    callback_entry = source:_entry(node)
+  end
   local template = template_for(source, opts.node_id)
   local consumed = 0
+  local layout_consumed = 0
   local first_navigable
   for index, descriptor in ipairs(descriptors) do
     local unconsumed = suffix:sub(consumed + 1)
@@ -195,11 +215,35 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
     if not separator then
       fail_row(row_number, "column " .. descriptor.id .. " parser did not consume its separator")
     end
-    local start_byte = marker_end + consumed
-    local separator_start = start_byte + amount - #separator
-    local field_range = { start_byte = start_byte, end_byte = start_byte + amount }
-    local physical_range = { start_byte = start_byte, end_byte = separator_start }
-    local separator_range = { start_byte = separator_start, end_byte = start_byte + amount }
+    local parser_start = marker_end + consumed
+    local parser_end = parser_start + amount
+    local field_range = { start_byte = parser_start, end_byte = parser_end }
+    local width = source.view and source.view.column_widths[index] or nil
+    local physical_range
+    local separator_range
+    if width ~= nil then
+      local physical_start = marker_end + layout_consumed
+      local boundary = display_width_boundary(
+        row_number, descriptor, suffix:sub(layout_consumed + 1), width
+      )
+      local physical_end = physical_start + boundary
+      if suffix:sub(layout_consumed + boundary + 1, layout_consumed + boundary + 1) ~= " " then
+        fail_row(row_number, "column " .. descriptor.id
+          .. " is missing its layout separator")
+      end
+      if parser_end < physical_end + 1 then
+        fail_row(row_number, "column " .. descriptor.id
+          .. " parser did not reach its layout separator")
+      end
+      physical_range = { start_byte = physical_start, end_byte = physical_end }
+      separator_range = { start_byte = physical_end, end_byte = physical_end + 1 }
+      layout_consumed = layout_consumed + boundary + 1
+    else
+      local separator_start = parser_end - #separator
+      physical_range = { start_byte = parser_start, end_byte = separator_start }
+      separator_range = { start_byte = separator_start, end_byte = parser_end }
+      layout_consumed = consumed + amount
+    end
     local template_field = template and template.fields and template.fields[index]
     local content_range = physical_range
     if template_field and template_field.id == descriptor.id
@@ -217,14 +261,14 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
       separator_range = separator_range,
       navigable = descriptor.navigable,
       align = descriptor.align,
-      width = source.view and source.view.column_widths[index] or nil,
+      width = width,
     }
     ranges[index] = field_range
     separators[index] = separator_range
     values[index] = value
     values[descriptor.id] = value
     if descriptor.navigable and not first_navigable then
-      first_navigable = field_range.start_byte
+      first_navigable = physical_range.start_byte
     end
     if opts.validate_metadata then
       local equals_ok, equal = pcall(descriptor.equals, callback_entry, value, ctx)
@@ -270,7 +314,11 @@ function M.decode(instance, row_number, line, opts)
   if decoded_marker.node_id == 0 then
     node = source.root_node
     if not node then fail_row(row_number, "navigation marker references an invalid instance") end
-    navigation_kind = path.parent(source.root) and "parent" or "root"
+    if path.parent(source.root) then
+      navigation_kind = "parent"
+    else
+      navigation_kind = "root"
+    end
   else
     node = source.nodes_by_id[decoded_marker.node_id]
     if not node then
@@ -317,6 +365,12 @@ function M.decode(instance, row_number, line, opts)
       fail_row(row_number, node.kind .. " path must not end in /")
     end
   end
+  local source_node
+  if navigation_kind then
+    source_node = nil
+  else
+    source_node = node
+  end
   local common = {
     marked = true,
     line = line,
@@ -325,7 +379,7 @@ function M.decode(instance, row_number, line, opts)
     source_instance_id = decoded_marker.instance_id,
     node_id = decoded_marker.node_id,
     source_instance = source,
-    source_node = navigation_kind and nil or node,
+    source_node = source_node,
     foreign = source ~= instance,
     entry = entry,
     proposed_path = proposed_path,
@@ -373,8 +427,12 @@ function M.prepare(instance, projection, render_path, opts)
   for index = 1, #descriptors do widths[index] = 0 end
 
   local function add_rendered(node, rendered_path, navigation_kind)
-    local callback_entry = navigation_kind
-      and navigation_callback_entry(instance, navigation_kind) or instance:_entry(node)
+    local callback_entry
+    if navigation_kind then
+      callback_entry = navigation_callback_entry(instance, navigation_kind)
+    else
+      callback_entry = instance:_entry(node)
+    end
     local fields = {}
     for index, descriptor in ipairs(descriptors) do
       local ctx = instance:_column_context(
@@ -389,9 +447,15 @@ function M.prepare(instance, projection, render_path, opts)
       }
       widths[index] = math.max(widths[index], display_width)
     end
+    local node_id
+    if navigation_kind then
+      node_id = 0
+    else
+      node_id = node.id
+    end
     rendered[#rendered + 1] = {
       node = node,
-      node_id = navigation_kind and 0 or node.id,
+      node_id = node_id,
       fields = fields,
       path = rendered_path,
       synthetic = navigation_kind ~= nil,
@@ -399,7 +463,12 @@ function M.prepare(instance, projection, render_path, opts)
     }
   end
 
-  local navigation_kind = path.parent(instance.root) and "parent" or "root"
+  local navigation_kind
+  if path.parent(instance.root) then
+    navigation_kind = "parent"
+  else
+    navigation_kind = "root"
+  end
   local navigation_path
   if navigation_kind == "parent" then
     navigation_path = "../"
