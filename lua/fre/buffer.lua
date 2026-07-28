@@ -518,6 +518,12 @@ function M.setup(instance)
       if instance._pending_reveal then instance:_apply_pending_reveal(winid) end
     end,
   })
+  vim.api.nvim_create_autocmd("BufLeave", {
+    group = instance._buffer_augroup, buffer = instance.bufnr,
+    callback = function()
+      window.release(instance, vim.api.nvim_get_current_win())
+    end,
+  })
   vim.api.nvim_create_autocmd("BufWinLeave", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function()
