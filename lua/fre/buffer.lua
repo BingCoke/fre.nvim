@@ -492,7 +492,7 @@ function M.setup(instance)
   end)
   attach_highlight_updates(instance)
 
-  local group_name = "FreBuffer" .. tostring(instance.id)
+  local group_name = "FreBuffer" .. tostring(instance.bufnr)
   instance._buffer_augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
   vim.api.nvim_create_autocmd("BufWriteCmd", {
     group = instance._buffer_augroup, buffer = instance.bufnr,

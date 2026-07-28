@@ -481,6 +481,15 @@ function M.prepare(instance, winid, inherited_previous)
   return true
 end
 
+local function assert_installed_buffer(instance, winid)
+  if not winid or not vim.api.nvim_win_is_valid(winid) then
+    fail("target window was invalidated during buffer installation", 4)
+  end
+  if vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then
+    fail("target window redirected buffer during installation", 4)
+  end
+end
+
 function M.release(instance, winid)
   if not winid or not vim.api.nvim_win_is_valid(winid) then return false end
   local metadata = raw_metadata(instance, winid)
@@ -798,6 +807,7 @@ function M.replace(instance, winid)
     protect_destination_buffer(instance, snapshot)
     M.prepare(instance, winid)
     vim.api.nvim_win_set_buf(winid, instance.bufnr)
+    assert_installed_buffer(instance, winid)
     restore_destination_buffer(snapshot)
     if not is_float(winid) then
       local current = { position = "current" }
@@ -914,6 +924,7 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
       winid = build_current(destination)
       M.prepare(instance, winid)
       vim.api.nvim_win_set_buf(winid, instance.bufnr)
+      assert_installed_buffer(instance, winid)
       newly_presented = snapshot.bufnr ~= instance.bufnr
       restore_destination_buffer(snapshot)
       restore_view(winid, saved)
@@ -948,6 +959,7 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
         M.prepare(instance, winid, previous_options)
       end
       vim.api.nvim_win_set_buf(winid, instance.bufnr)
+      assert_installed_buffer(instance, winid)
       if scratch and vim.api.nvim_buf_is_valid(scratch)
           and #vim.fn.win_findbuf(scratch) == 0 then
         vim.api.nvim_buf_delete(scratch, { force = true })
