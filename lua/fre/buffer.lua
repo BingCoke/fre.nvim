@@ -176,13 +176,18 @@ local function restore_windows(instance, windows, rows_by_id, exact)
         instance.bufnr, row_number - 1, row_number, false
       )[1] or ""
       local col = math.max(0, math.min(saved.cursor[2], #line))
+      local semantic_mapped = false
       if saved.anchor then
         local ok, decoded = pcall(row.decode, instance, row_number, line, {
           allow_empty_path = true,
           validate_metadata = false,
         })
         if ok and decoded and decoded.marked then
-          col = row.cursor_column(decoded, saved.anchor) or col
+          local mapped_col = row.cursor_column(decoded, saved.anchor)
+          if mapped_col ~= nil then
+            col = mapped_col
+            semantic_mapped = true
+          end
         end
       end
       col = math.max(0, math.min(col, #line))
@@ -192,7 +197,14 @@ local function restore_windows(instance, windows, rows_by_id, exact)
       view.col = col
       if not exact then view.topline = (view.topline or 1) + delta end
       view.topline = math.max(1, math.min(view.topline or 1, count))
-      pcall(vim.api.nvim_win_call, winid, vim.fn.winrestview, view)
+      pcall(vim.api.nvim_win_call, winid, function()
+        if semantic_mapped then
+          vim.api.nvim_win_set_cursor(0, { row_number, col })
+          view.coladd = 0
+          view.curswant = vim.fn.winsaveview().curswant
+        end
+        vim.fn.winrestview(view)
+      end)
       M.constrain_cursor(instance, winid)
     end
   end
@@ -537,6 +549,10 @@ function M.setup(instance)
   vim.api.nvim_create_autocmd("BufWinLeave", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function()
+      local winid = vim.api.nvim_get_current_win()
+      if instance._pending_initial_cursor then
+        instance._pending_initial_cursor[winid] = nil
+      end
       vim.schedule(function() window.sync_visibility(instance) end)
     end,
   })
