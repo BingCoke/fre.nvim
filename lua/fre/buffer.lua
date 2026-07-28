@@ -511,6 +511,7 @@ function M.setup(instance)
     callback = function()
       local winid = vim.api.nvim_get_current_win()
       window.prepare(instance, winid)
+      window.activate(instance, winid)
       if instance._window_transition then return end
       M.place_initial_cursor(instance, winid)
       instance:_on_visibility_enter()
