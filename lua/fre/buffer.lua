@@ -323,8 +323,6 @@ function M.commit(instance, prepared)
       last_patch = patch,
       projection_generation = (previous_view.projection_generation or 0) + 1,
     }
-    instance._marker_width_stale = prepared.marker_generation
-      < instance.manager:get_marker_widths().generation
     vim.bo[instance.bufnr].modified = false
     restore_windows(instance, snapshot.windows, rows_by_id, false)
     local pending = {}
@@ -332,6 +330,8 @@ function M.commit(instance, prepared)
       pending[#pending + 1] = winid
     end
     for _, winid in ipairs(pending) do M.place_initial_cursor(instance, winid) end
+    instance._marker_width_stale = prepared.marker_generation
+      < instance.manager:get_marker_widths().generation
     return true
   end)
   if not ok or result == false then
