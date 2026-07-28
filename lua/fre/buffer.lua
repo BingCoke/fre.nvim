@@ -51,15 +51,12 @@ function M.place_initial_cursor(instance, winid)
     if winid then instance._pending_initial_cursor[winid] = nil end
     return false
   end
-  local line = get_line(instance, 1)
   local ok, decoded = pcall(M.decode, instance, 1, {
     allow_empty_path = true,
     validate_metadata = false,
   })
-  local templates = instance.view and instance.view.row_templates
-  local template = ok and decoded and decoded.marked and templates
-    and templates[decoded.node_id] or nil
-  if template and template.line == line then
+  if ok and decoded and decoded.marked and decoded.synthetic
+      and decoded.instance_id == instance.id and decoded.node_id == 0 then
     vim.api.nvim_win_set_cursor(winid, { 1, decoded.path_range.start_byte })
     instance._pending_initial_cursor[winid] = nil
     return true
@@ -68,31 +65,12 @@ function M.place_initial_cursor(instance, winid)
   return false
 end
 
-function M.marker(instance_id, node_id, manager)
-  return row.marker(manager or require("fre.manager").default, instance_id, node_id)
-end
-
 function M.decode(instance, row_number, opts)
   return row.decode(instance, row_number, get_line(instance, row_number), opts)
 end
 
 function M.prepare(instance, projection, render_path, opts)
   return row.prepare(instance, projection, render_path, opts)
-end
-
-function M.row_has_marker(instance, row_number, marker)
-  local line = get_line(instance, row_number)
-  return line ~= nil and line:sub(1, #marker) == marker
-end
-
-function M.find_marker_rows(instance, marker)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return {} end
-  local result = {}
-  local lines = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false)
-  for index, line in ipairs(lines) do
-    if line:sub(1, #marker) == marker then result[#result + 1] = index end
-  end
-  return result
 end
 
 function M.row_matches_identity(instance, row_number, instance_id, node_id)
@@ -128,6 +106,16 @@ local function same_widths(left, right)
   for index = 1, #left do
     if left[index] ~= right[index] then return false end
   end
+  return true
+end
+
+local function set_lines_raw(instance, first, last, lines)
+  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return false end
+  local was_modifiable = vim.bo[instance.bufnr].modifiable
+  vim.bo[instance.bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(instance.bufnr, first, last, false, lines)
+  vim.bo[instance.bufnr].modified = false
+  vim.bo[instance.bufnr].modifiable = was_modifiable
   return true
 end
 
@@ -233,7 +221,6 @@ end
 
 function M.restore(instance, snapshot)
   if not snapshot or not vim.api.nvim_buf_is_valid(instance.bufnr) then return false end
-  local current_modifiable = vim.bo[instance.bufnr].modifiable
   vim.bo[instance.bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, snapshot.lines)
   vim.api.nvim_buf_clear_namespace(instance.bufnr, row_namespace, 0, -1)
@@ -260,9 +247,6 @@ function M.restore(instance, snapshot)
   vim.bo[instance.bufnr].modified = snapshot.modified
   vim.bo[instance.bufnr].modifiable = snapshot.modifiable
   restore_windows(instance, snapshot.windows, nil, true)
-  if current_modifiable ~= snapshot.modifiable then
-    vim.bo[instance.bufnr].modifiable = snapshot.modifiable
-  end
   return true
 end
 
@@ -294,7 +278,7 @@ function M.commit(instance, prepared)
         for index = prefix + 1, #prepared.lines - suffix do
           replacement[#replacement + 1] = prepared.lines[index]
         end
-        if not instance:_replace_lines(prefix, #current - suffix, replacement, false) then
+        if not set_lines_raw(instance, prefix, #current - suffix, replacement) then
           return false
         end
         patch = {
@@ -303,7 +287,7 @@ function M.commit(instance, prepared)
         }
       end
     else
-      if not instance:_set_lines(prepared.lines, false) then return false end
+      if not set_lines_raw(instance, 0, -1, prepared.lines) then return false end
       patch = { kind = "full", start_row = 1, old_end_row = -1, new_end_row = #prepared.lines }
     end
 
@@ -339,7 +323,8 @@ function M.commit(instance, prepared)
       last_patch = patch,
       projection_generation = (previous_view.projection_generation or 0) + 1,
     }
-    instance._marker_width_stale = false
+    instance._marker_width_stale = prepared.marker_generation
+      < instance.manager:get_marker_widths().generation
     vim.bo[instance.bufnr].modified = false
     restore_windows(instance, snapshot.windows, rows_by_id, false)
     local pending = {}

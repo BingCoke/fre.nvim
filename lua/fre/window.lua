@@ -996,10 +996,7 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
         error(remove_err, 0)
       end
     end
-    if fix_option then
-      local restored = pcall(set_split_fixed, winid, fix_option, fixed_before)
-      if not restored then pcall(set_split_fixed, winid, fix_option, fixed_before) end
-    end
+    if fix_option then pcall(set_split_fixed, winid, fix_option, fixed_before) end
   end
   if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_get_current_win() ~= winid then
     pcall(vim.api.nvim_set_current_win, winid)

@@ -87,14 +87,12 @@ function Instance:_column_context(node, entry, descriptor, index, is_last)
   }
 end
 
-function Instance:_replace_lines(first, last, lines, preserve_views)
+function Instance:_replace_lines(first, last, lines)
   if not vim.api.nvim_buf_is_valid(self.bufnr) then return false end
   local views = {}
-  if preserve_views ~= false then
-    for _, winid in ipairs(vim.fn.win_findbuf(self.bufnr)) do
-      if vim.api.nvim_win_is_valid(winid) then
-        views[winid] = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
-      end
+  for _, winid in ipairs(vim.fn.win_findbuf(self.bufnr)) do
+    if vim.api.nvim_win_is_valid(winid) then
+      views[winid] = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
     end
   end
   local was_modifiable = vim.bo[self.bufnr].modifiable
@@ -110,8 +108,8 @@ function Instance:_replace_lines(first, last, lines, preserve_views)
   return true
 end
 
-function Instance:_set_lines(lines, preserve_views)
-  return self:_replace_lines(0, -1, lines, preserve_views)
+function Instance:_set_lines(lines)
+  return self:_replace_lines(0, -1, lines)
 end
 
 function Instance:_loading_line()
@@ -140,6 +138,41 @@ function Instance:_render_success()
   return buffer.project(self, projection, function(node)
     return display_name(self, node)
   end)
+end
+
+function Instance:_on_marker_width_changed(generation)
+  self._marker_width_stale = true
+  if self._destroyed or self.state == "destroying" or self.state == "destroyed" then
+    return
+  end
+  if self.state ~= "ready-hidden" and self.state ~= "ready-visible" then return end
+  if not vim.api.nvim_buf_is_valid(self.bufnr) or vim.bo[self.bufnr].modified then return end
+  if (self.actions and self.actions.write) or self._refresh_request
+      or self._watch_refresh_request then return end
+  if self._execution and not mutation_execute.is_terminal(self._execution) then return end
+  for _, node in pairs(self.nodes_by_id) do
+    if node.kind == "directory"
+        and (node.load_state == "loading" or node.load_state == "refreshing") then
+      return
+    end
+  end
+
+  local current_generation = self.manager:get_marker_widths().generation
+  local view_generation = self.view and self.view.marker_generation or 0
+  if view_generation >= generation and view_generation >= current_generation then
+    self._marker_width_stale = false
+    return
+  end
+
+  local ok, result = pcall(self._render_success, self)
+  if not ok or result == false then
+    local err = ok and "buffer projection commit failed" or result
+    self._marker_width_stale = true
+    self:_report_async_error("marker width reprojection failed: " .. tostring(err))
+    return
+  end
+  view_generation = self.view and self.view.marker_generation or 0
+  self._marker_width_stale = view_generation < self.manager:get_marker_widths().generation
 end
 
 function Instance:_snapshot_visibility()
