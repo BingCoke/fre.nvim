@@ -32,6 +32,10 @@ local function fail(message, level)
   error("fre.window: " .. message, level or 3)
 end
 
+local function place_initial_cursor(instance, winid)
+  return require("fre.buffer").place_initial_cursor(instance, winid)
+end
+
 local function finite(value)
   return type(value) == "number" and value == value
     and value ~= math.huge and value ~= -math.huge
@@ -669,6 +673,8 @@ function M.replace(instance, winid)
     fail("target window is not valid", 2)
   end
   local snapshot = snapshot_destination(instance, winid)
+  local previous_transition = instance._window_transition
+  instance._window_transition = true
   local ok, err = pcall(function()
     protect_destination_buffer(instance, snapshot)
     vim.api.nvim_win_set_buf(winid, instance.bufnr)
@@ -682,11 +688,13 @@ function M.replace(instance, winid)
     end
     M.sync_visibility(instance)
   end)
+  instance._window_transition = previous_transition
   if not ok then
     pcall(restore_destination, instance, snapshot)
     pcall(observe_visibility, instance)
     error(err, 0)
   end
+  if snapshot.bufnr ~= instance.bufnr then place_initial_cursor(instance, winid) end
   return winid
 end
 
@@ -760,6 +768,7 @@ end
 
 local function open_prepared(instance, tabpage, layout, effective, selected, caller_win)
   local remembered = copy(layout)
+  local newly_presented = false
   if selected and M.same_layout(instance, selected, effective) then
     local previous_options = snapshot_window_options(instance, selected)
     local ok, result = pcall(function()
@@ -786,6 +795,7 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
     local ok, result = pcall(function()
       protect_destination_buffer(instance, snapshot)
       winid = build_current(instance, destination)
+      newly_presented = snapshot.bufnr ~= instance.bufnr
       restore_destination_buffer(snapshot)
       restore_view(winid, saved)
       M.apply_window_options(instance, winid)
@@ -814,6 +824,7 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
       else
         winid = build_split_buffer(instance.bufnr, layout, effective, caller_win)
       end
+      newly_presented = true
       restore_view(winid, saved)
       M.apply_window_options(instance, winid)
       set_metadata(instance, winid, layout, effective)
@@ -848,6 +859,7 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
   if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_get_current_win() ~= winid then
     pcall(vim.api.nvim_set_current_win, winid)
   end
+  if newly_presented then place_initial_cursor(instance, winid) end
   remember(instance, tabpage, remembered)
   pcall(M.sync_visibility, instance)
   return winid

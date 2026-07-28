@@ -275,8 +275,14 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
       id = descriptor.id,
       value = value,
       range = field_range,
+      physical_range = physical_range,
       content_range = content_range,
       separator_range = separator_range,
+      leading_padding = content_range.start_byte - physical_range.start_byte,
+      trailing_padding = physical_range.end_byte - content_range.end_byte,
+      template_available = template_field ~= nil
+        and template_field.id == descriptor.id
+        and same_range(template_field.physical_range, physical_range),
       navigable = descriptor.navigable,
       align = descriptor.align,
       width = width,
@@ -427,6 +433,141 @@ function M.decode(instance, row_number, line, opts)
     common.row_kind = "entry"
   end
   return common
+end
+
+local function byte_boundary(text, byte_offset)
+  byte_offset = math.max(0, math.min(byte_offset, #text))
+  local boundary = 0
+  for character_index = 1, vim.fn.strchars(text) do
+    local candidate = vim.str_byteindex(text, character_index)
+    if candidate > byte_offset then break end
+    boundary = candidate
+  end
+  return boundary
+end
+
+local function display_offset(text, byte_offset)
+  local boundary = byte_boundary(text, byte_offset)
+  return vim.fn.strdisplaywidth(text:sub(1, boundary))
+end
+
+local function byte_for_display_offset(text, offset)
+  offset = math.max(0, offset or 0)
+  local boundary = 0
+  local width = 0
+  for character_index = 1, vim.fn.strchars(text) do
+    local candidate = vim.str_byteindex(text, character_index)
+    local candidate_width = vim.fn.strdisplaywidth(text:sub(1, candidate))
+    if offset < candidate_width then return boundary end
+    boundary = candidate
+    width = candidate_width
+  end
+  if offset >= width then return boundary end
+  return 0
+end
+
+local function range_text(decoded, range)
+  return decoded.line:sub(range.start_byte + 1, range.end_byte)
+end
+
+local function content_end_anchor(decoded, field)
+  return {
+    field_id = field.id,
+    zone = "content",
+    display_offset = vim.fn.strdisplaywidth(range_text(decoded, field.content_range)),
+  }
+end
+
+function M.cursor_anchor(decoded, col)
+  if not decoded or not decoded.marked or type(decoded.line) ~= "string" then return nil end
+  col = math.max(0, math.min(col or 0, #decoded.line))
+  local preceding
+  for _, field in ipairs(decoded.fields or {}) do
+    local physical = field.physical_range
+    if field.navigable and physical then
+      if col >= physical.start_byte and col < physical.end_byte then
+        local physical_text = range_text(decoded, physical)
+        local normalized = physical.start_byte
+          + byte_boundary(physical_text, col - physical.start_byte)
+        local content = field.content_range
+        if normalized < content.start_byte then
+          local padding = decoded.line:sub(normalized + 1, content.start_byte)
+          return {
+            field_id = field.id,
+            zone = "leading_padding",
+            display_offset = vim.fn.strdisplaywidth(padding),
+          }
+        end
+        if normalized >= content.end_byte then
+          local padding = decoded.line:sub(content.end_byte + 1, normalized)
+          return {
+            field_id = field.id,
+            zone = "trailing_padding",
+            display_offset = vim.fn.strdisplaywidth(padding),
+          }
+        end
+        local text = range_text(decoded, content)
+        return {
+          field_id = field.id,
+          zone = "content",
+          display_offset = display_offset(text, normalized - content.start_byte),
+        }
+      end
+      if col >= physical.end_byte then preceding = field end
+    end
+    local separator = field.separator_range
+    if separator and col >= separator.start_byte and col < separator.end_byte then
+      if preceding then return content_end_anchor(decoded, preceding) end
+      return { field_id = "path", zone = "content", display_offset = 0 }
+    end
+  end
+
+  if col < decoded.path_range.start_byte then
+    if preceding then return content_end_anchor(decoded, preceding) end
+    return { field_id = "path", zone = "content", display_offset = 0 }
+  end
+  local text = range_text(decoded, decoded.path_range)
+  return {
+    field_id = "path",
+    zone = "content",
+    display_offset = display_offset(text, col - decoded.path_range.start_byte),
+  }
+end
+
+function M.cursor_column(decoded, anchor)
+  if not decoded or not decoded.marked or type(anchor) ~= "table" then return nil end
+  if anchor.field_id == "path" then
+    local text = range_text(decoded, decoded.path_range)
+    return decoded.path_range.start_byte
+      + byte_for_display_offset(text, anchor.display_offset)
+  end
+
+  local selected
+  for _, field in ipairs(decoded.fields or {}) do
+    if field.navigable and field.id == anchor.field_id then
+      selected = field
+      break
+    end
+  end
+  if not selected or not selected.physical_range or not selected.content_range then
+    return decoded.path_range.start_byte
+  end
+
+  local physical = selected.physical_range
+  local content = selected.content_range
+  if anchor.zone == "leading_padding" then
+    local text = decoded.line:sub(physical.start_byte + 1, content.start_byte)
+    local width = vim.fn.strdisplaywidth(text)
+    return physical.start_byte
+      + byte_for_display_offset(text, math.max(0, width - (anchor.display_offset or 0)))
+  end
+  if anchor.zone == "trailing_padding" then
+    local text = decoded.line:sub(content.end_byte + 1, physical.end_byte)
+    return content.end_byte + byte_for_display_offset(text, anchor.display_offset)
+  end
+
+  local text = range_text(decoded, content)
+  return content.start_byte + byte_for_display_offset(text, anchor.display_offset)
 end
 
 function M.matches_identity(instance, line, instance_id, node_id)

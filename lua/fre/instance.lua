@@ -87,12 +87,14 @@ function Instance:_column_context(node, entry, descriptor, index, is_last)
   }
 end
 
-function Instance:_replace_lines(first, last, lines)
+function Instance:_replace_lines(first, last, lines, preserve_views)
   if not vim.api.nvim_buf_is_valid(self.bufnr) then return false end
   local views = {}
-  for _, winid in ipairs(vim.fn.win_findbuf(self.bufnr)) do
-    if vim.api.nvim_win_is_valid(winid) then
-      views[winid] = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
+  if preserve_views ~= false then
+    for _, winid in ipairs(vim.fn.win_findbuf(self.bufnr)) do
+      if vim.api.nvim_win_is_valid(winid) then
+        views[winid] = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
+      end
     end
   end
   local was_modifiable = vim.bo[self.bufnr].modifiable
@@ -108,8 +110,8 @@ function Instance:_replace_lines(first, last, lines)
   return true
 end
 
-function Instance:_set_lines(lines)
-  return self:_replace_lines(0, -1, lines)
+function Instance:_set_lines(lines, preserve_views)
+  return self:_replace_lines(0, -1, lines, preserve_views)
 end
 
 function Instance:_loading_line()
@@ -1543,6 +1545,7 @@ function Instance:_start_destroy()
   self._reveal_generation = self._reveal_generation + 1
   if self._pending_reveal then self._pending_reveal.active = false end
   self._pending_reveal = nil
+  self._pending_initial_cursor = {}
   self._pending_visibility_refresh = false
 
   local ready_callbacks = self._ready_callbacks
@@ -1626,6 +1629,7 @@ local function invalidate_failed_constructor(self)
     self.root_node.load_generation = self.root_node.load_generation + 1
   end
   if self._pending_reveal then self._pending_reveal.active = false end
+  self._pending_initial_cursor = {}
   for _, callback in ipairs(self._ready_callbacks or {}) do callback.active = false end
   self._ready_callbacks = {}
 end

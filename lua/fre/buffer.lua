@@ -27,18 +27,45 @@ local function set_node_extmark(instance, node, row)
   })
 end
 
-local function clamp_cursor(instance, winid)
+function M.constrain_cursor(instance, winid)
   winid = winid or vim.api.nvim_get_current_win()
   if not vim.api.nvim_win_is_valid(winid)
       or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return end
   local cursor = vim.api.nvim_win_get_cursor(winid)
-  local row = cursor[1]
-  local ok, decoded = pcall(M.decode, instance, row, { allow_empty_path = true })
+  local row_number = cursor[1]
+  local ok, decoded = pcall(M.decode, instance, row_number, {
+    allow_empty_path = true,
+    validate_metadata = false,
+  })
   if not ok or not decoded or not decoded.marked then return end
-  local lower = decoded.path_range.start_byte
+  local lower = decoded.navigable_range.start_byte
   local upper = math.max(lower, decoded.path_range.end_byte)
   local col = math.max(lower, math.min(cursor[2], upper))
-  if cursor[2] ~= col then vim.api.nvim_win_set_cursor(winid, { row, col }) end
+  if cursor[2] ~= col then vim.api.nvim_win_set_cursor(winid, { row_number, col }) end
+end
+
+function M.place_initial_cursor(instance, winid)
+  if not instance._pending_initial_cursor then instance._pending_initial_cursor = {} end
+  if not winid or not vim.api.nvim_win_is_valid(winid)
+      or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then
+    if winid then instance._pending_initial_cursor[winid] = nil end
+    return false
+  end
+  local line = get_line(instance, 1)
+  local ok, decoded = pcall(M.decode, instance, 1, {
+    allow_empty_path = true,
+    validate_metadata = false,
+  })
+  local templates = instance.view and instance.view.row_templates
+  local template = ok and decoded and decoded.marked and templates
+    and templates[decoded.node_id] or nil
+  if template and template.line == line then
+    vim.api.nvim_win_set_cursor(winid, { 1, decoded.path_range.start_byte })
+    instance._pending_initial_cursor[winid] = nil
+    return true
+  end
+  instance._pending_initial_cursor[winid] = true
+  return false
 end
 
 function M.marker(instance_id, node_id, manager)
@@ -116,39 +143,57 @@ local function capture_windows(instance)
         row.decode, instance, cursor[1], line,
         { allow_empty_path = true, validate_metadata = false }
       )
-      local node_id
-      if ok and decoded and decoded.marked and not decoded.synthetic
-          and decoded.instance_id == instance.id then
-        node_id = decoded.node_id
+      local node_id, anchor
+      if ok and decoded and decoded.marked then
+        anchor = row.cursor_anchor(decoded, cursor[2])
+        if not decoded.synthetic and decoded.instance_id == instance.id then
+          node_id = decoded.node_id
+        end
       end
-      windows[winid] = { view = view, cursor = cursor, node_id = node_id }
+      windows[winid] = {
+        view = view,
+        cursor = cursor,
+        node_id = node_id,
+        anchor = anchor,
+      }
     end
   end
   return windows
 end
 
-local function restore_windows(instance, windows, rows_by_id, exact, clamp_path)
+local function restore_windows(instance, windows, rows_by_id, exact)
   if not vim.api.nvim_buf_is_valid(instance.bufnr) then return end
   local count = vim.api.nvim_buf_line_count(instance.bufnr)
   for winid, saved in pairs(windows or {}) do
     if vim.api.nvim_win_is_valid(winid)
         and vim.api.nvim_win_get_buf(winid) == instance.bufnr then
-      local row = saved.cursor[1]
+      local row_number = saved.cursor[1]
       if not exact and saved.node_id and rows_by_id[saved.node_id] then
-        row = rows_by_id[saved.node_id]
+        row_number = rows_by_id[saved.node_id]
       end
-      row = math.max(1, math.min(row, count))
-      local line = vim.api.nvim_buf_get_lines(instance.bufnr, row - 1, row, false)[1] or ""
+      row_number = math.max(1, math.min(row_number, count))
+      local line = vim.api.nvim_buf_get_lines(
+        instance.bufnr, row_number - 1, row_number, false
+      )[1] or ""
       local col = math.max(0, math.min(saved.cursor[2], #line))
+      if saved.anchor then
+        local ok, decoded = pcall(row.decode, instance, row_number, line, {
+          allow_empty_path = true,
+          validate_metadata = false,
+        })
+        if ok and decoded and decoded.marked then
+          col = row.cursor_column(decoded, saved.anchor) or col
+        end
+      end
+      col = math.max(0, math.min(col, #line))
       local view = vim.deepcopy(saved.view)
-      local delta = row - saved.cursor[1]
-      view.lnum = row
+      local delta = row_number - saved.cursor[1]
+      view.lnum = row_number
       view.col = col
       if not exact then view.topline = (view.topline or 1) + delta end
       view.topline = math.max(1, math.min(view.topline or 1, count))
       pcall(vim.api.nvim_win_call, winid, vim.fn.winrestview, view)
-      pcall(vim.api.nvim_win_set_cursor, winid, { row, col })
-      if clamp_path then clamp_cursor(instance, winid) end
+      M.constrain_cursor(instance, winid)
     end
   end
 end
@@ -202,7 +247,7 @@ function M.restore(instance, snapshot)
   for node, mark in pairs(snapshot.node_extmarks) do node.row_extmark = mark end
   vim.bo[instance.bufnr].modified = snapshot.modified
   vim.bo[instance.bufnr].modifiable = snapshot.modifiable
-  restore_windows(instance, snapshot.windows, nil, true, true)
+  restore_windows(instance, snapshot.windows, nil, true)
   if current_modifiable ~= snapshot.modifiable then
     vim.bo[instance.bufnr].modifiable = snapshot.modifiable
   end
@@ -237,14 +282,16 @@ function M.commit(instance, prepared)
         for index = prefix + 1, #prepared.lines - suffix do
           replacement[#replacement + 1] = prepared.lines[index]
         end
-        if not instance:_replace_lines(prefix, #current - suffix, replacement) then return false end
+        if not instance:_replace_lines(prefix, #current - suffix, replacement, false) then
+          return false
+        end
         patch = {
           kind = "interval", start_row = prefix + 1,
           old_end_row = #current - suffix, new_end_row = #prepared.lines - suffix,
         }
       end
     else
-      if not instance:_set_lines(prepared.lines) then return false end
+      if not instance:_set_lines(prepared.lines, false) then return false end
       patch = { kind = "full", start_row = 1, old_end_row = -1, new_end_row = #prepared.lines }
     end
 
@@ -282,12 +329,17 @@ function M.commit(instance, prepared)
     }
     instance._marker_width_stale = false
     vim.bo[instance.bufnr].modified = false
-    restore_windows(instance, snapshot.windows, rows_by_id, false, true)
+    restore_windows(instance, snapshot.windows, rows_by_id, false)
+    local pending = {}
+    for winid in pairs(instance._pending_initial_cursor or {}) do
+      pending[#pending + 1] = winid
+    end
+    for _, winid in ipairs(pending) do M.place_initial_cursor(instance, winid) end
     return true
   end)
   if not ok or result == false then
-    local restore_ok, restore_err = pcall(M.restore, instance, snapshot)
     instance.view = previous_view
+    local restore_ok, restore_err = pcall(M.restore, instance, snapshot)
     if not restore_ok then
       error(tostring(result) .. "; rollback failed: " .. tostring(restore_err), 0)
     end
@@ -476,8 +528,8 @@ function M.setup(instance)
     callback = function()
       local winid = vim.api.nvim_get_current_win()
       window.apply_all(instance)
-      clamp_cursor(instance, winid)
       if instance._window_transition then return end
+      M.place_initial_cursor(instance, winid)
       instance:_on_visibility_enter()
       if instance._pending_reveal then instance:_apply_pending_reveal(winid) end
     end,
@@ -496,12 +548,12 @@ function M.setup(instance)
   })
   vim.api.nvim_create_autocmd("CursorMoved", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
-    callback = function() clamp_cursor(instance) end,
+    callback = function() M.constrain_cursor(instance) end,
   })
   for _, event in ipairs({ "InsertEnter", "InsertCharPre", "CursorMovedI" }) do
     vim.api.nvim_create_autocmd(event, {
       group = instance._buffer_augroup, buffer = instance.bufnr,
-      callback = function() clamp_cursor(instance) end,
+      callback = function() M.constrain_cursor(instance) end,
     })
   end
 end
