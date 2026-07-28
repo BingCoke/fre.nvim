@@ -414,8 +414,10 @@ function M.write(ctx, _opts)
     close_progress()
     token.execution = nil
     if reconciliation_error ~= nil then instance.needs_refresh = true end
+    local execution
+    if outcome ~= nil then execution = vim.deepcopy(outcome) end
     instance._last_write_result = {
-      execution = outcome == nil and nil or vim.deepcopy(outcome),
+      execution = execution,
       reconciliation_error = reconciliation_error,
     }
     release(instance, token)
