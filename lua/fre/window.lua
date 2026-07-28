@@ -350,10 +350,16 @@ local function set_metadata(instance, winid, layout, effective)
   })
 end
 
-local function set_option_metadata(instance, winid, previous_options)
-  local current = raw_metadata(instance, winid) or {}
+local function set_option_metadata(instance, winid, previous_options, transfer)
+  local current = raw_metadata(instance, winid)
+  if not current or current.bufnr ~= instance.bufnr then
+    current = {}
+  else
+    current = copy(current)
+  end
   current.bufnr = instance.bufnr
   current.previous_options = copy(previous_options)
+  current.option_transfer = transfer and copy(transfer) or nil
   vim.api.nvim_win_set_var(winid, metadata_name(instance), current)
 end
 
@@ -420,13 +426,18 @@ end
 
 local function transferred_option_owner(instance, winid)
   local owner, owner_metadata
+  local source_name = metadata_name(instance)
   local variables = vim.api.nvim_win_call(winid, function()
     return vim.fn.getwinvar(0, "")
   end)
   for name, metadata in pairs(variables) do
+    local transfer = type(metadata) == "table" and metadata.option_transfer or nil
     if type(name) == "string" and name:match("^fre_layout_%d+$")
         and type(metadata) == "table" and metadata.bufnr ~= instance.bufnr
         and type(metadata.previous_options) == "table"
+        and type(transfer) == "table"
+        and transfer.source_bufnr == instance.bufnr
+        and transfer.source_name == source_name
         and vim.api.nvim_buf_is_valid(metadata.bufnr) then
       local ok, identity = pcall(vim.api.nvim_buf_get_var, metadata.bufnr, "fre")
       local exact_name = ok and type(identity) == "table"
@@ -477,9 +488,13 @@ function M.prepare(instance, winid, inherited_previous)
   local target_metadata = snapshot_metadata(instance, winid)
   local owner_snapshot = owner and owner.name ~= target_name
     and snapshot_named_metadata(winid, owner.name) or nil
+  local transfer = owner and owner.bufnr ~= instance.bufnr and {
+    source_bufnr = owner.bufnr,
+    source_name = owner.name,
+  } or nil
   local ok, err = pcall(function()
     if owner and owner.name ~= target_name then clear_named_metadata(winid, owner.name) end
-    set_option_metadata(instance, winid, previous_options)
+    set_option_metadata(instance, winid, previous_options, transfer)
   end)
   if not ok then
     restore_metadata(instance, winid, target_metadata)
@@ -552,12 +567,18 @@ function M.release(instance, winid)
   end
 
   local active_options = snapshot_window_options(instance, winid, metadata.previous_options)
-  local metadata_snapshot = clear_metadata and snapshot_named_metadata(winid, name) or nil
+  local metadata_snapshot = snapshot_named_metadata(winid, name)
   local ok, err = pcall(function()
     for key, value in pairs(metadata.previous_options) do
       vim.api.nvim_set_option_value(key, value, { scope = "local", win = winid })
     end
-    if clear_metadata then clear_named_metadata(winid, name) end
+    if clear_metadata then
+      clear_named_metadata(winid, name)
+    else
+      local retained = copy(metadata)
+      retained.option_transfer = nil
+      vim.api.nvim_win_set_var(winid, name, retained)
+    end
   end)
   if not ok then
     local rollback_errors = {}
