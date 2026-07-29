@@ -672,44 +672,92 @@ describe("fre ticket 16 window layouts", function()
     assert.are.same({}, current_tab_views(instance))
   end)
 
-  it("applies configured window options to Fre-created and manual views without bogus window IDs", function()
+  it("applies configured options without retaining option lifecycle metadata", function()
     local instance = ready(nil, {
       layout = { position = "current" },
       window = { options = { cursorline = true, number = true } },
     })
     local first = open_view(instance)
-    assert.is_true(vim.wo[first].cursorline)
-    assert.is_true(vim.wo[first].number)
+    assert.is_true(vim.api.nvim_get_option_value(
+      "cursorline", { scope = "local", win = first }
+    ))
+    assert.is_true(vim.api.nvim_get_option_value(
+      "number", { scope = "local", win = first }
+    ))
+    local metadata = vim.api.nvim_win_get_var(first, "fre_layout_" .. instance.id)
+    assert.are.same({
+      bufnr = instance.bufnr,
+      layout = { position = "current" },
+      effective = { position = "current" },
+    }, metadata)
+
     vim.cmd("vsplit")
     local manual = vim.api.nvim_get_current_win()
     assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(manual))
-    assert.is_true(vim.wo[manual].cursorline)
-    assert.is_true(vim.wo[manual].number)
+    assert.is_true(vim.api.nvim_get_option_value(
+      "cursorline", { scope = "local", win = manual }
+    ))
+    assert.is_true(vim.api.nvim_get_option_value(
+      "number", { scope = "local", win = manual }
+    ))
 
     instance:hidden()
     assert.are.same({}, vim.fn.win_findbuf(instance.bufnr))
-    local set_option = vim.api.nvim_set_option_value
-    local window_option_calls = 0
-    vim.api.nvim_set_option_value = function(name, value, opts)
-      if opts and opts.win ~= nil then window_option_calls = window_option_calls + 1 end
-      return set_option(name, value, opts)
-    end
-    local ok, err = pcall(require("fre.buffer").apply_window_options, instance)
-    vim.api.nvim_set_option_value = set_option
-    assert.is_true(ok, tostring(err))
-    assert.are.equal(0, window_option_calls)
     assert.is_true(vim.api.nvim_buf_is_valid(instance.bufnr))
     local actual = vim.api.nvim_get_current_win()
-    vim.cmd("vsplit")
-    assert.are_not.equal(actual, vim.api.nvim_get_current_win())
+    local normal = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_option_value("bufhidden", "hide", { buf = normal })
+    vim.api.nvim_win_set_buf(actual, normal)
+    vim.api.nvim_set_option_value("cursorline", false, { scope = "local", win = actual })
+    vim.api.nvim_set_option_value("number", false, { scope = "local", win = actual })
     vim.api.nvim_win_set_buf(actual, instance.bufnr)
     wait_for(function() return instance.state == "ready-visible" end)
-    assert.is_true(vim.wo[actual].cursorline)
-    assert.is_true(vim.wo[actual].number)
-    local replacement = vim.api.nvim_create_buf(false, true)
-    vim.bo[replacement].bufhidden = "wipe"
-    vim.api.nvim_win_set_buf(actual, replacement)
+    assert.is_true(vim.api.nvim_get_option_value(
+      "cursorline", { scope = "local", win = actual }
+    ))
+    assert.is_true(vim.api.nvim_get_option_value(
+      "number", { scope = "local", win = actual }
+    ))
+    vim.api.nvim_win_set_buf(actual, normal)
     wait_for(function() return instance.state == "ready-hidden" end)
+    assert.is_false(vim.api.nvim_get_option_value(
+      "cursorline", { scope = "local", win = actual }
+    ))
+    assert.is_false(vim.api.nvim_get_option_value(
+      "number", { scope = "local", win = actual }
+    ))
+  end)
+
+  it("keeps omitted options isolated across Fre buffer pairings", function()
+    local first = ready(nil, {
+      layout = { position = "current" },
+      window = { options = { cursorline = true } },
+    })
+    local second = ready(nil, { layout = { position = "current" } })
+    local winid = open_view(second)
+    vim.api.nvim_set_option_value("cursorline", false, { scope = "local", win = winid })
+
+    assert.are.equal(winid, open_view(first))
+    assert.is_true(vim.api.nvim_get_option_value(
+      "cursorline", { scope = "local", win = winid }
+    ))
+    assert.are.equal(winid, open_view(second))
+    assert.is_false(vim.api.nvim_get_option_value(
+      "cursorline", { scope = "local", win = winid }
+    ))
+  end)
+
+  it("applies configured options to a no-autocmd same-buffer split", function()
+    local instance = ready(nil, {
+      layout = { position = "current" },
+      window = { options = { scroll = 3 } },
+    })
+    open_view(instance)
+    local split = open_view(instance, { position = "left", size = 20 })
+    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(split))
+    assert.are.equal(3, vim.api.nvim_get_option_value(
+      "scroll", { scope = "local", win = split }
+    ))
   end)
 
   it("shares one buffer while preserving independent cursor and winsaveview state", function()

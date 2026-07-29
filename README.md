@@ -103,7 +103,7 @@ end, { desc = "Open Fre" })
 
 ## 编辑文件系统
 
-Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末尾的可编辑路径。光标会被约束在已有行和导航行的路径字段内；新增未标记行仍可从第 0 列编辑。元数据可以随整行 yank，但语义只读。
+Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末尾的可编辑路径。首次显示、进入父目录和 `reveal()` 会把光标放在路径起点；之后普通、可视和插入模式可以进入 permissions、size、mtime 及可导航的自定义元数据，但不能进入隐藏身份或行首 icon。新增未标记行仍可从第 0 列编辑。元数据可以选择、yank 和暂时修改，但语义只读。
 
 | 目标 | Buffer 操作 |
 | --- | --- |
@@ -117,7 +117,7 @@ Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末�
 
 **警告：删除不经过回收站且无法撤销。删除目录行会递归删除磁盘上的全部子项，包括隐藏、折叠或未投影内容；目录复制和移动同样作用于整个子树。确认前请仔细检查计划。**
 
-路径必须是实例根目录内的相对路径。空路径、绝对路径、逃逸根目录的 `..`、重复目标和只读列修改都会在写入前报错。
+路径必须是实例根目录内的相对路径。空路径、绝对路径、逃逸根目录的 `..`、重复目标和只读元数据修改都会在写入准备阶段报错；元数据错误会指出 buffer 行号和列 ID。
 
 完成编辑后执行：
 
@@ -346,7 +346,7 @@ actions.split_select(ctx, {
 })
 ```
 
-对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会创建实例，并自动设置目标目录为 root、当前实例为 `inherit`。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`opts.instance` 可以覆盖其他实例配置，但不能覆盖 `root` 或 `inherit`。
+对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会使用源实例所属的 Manager 创建实例，并自动设置真实目录或词法父目录为 root、当前实例为 `inherit`。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`opts.instance` 可以覆盖其他实例配置，但不能覆盖 `root` 或 `inherit`。
 
 ## 列
 
@@ -391,7 +391,7 @@ columns.icon({
 
 默认可见顺序是 `icon -> permissions -> size -> mtime -> path`。`size` 使用 `lstat.size` 和十进制单位：`999`、`1.0k`、`1.0M`、`1.0G`；目录显示自身元数据而非递归总量，symlink 显示 link 对象本身的大小，缺失值显示 `-`。
 
-列是 buffer 中真实、可选择和可 yank 的文本，但语义只读。写入前 Fre 会重新解析并验证它们；复制或移动带 marker 的行时，Fre 会为新位置增量恢复对应的 highlight。导航行使用相同列序和宽度；custom callback 会收到 `ctx.synthetic = true`、`ctx.navigation_kind` 以及代表 `..` 或 `/` 的 callback-only directory Entry，但 `instance:get_entry(1)` 仍返回 `nil`。
+列是 buffer 中真实、可选择和可 yank 的文本，但语义只读。Fre 允许把元数据修改保留为草稿，直到写入准备阶段重新解析并按行号、列 ID 验证；复制或移动带 marker 的行时，Fre 会为新位置增量恢复对应的 highlight。导航行使用相同列序和投影宽度；custom callback 会收到 `ctx.synthetic = true`、`ctx.navigation_kind` 以及代表 `..` 或 `/` 的 callback-only directory Entry，但 `instance:get_entry(1)` 仍返回 `nil`。
 
 自定义列必须提供唯一 `id`、对齐方式和 render/parse/equals 契约：
 
@@ -416,7 +416,7 @@ columns.custom({
 })
 ```
 
-`metadata` 只支持 `kind`、`mode`、`size`、`mtime`。`render` 可以返回文本和可选 highlight group；文本必须是无控制字符的有效 UTF-8。
+`metadata` 只支持 `kind`、`mode`、`size`、`mtime`。`render` 可以返回文本和可选 highlight group；文本必须是无控制字符的有效 UTF-8。每次投影会先渲染所有行并测量各列，再按 `align = "left" | "center" | "right"` 统一填充；自定义列宽可随内容增长或收缩，path 始终是最后的无界字段。列宽变化时，Fre 按字段和内容偏移恢复光标，不会把原本位于内容上的光标移入对齐空格。
 
 ## Lua API
 
@@ -563,7 +563,11 @@ GC 只考虑已隐藏且当前可安全销毁的实例。可见、写入锁定�
 
 ## 稳定 marker 与特殊文件排查
 
-每个已有条目在物理 buffer 行首都带有 `\x1ffre:<instance-id>:<node-id>\x1f` 稳定身份 marker；导航行使用独立的 `\x1ffre-nav:<instance-id>:parent|root\x1f` marker。它们在正常窗口中通过 buffer-local syntax conceal 隐藏；raw buffer API、`:print` 和普通 yank 会保留这些真实字节，这是协议的一部分。导航 marker 不属于 Tree、baseline 或 filesystem mutation。
+每个已有条目和导航行在物理 buffer 行首都带有统一的 `\x1ffre:<instance-id>:<node-id>\x1f` 稳定身份 marker。两个 ID 都是从宽度 3 开始的零填充十进制数；没有 base36 或固定宽度上限。真实 instance/node ID 为正数，node ID `0` 是唯一导航哨兵：它根据源实例 root 表示 `../` 或 `/`，不属于 Tree、baseline 或 filesystem mutation。
+
+Marker 是隐藏的内部结构文本，不是可配置列。每个 Manager 生命周期内，instance/node 字段宽度只会随 ID 位数单调增长且不会收缩；单次投影只使用一个宽度快照，因此所有规范行的 marker 等长。宽度增长不会覆盖已修改 buffer：草稿保留旧 marker 字节，直到成功写入或显式成功刷新后才按当前宽度规范化。
+
+正式的 `syntax/fre.vim` 在首个带 marker 的投影前提供 conceal；目标窗口也会在显示 Fre 前应用 conceal 等局部选项，并在离开 Fre 时恢复之前的值。Raw buffer API、`:print` 和普通 yank 仍会保留这些真实字节，这是复制身份协议的一部分。
 
 若屏幕上直接出现 `fre:1:...`，在对应 Fre 窗口检查：
 

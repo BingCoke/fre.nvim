@@ -265,6 +265,9 @@ local function validate_window(value, path)
   check_known_keys(value, { options = true }, path)
   if value.options ~= nil then
     validate_named_map(value.options, path .. ".options", validate_option)
+    if value.options.winfixbuf == true then
+      fail(path .. ".options.winfixbuf must not be true")
+    end
   end
 end
 

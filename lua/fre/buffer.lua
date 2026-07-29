@@ -509,19 +509,12 @@ function M.setup(instance)
   vim.api.nvim_create_autocmd("BufWinEnter", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function()
-      local winid = vim.api.nvim_get_current_win()
-      window.prepare(instance, winid)
-      window.activate(instance, winid)
       if instance._window_transition then return end
+      local winid = vim.api.nvim_get_current_win()
+      window.apply(instance, winid)
       M.place_initial_cursor(instance, winid)
       instance:_on_visibility_enter()
       if instance._pending_reveal then instance:_apply_pending_reveal(winid) end
-    end,
-  })
-  vim.api.nvim_create_autocmd("BufLeave", {
-    group = instance._buffer_augroup, buffer = instance.bufnr,
-    callback = function()
-      window.release(instance, vim.api.nvim_get_current_win())
     end,
   })
   vim.api.nvim_create_autocmd("BufWinLeave", {
@@ -531,7 +524,6 @@ function M.setup(instance)
       if instance._pending_initial_cursor then
         instance._pending_initial_cursor[winid] = nil
       end
-      window.release(instance, winid)
       vim.schedule(function() window.sync_visibility(instance) end)
     end,
   })

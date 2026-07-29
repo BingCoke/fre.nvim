@@ -92,6 +92,19 @@ describe("fre configuration", function()
     assert.is_true(second.window.options.cursorline)
   end)
 
+  it("rejects winfixbuf true while accepting false", function()
+    local manager = new_manager()
+    assert_error_contains("window.options.winfixbuf", function()
+      manager:setup({ window = { options = { winfixbuf = true } } })
+    end)
+    assert_error_contains("window.options.winfixbuf", function()
+      manager:resolve_instance_config({ window = { options = { winfixbuf = true } } })
+    end)
+    assert.is_false(manager:resolve_instance_config({
+      window = { options = { winfixbuf = false } },
+    }).window.options.winfixbuf)
+  end)
+
   it("merges layouts by position family and rejects explicitly irrelevant fields", function()
     local manager = new_manager()
     manager:setup({ layout = { position = "right" } })
