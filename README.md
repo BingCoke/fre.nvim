@@ -141,10 +141,11 @@ Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末�
 
 | 按键 | 行为 |
 | --- | --- |
-| `<CR>` | 打开文件或 symlink；进入目录或选择 `../` 时创建继承当前视图状态的实例；在根 `/` 上无操作 |
+| `<CR>` | 打开文件或 symlink；进入目录或选择 `../` 时创建独立实例，并传入普通的 `sort`/`hidden_file` 值选项；在根 `/` 上无操作 |
 | `zv` | 展开光标所在目录；非目录行无操作 |
 | `zc` | 折叠光标所在目录；非目录行无操作 |
 | `za` | 切换目录展开状态；非目录行无操作 |
+| `zM` | 折叠实例中全部目录；与光标所在行无关 |
 | `q` | 隐藏当前 tab 中的 Fre 视图，但保留实例和 buffer |
 | `g.` | 显示或隐藏点文件 |
 | `R` | 刷新；buffer 已修改时先确认是否丢弃草稿 |
@@ -164,6 +165,7 @@ fre.setup({
 
   hidden_file = false,
   skip_confirm_for_simple_edits = false,
+  auto_expand_single_directory = false,
 
   columns = {
     columns.icon(),
@@ -223,6 +225,7 @@ fre.setup({
 | `default_file_explorer` | `true` | 第一次 `setup()` 是否接管本地目录 buffer；仅 setup 可用 |
 | `hidden_file` | `false` | 是否投影 basename 以 `.` 开头的条目 |
 | `skip_confirm_for_simple_edits` | `false` | 是否跳过简单文件系统编辑的写入确认 |
+| `auto_expand_single_directory` | `false` | 展开目录并完成新扫描后，仅当扫描结果只有一个直接子项且它是当前可见的真实目录时才自动继续展开 |
 | `sort` | 目录优先、ASCII 不区分大小写名称排序 | 每个父目录独立调用的比较函数 |
 | `columns` | icon、permissions、size、mtime | 完整替换列描述符序列；path 始终是最后的专用字段 |
 | `gc.ttl_ms` | `60000` | 隐藏实例的回收延迟；`0` 禁用 TTL 回收 |
@@ -253,6 +256,7 @@ local instance = require("fre").new({
   root = "/absolute/path/to/project", -- 必填
   hidden_file = true,
   skip_confirm_for_simple_edits = true,
+  auto_expand_single_directory = true,
   sort = custom_sort,
   expanded = { "src", "src/x" }, -- 相对于 root 的初始展开目录
   columns = custom_columns,
@@ -269,7 +273,7 @@ local instance = require("fre").new({
 })
 ```
 
-实例选项覆盖 setup 默认值。每个实例完全由本次传入的值选项决定；`expanded` 是 root-relative 目录列表，会按 root 的平台路径语义规范化，并在 root 加载后通过普通展开流程逐项应用。全部初始展开完成后实例才 ready；路径缺失、不是目录或加载失败都会使本次初始化失败。`fre.new()` 不接受来源实例或实例引用，也不会在实例之间建立状态关系。`default_file_explorer`、`gc.groups` 和 `gc.default_group` 是 setup-only 配置，不能传给 `fre.new()`。
+实例选项覆盖 setup 默认值。每个实例完全由本次传入的值选项决定；`expanded` 是 root-relative 目录列表，会按 root 的平台路径语义规范化，并在 root 加载后通过普通展开流程逐项应用。`auto_expand_single_directory = true` 时，每次新展开都会等待该目录的新扫描完成；仅当整个扫描结果恰好只有一个直接子项、该子项是真实目录且符合当前 `hidden_file` 设置时，才展开它并重复。任何文件、symlink 或隐藏兄弟项都会使子项总数不再为一，即使该项不会投影；唯一子项是文件或 symlink 时也不会继续，且不会跟随 symlink。唯一子项是隐藏目录时，仅在 `hidden_file = true` 时继续。遇到其他情况、扫描错误或手动折叠时停止。全部初始展开及其自动后缀完成后实例才 ready；路径缺失、不是目录或加载失败都会使本次初始化失败。`fre.new()` 不接受来源实例或实例引用，也不会在实例之间建立状态关系。`default_file_explorer`、`gc.groups` 和 `gc.default_group` 是 setup-only 配置，不能传给 `fre.new()`。
 
 ## 窗口布局
 
@@ -334,6 +338,7 @@ local ctx = actions.context()
 actions.expand(ctx)
 actions.collapse(ctx)
 actions.toggle_expand(ctx)
+actions.collapse_all(ctx)
 actions.toggle_hidden_file(ctx)
 actions.refresh(ctx)
 actions.jump_to_path(ctx) -- 当前 entry/navigation 行的 path 字段起点
@@ -453,6 +458,7 @@ instance:toggle(layout)
 instance:expand(path)
 instance:collapse(path)
 instance:toggle_expand(path)
+instance:collapse_all()
 instance:reveal(path)
 
 instance:set_sort(compare)
@@ -482,7 +488,7 @@ instance:destroy()
 }
 ```
 
-`expand`、`collapse`、`toggle_expand` 和 `reveal` 接受 root 内的 snapshot 相对路径，也可接受 root 内绝对路径；`get_pos` 和 `set_cursor_to_path` 接受 snapshot 相对路径。`set_cursor_to_path` 可以在创建期间调用：它等待实例 ready 后，把指定窗口的 cursor 放到目标条目的 path 起点，不展开目录或保存 cursor 状态。会改变投影的操作在 buffer 已修改时会直接报错，以避免覆盖草稿；窗口操作和 lookup 仍可使用。
+`expand`、`collapse`、`toggle_expand` 和 `reveal` 接受 root 内的 snapshot 相对路径，也可接受 root 内绝对路径；`collapse_all` 与光标和路径无关，会清除缓存树中全部非 root 目录的展开状态，同时保留目录缓存与元数据。`get_pos` 和 `set_cursor_to_path` 接受 snapshot 相对路径。`set_cursor_to_path` 可以在创建期间调用：它等待实例 ready 后，把指定窗口的 cursor 放到目标条目的 path 起点，不展开目录或保存 cursor 状态。会改变投影的操作在 buffer 已修改时会直接报错，以避免覆盖草稿；窗口操作和 lookup 仍可使用。
 
 `setGroup(group)` 将实例迁移到 `setup()` 中已存在的 GC 组，并立即按目标组容量执行回收；迁移实例在本次容量约束中受保护。该操作不会重置当前隐藏区间或 TTL timer，并同步更新 `instance.config.gc.group` 与保留 buffer metadata `vim.b.fre.gc_group`。
 
@@ -500,7 +506,7 @@ instance:when_ready(function(err)
 end)
 ```
 
-配置了 `expanded` 时，root 和全部初始展开目录完成加载后才会调用 `when_ready` 并触发 `FreReady`。初始化展开失败时，Instance 进入 `load-failed`，错误同时传给 callback 和事件的 `data.error`。
+配置了 `expanded` 时，root、全部初始展开目录以及 `auto_expand_single_directory` 产生的自动展开后缀完成加载后，才会调用 `when_ready` 并触发 `FreReady`。初始化展开失败时，Instance 进入 `load-failed`，错误同时传给 callback 和事件的 `data.error`。
 
 也可以监听 `User FreReady`：
 

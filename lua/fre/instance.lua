@@ -702,8 +702,13 @@ function Instance:_ensure_directory_loaded(node, callback)
   if not ok then done(adapter_err) end
 end
 
-function Instance:_rescan_directory(node)
-  if not node.loaded or node.load_state == "refreshing" then return end
+function Instance:_rescan_directory(node, callback)
+  if not node.loaded then return end
+  node._rescan_waiters = node._rescan_waiters or {}
+  node._rescan_waiters[#node._rescan_waiters + 1] = callback or function(err)
+    if err then self:_report_async_error(err) end
+  end
+  if node.load_state == "refreshing" then return end
   node.load_generation = node.load_generation + 1
   local generation = node.load_generation
   node.load_state = "refreshing"
@@ -718,11 +723,14 @@ function Instance:_rescan_directory(node)
       end
       if vim.bo[self.bufnr].modified or (self.actions and self.actions.write)
           or not self:_active_directory(node) then
+        node._rescan_waiters = {}
         node.load_state = "loaded"
         node.loaded = true
         node.children_cached = true
         return
       end
+      local waiters = node._rescan_waiters or {}
+      node._rescan_waiters = {}
       local tree_snapshot
       if not err then
         tree_snapshot = self.tree:snapshot_directory(node)
@@ -735,6 +743,14 @@ function Instance:_rescan_directory(node)
         end)
         if not ok then err = value end
       end
+      if not err then
+        local ok, result = pcall(self._render_success, self)
+        if not ok then
+          err = result
+        elseif result == false then
+          err = "buffer projection commit failed"
+        end
+      end
       if err then
         if tree_snapshot then
           self.tree:restore_directory(node, tree_snapshot)
@@ -743,20 +759,10 @@ function Instance:_rescan_directory(node)
         node.load_state = "loaded"
         node.loaded = true
         node.children_cached = true
-        self:_report_async_error(err)
-        return
-      end
-      local ok, render_err = pcall(self._render_success, self)
-      if not ok then
-        self.tree:restore_directory(node, tree_snapshot)
-        self:_projection()
-        node.load_state = "loaded"
-        node.loaded = true
-        node.children_cached = true
-        self:_report_async_error(render_err)
       else
         self:_sync_watchers()
       end
+      for _, waiter in ipairs(waiters) do waiter(err) end
     end)
   end
   local ok, adapter_err = pcall(self.manager:get_fs_adapter().load, node.path, done)
@@ -769,6 +775,7 @@ function Instance:_invalidate_subtree_loads(node)
     local preserved = node.loaded
     node.load_generation = node.load_generation + 1
     node._load_waiters = {}
+    node._rescan_waiters = {}
     node.load_state = preserved and "loaded" or "unloaded"
     node.loaded = preserved
     node.children_cached = preserved
@@ -837,6 +844,36 @@ function Instance:_expand(snapshot_path, on_complete, initializing)
       self:_report_async_error(expand_err)
     end
   end
+  local auto_expand
+  local function resume_auto(parent)
+    local ok, expand_err = pcall(auto_expand, parent)
+    if not ok then stop(expand_err) end
+  end
+  auto_expand = function(parent)
+    if not request.active or self.nodes_by_id[parent.id] ~= parent
+        or not self:_active_directory(parent) then return end
+    local children = parent.children_order or {}
+    if #children ~= 1 then stop(nil); return end
+    local child = children[1]
+    if child.kind ~= "directory"
+        or (not self.current_hidden_file and child.name:sub(1, 1) == ".") then
+      stop(nil)
+      return
+    end
+    if not child.expanded then
+      child.expanded = true
+      self:_render_success()
+      self:_sync_watchers()
+    end
+    local function continue(load_err)
+      if load_err then stop(load_err) else resume_auto(child) end
+    end
+    if child.loaded then
+      self:_rescan_directory(child, continue)
+    else
+      self:_ensure_directory_loaded(child, continue)
+    end
+  end
   local walk
   local function resume(parent, index)
     if request.synchronous then
@@ -845,6 +882,15 @@ function Instance:_expand(snapshot_path, on_complete, initializing)
     end
     local ok, walk_err = pcall(walk, parent, index)
     if not ok then stop(walk_err) end
+  end
+  local function continue_explicit(child, index, became_expanded)
+    if index < #segments then
+      resume(child, index + 1)
+    elseif self.config.auto_expand_single_directory and (became_expanded or initializing) then
+      resume_auto(child)
+    else
+      stop(nil)
+    end
   end
   walk = function(parent, index)
     if not request.active then return end
@@ -864,22 +910,30 @@ function Instance:_expand(snapshot_path, on_complete, initializing)
       self:_render_success()
       self:_sync_watchers()
     end
+    local function continue(load_err)
+      if load_err then
+        stop(load_err)
+      else
+        continue_explicit(child, index, became_expanded)
+      end
+    end
     if child.loaded then
-      if became_expanded then self:_rescan_directory(child) end
-      if index == #segments then stop(nil) else resume(child, index + 1) end
-    else
-      self:_ensure_directory_loaded(child, function(load_err)
-        if load_err then
-          stop(load_err)
-        elseif index == #segments then
-          stop(nil)
+      local rescan_for_initial_auto = initializing and index == #segments
+        and self.config.auto_expand_single_directory
+      if became_expanded or rescan_for_initial_auto then
+        if self.config.auto_expand_single_directory then
+          self:_rescan_directory(child, continue)
         else
-          resume(child, index + 1)
+          self:_rescan_directory(child)
+          continue(nil)
         end
-      end)
+      else
+        continue(nil)
+      end
+    else
+      self:_ensure_directory_loaded(child, continue)
     end
   end
-
   resume(self.root_node, 1)
   request.synchronous = false
   return nil
@@ -898,6 +952,26 @@ function Instance:collapse(snapshot_path)
   self:_invalidate_subtree_loads(node)
   self:_render_success()
   self:_sync_watchers()
+  return nil
+end
+
+function Instance:collapse_all()
+  self:_require_projection_change()
+  local changed = false
+  for _, node in pairs(self.nodes_by_id) do
+    if node ~= self.root_node and node.kind == "directory" and node.expanded then
+      node.expanded = false
+      changed = true
+    end
+  end
+  if not changed then
+    self:_schedule_watch_followup()
+    return nil
+  end
+  self:_invalidate_subtree_loads(self.root_node)
+  self:_render_success()
+  self:_sync_watchers()
+  self:_schedule_watch_followup()
   return nil
 end
 

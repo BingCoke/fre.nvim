@@ -33,6 +33,7 @@ describe("fre configuration", function()
     assert.is_true(defaults.default_file_explorer)
     assert.is_false(defaults.hidden_file)
     assert.is_false(defaults.skip_confirm_for_simple_edits)
+    assert.is_false(defaults.auto_expand_single_directory)
     assert.is_true(defaults.use_mapping_default)
     assert.are.same({ "icon", "permissions", "size", "mtime" }, {
       defaults.columns[1].id,
@@ -108,6 +109,22 @@ describe("fre configuration", function()
     }).skip_confirm_for_simple_edits)
     assert_error_contains("skip_confirm_for_simple_edits must be a boolean", function()
       manager:resolve_instance_config({ skip_confirm_for_simple_edits = 1 })
+    end)
+  end)
+
+  it("validates and overrides auto_expand_single_directory for setup and instances", function()
+    local manager = new_manager()
+    manager:setup({ auto_expand_single_directory = true })
+    assert.is_true(manager:get_setup_defaults().auto_expand_single_directory)
+    assert.is_true(manager:resolve_instance_config().auto_expand_single_directory)
+    assert.is_false(manager:resolve_instance_config({
+      auto_expand_single_directory = false,
+    }).auto_expand_single_directory)
+    assert_error_contains("must be a boolean", function()
+      manager:setup({ auto_expand_single_directory = "yes" })
+    end)
+    assert_error_contains("must be a boolean", function()
+      manager:resolve_instance_config({ auto_expand_single_directory = 1 })
     end)
   end)
 

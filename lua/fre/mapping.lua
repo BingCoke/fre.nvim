@@ -92,6 +92,7 @@ local function mapping_base()
       ["zv"] = actions.expand,
       ["zc"] = actions.collapse,
       ["za"] = actions.toggle_expand,
+      ["zM"] = actions.collapse_all,
       ["q"] = actions.hidden,
       ["g."] = actions.toggle_hidden_file,
       ["R"] = actions.refresh,
@@ -122,7 +123,11 @@ end
 
 function M.setup(instance)
   if instance._mapping_installed then fail("instance mappings are already installed", 2) end
-  local jump_to_path = require("fre.actions").jump_to_path
+  local actions = require("fre.actions")
+  local allow_undecodable_row = {
+    [actions.jump_to_path] = true,
+    [actions.collapse_all] = true,
+  }
   local base = instance.config.use_mapping_default and mapping_base() or {}
   local installed_maps = overlay(base, copy_maps(instance.config.mapping))
   local installed = {}
@@ -130,7 +135,7 @@ function M.setup(instance)
     for mode, mode_map in pairs(installed_maps) do
       for lhs, handler in pairs(mode_map) do
         vim.keymap.set(mode, lhs, function()
-          local context_opts = handler == jump_to_path
+          local context_opts = allow_undecodable_row[handler]
             and { allow_undecodable_row = true } or nil
           return handler(M.context(instance, context_opts))
         end, {

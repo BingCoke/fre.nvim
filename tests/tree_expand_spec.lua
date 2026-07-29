@@ -176,6 +176,268 @@ describe("fre directory tree expansion", function()
     assert.are.equal(instance.error, event.error)
   end)
 
+  it("waits for configured single-directory suffixes before readiness", function()
+    fixture:tree({ ["src/one/two/end.txt"] = "x" })
+    local adapter, counts, _, release = deferred_loader()
+    fre._set_fs_adapter(adapter)
+    local callback_count = 0
+    local instance = keep(fre.new({
+      root = fixture.root,
+      expanded = { "src" },
+      auto_expand_single_directory = true,
+    }))
+    instance:when_ready(function() callback_count = callback_count + 1 end)
+
+    local src = fixture:path("src")
+    local one = fixture:path("src", "one")
+    local two = fixture:path("src", "one", "two")
+    release(instance.root)
+    release(src)
+    release(one)
+    assert.are.equal("creating", instance.state)
+    assert.are.equal(0, callback_count)
+    release(two)
+    wait_ready(instance)
+    wait_for(function() return callback_count == 1 end)
+    assert.are.equal(1, counts[src])
+    assert.are.equal(1, counts[one])
+    assert.are.equal(1, counts[two])
+    assert.is_true(instance.nodes_by_path[src].expanded)
+    assert.is_true(instance.nodes_by_path[one].expanded)
+    assert.is_true(instance.nodes_by_path[two].expanded)
+  end)
+
+  it("retries configured automatic suffixes before becoming ready", function()
+    fixture:tree({ ["src/one/two/end.txt"] = "x" })
+    local adapter, counts, _, release = deferred_loader()
+    fre._set_fs_adapter(adapter)
+    local instance = keep(fre.new({
+      root = fixture.root,
+      expanded = { "src" },
+      auto_expand_single_directory = true,
+    }))
+    local src = fixture:path("src")
+    local one = fixture:path("src", "one")
+    local two = fixture:path("src", "one", "two")
+
+    release(instance.root)
+    release(src)
+    release(one, 1, "automatic suffix failed")
+    wait_for(function() return instance.state == "load-failed" end)
+
+    local refresh_done, refresh_error = false, nil
+    instance:refresh({ on_complete = function(err)
+      refresh_done = true
+      refresh_error = err
+    end })
+    release(instance.root, 2)
+    wait_for(function() return counts[src] == 2 end)
+    assert.are.equal("creating", instance.state)
+    assert.is_false(refresh_done)
+    release(src, 2)
+    wait_for(function() return counts[one] == 2 end)
+    assert.are.equal("creating", instance.state)
+    assert.is_false(refresh_done)
+    release(one, 2)
+    wait_for(function() return counts[two] == 1 end)
+    assert.are.equal("creating", instance.state)
+    assert.is_false(refresh_done)
+    release(two)
+
+    wait_ready(instance)
+    wait_for(function() return refresh_done end)
+    assert.is_nil(refresh_error)
+    assert.are.equal(2, counts[src])
+    assert.are.equal(2, counts[one])
+    assert.are.equal(1, counts[two])
+    assert.is_true(instance.nodes_by_path[src].expanded)
+    assert.is_true(instance.nodes_by_path[one].expanded)
+    assert.is_true(instance.nodes_by_path[two].expanded)
+    assert.is_not_nil(instance:get_pos("src/one/two/end.txt"))
+  end)
+
+  it("requires exactly one total direct child before automatic expansion", function()
+    local target = fixture:write("target.txt", "x")
+    fixture:tree({
+      ["pure/com/xxx/xx/src/end.txt"] = "x",
+      ["directory-file/only/end.txt"] = "x",
+      ["directory-file/file.txt"] = "x",
+      ["directory-symlink/only/end.txt"] = "x",
+      ["directory-hidden-file/only/end.txt"] = "x",
+      ["directory-hidden-file/.marker"] = "x",
+      ["directory-hidden-directory/only/end.txt"] = "x",
+      ["directory-hidden-directory/.secret/end.txt"] = "x",
+      ["multiple/a/end.txt"] = "a",
+      ["multiple/b/end.txt"] = "b",
+      ["sole-file/file.txt"] = "x",
+      ["hidden-only/.secret/end.txt"] = "x",
+      ["off/only/end.txt"] = "x",
+    })
+    local directory_link = fixture:symlink(target, "directory-symlink/link")
+    local sole_link = fixture:symlink(target, "sole-symlink/link")
+    local enabled = wait_ready(keep(fre.new({
+      root = fixture.root, auto_expand_single_directory = true,
+    })))
+    local function expand_and_wait(relative)
+      enabled:expand(relative)
+      local absolute = fixture:path(relative)
+      wait_for(function() return enabled.nodes_by_path[absolute].loaded end)
+      return enabled.nodes_by_path[absolute]
+    end
+    local function assert_directory_stopped(parent, child)
+      expand_and_wait(parent)
+      assert.is_false(enabled.nodes_by_path[fixture:path(parent, child)].expanded)
+      assert.is_nil(enabled:get_pos(parent .. "/" .. child .. "/end.txt"))
+    end
+
+    enabled:expand("pure")
+    wait_for(function() return enabled:get_pos("pure/com/xxx/xx/src/end.txt") ~= nil end)
+    for _, relative in ipairs({
+      "pure/com", "pure/com/xxx", "pure/com/xxx/xx", "pure/com/xxx/xx/src",
+    }) do
+      assert.is_true(enabled.nodes_by_path[fixture:path(relative)].expanded)
+    end
+
+    assert_directory_stopped("directory-file", "only")
+    assert_directory_stopped("directory-hidden-file", "only")
+    assert_directory_stopped("directory-hidden-directory", "only")
+    assert_directory_stopped("multiple", "a")
+    assert.is_false(enabled.nodes_by_path[fixture:path("multiple", "b")].expanded)
+
+    if directory_link then
+      assert_directory_stopped("directory-symlink", "only")
+      assert.are.equal("symlink", enabled.nodes_by_path[directory_link].kind)
+    end
+
+    local sole_file = expand_and_wait("sole-file")
+    assert.are.equal(1, #sole_file.children_order)
+    assert.are.equal("file", sole_file.children_order[1].kind)
+
+    local hidden_only = expand_and_wait("hidden-only")
+    assert.are.equal(1, #hidden_only.children_order)
+    assert.is_false(enabled.nodes_by_path[fixture:path("hidden-only", ".secret")].expanded)
+
+    if sole_link then
+      local sole_symlink = expand_and_wait("sole-symlink")
+      assert.are.equal(1, #sole_symlink.children_order)
+      assert.are.equal("symlink", sole_symlink.children_order[1].kind)
+    end
+
+    local show_hidden = wait_ready(keep(fre.new({
+      root = fixture.root, hidden_file = true, auto_expand_single_directory = true,
+    })))
+    show_hidden:expand("hidden-only")
+    wait_for(function() return show_hidden:get_pos("hidden-only/.secret/end.txt") ~= nil end)
+    assert.is_true(show_hidden.nodes_by_path[fixture:path("hidden-only", ".secret")].expanded)
+
+    local disabled = wait_ready(keep(fre.new({ root = fixture.root })))
+    disabled:expand("off")
+    wait_for(function() return disabled.nodes_by_path[fixture:path("off")].loaded end)
+    assert.is_false(disabled.nodes_by_path[fixture:path("off", "only")].expanded)
+  end)
+
+  it("chooses from a completed fresh rescan instead of cached children", function()
+    fixture:tree({ ["target/a/end.txt"] = "a", ["target/b/end.txt"] = "b" })
+    local adapter, counts, pending, release = deferred_loader()
+    fre._set_fs_adapter(adapter)
+    local instance = keep(fre.new({
+      root = fixture.root, auto_expand_single_directory = true,
+    }))
+    release(instance.root)
+    wait_ready(instance)
+    local target = fixture:path("target")
+    local a = fixture:path("target", "a")
+
+    instance:expand("target")
+    release(target, 1)
+    wait_for(function() return instance.nodes_by_path[target].loaded end)
+    assert.is_false(instance.nodes_by_path[a].expanded)
+    instance:collapse("target")
+    fs.remove_tree(fixture:path("target", "b"))
+    instance:expand("target")
+    wait_for(function() return pending[target] and pending[target][2] end)
+    assert.is_false(instance.nodes_by_path[a].expanded)
+    assert.are.equal(2, counts[target])
+    release(target, 2)
+    wait_for(function() return instance.nodes_by_path[a].expanded end)
+    release(a)
+    wait_for(function() return instance:get_pos("target/a/end.txt") ~= nil end)
+  end)
+
+  it("preserves an expanded prefix and reports one recursive load error", function()
+    fixture:tree({ ["target/only/end.txt"] = "x" })
+    local adapter, _, pending, release = deferred_loader()
+    fre._set_fs_adapter(adapter)
+    local instance = keep(fre.new({
+      root = fixture.root, auto_expand_single_directory = true,
+    }))
+    release(instance.root)
+    wait_ready(instance)
+    local notices = {}
+    local original_notify = vim.notify
+    vim.notify = function(message) notices[#notices + 1] = message end
+    local target = fixture:path("target")
+    local only = fixture:path("target", "only")
+
+    instance:expand("target")
+    release(target)
+    wait_for(function() return pending[only] and pending[only][1] end)
+    release(only, 1, "recursive load exploded")
+    wait_for(function() return #notices == 1 end)
+    pending[only][1]()
+    vim.wait(30, function() return false end, 10)
+    vim.notify = original_notify
+    assert.are.equal(1, #notices)
+    assert.is_true(instance.nodes_by_path[target].expanded)
+    assert.is_true(instance.nodes_by_path[only].expanded)
+    assert.is_truthy(instance._last_async_error:find("recursive load exploded", 1, true))
+  end)
+
+  it("lets collapse and collapse_all cancel recursive work without late errors", function()
+    fixture:tree({ ["target/only/end.txt"] = "x" })
+    local adapter, _, pending, release = deferred_loader()
+    fre._set_fs_adapter(adapter)
+    local instance = keep(fre.new({
+      root = fixture.root, auto_expand_single_directory = true,
+    }))
+    release(instance.root)
+    wait_ready(instance)
+    local notices = {}
+    local original_notify = vim.notify
+    vim.notify = function(message) notices[#notices + 1] = message end
+    local target = fixture:path("target")
+    local only = fixture:path("target", "only")
+
+    instance:expand("target")
+    wait_for(function() return pending[target] and pending[target][1] end)
+    instance:collapse_all()
+    release(target, 1)
+    vim.wait(30, function() return false end, 10)
+    assert.is_false(instance.nodes_by_path[target].expanded)
+    assert.is_nil(instance.nodes_by_path[only])
+
+    instance:expand("target")
+    release(target, 2)
+    wait_for(function() return pending[only] and pending[only][1] end)
+    instance:collapse("target")
+    release(only, 1, "cancelled load must be ignored")
+    vim.wait(30, function() return false end, 10)
+    vim.notify = original_notify
+    assert.is_false(instance.nodes_by_path[target].expanded)
+    assert.is_nil(instance:get_pos("target/only"))
+    assert.are.same({}, notices)
+  end)
+
+  it("does not apply single-directory expansion to reveal", function()
+    fixture:tree({ ["a/target.txt"] = "x", ["a/only/end.txt"] = "y" })
+    local instance = wait_ready(keep(fre.new({
+      root = fixture.root, auto_expand_single_directory = true,
+    })))
+    instance:reveal("a/target.txt")
+    wait_for(function() return instance:get_pos("a/target.txt") ~= nil end)
+    assert.is_false(instance.nodes_by_path[fixture:path("a", "only")].expanded)
+  end)
+
 
   it("loads a deep path segment-by-segment into one instance-local tree", function()
     fixture:tree({
@@ -262,6 +524,51 @@ describe("fre directory tree expansion", function()
     assert.are.same({
       "a/", "a/n/", "a/n/z.txt", "a/a.txt", "b/", "b/y.txt", "c.txt",
     }, projected_paths(instance))
+  end)
+
+  it("does not rescan or recurse when expanding an already-expanded directory", function()
+    fixture:tree({ ["target/only/end.txt"] = "x" })
+    local counts = {}
+    fre._set_fs_adapter({ load = function(scan_path, done)
+      counts[scan_path] = (counts[scan_path] or 0) + 1
+      real_fs.load(scan_path, done)
+    end })
+    local instance = wait_ready(keep(fre.new({
+      root = fixture.root, auto_expand_single_directory = true,
+    })))
+    local target_path = fixture:path("target")
+    local only_path = fixture:path("target", "only")
+    instance:expand("target")
+    wait_for(function() return instance:get_pos("target/only/end.txt") ~= nil end)
+    instance:collapse("target/only")
+    local target_scans = counts[target_path]
+    local only_scans = counts[only_path]
+
+    instance:expand("target")
+    vim.wait(40, function() return false end, 10)
+
+    assert.are.equal(target_scans, counts[target_path])
+    assert.are.equal(only_scans, counts[only_path])
+    assert.is_true(instance.nodes_by_path[target_path].expanded)
+    assert.is_false(instance.nodes_by_path[only_path].expanded)
+  end)
+
+  it("collapses inactive cached descendants after their ancestor is collapsed", function()
+    fixture:tree({ ["a/n/deep.txt"] = "x" })
+    local instance = wait_ready(keep(fre.new({ root = fixture.root })))
+    instance:expand("a/n")
+    wait_for(function() return instance:get_pos("a/n/deep.txt") ~= nil end)
+    local a = instance.nodes_by_path[fixture:path("a")]
+    local n = instance.nodes_by_path[fixture:path("a", "n")]
+
+    instance:collapse("a")
+    assert.is_false(a.expanded)
+    assert.is_true(n.expanded)
+    instance:collapse_all()
+
+    assert.is_false(a.expanded)
+    assert.is_false(n.expanded)
+    assert.is_nil(instance:get_pos("a/n"))
   end)
 
   it("collapses only contiguous descendants and restores cached deep expansion immediately", function()

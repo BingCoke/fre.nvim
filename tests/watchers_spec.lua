@@ -258,6 +258,104 @@ describe("fre ticket 15 directory watchers", function()
     assert.are_not.equal(a_handle, watcher:latest(path.resolve(instance.root, "a")))
   end)
 
+  it("collapse_all closes descendant watchers and makes their stale callbacks inert", function()
+    local instance = ready({ ["a/n/deep.txt"] = "x", ["b/other.txt"] = "y" })
+    instance:expand("a/n")
+    instance:expand("b")
+    wait_idle(instance)
+    instance:open()
+    local a = fixture:path("a")
+    local n = fixture:path("a", "n")
+    local b = fixture:path("b")
+    local a_handle = watcher:latest(a)
+    local n_handle = watcher:latest(n)
+    local b_handle = watcher:latest(b)
+    watcher:emit(a, nil, "old")
+    local stale_timer = a_handle.timer.callbacks[#a_handle.timer.callbacks]
+    local counts = loader_counts()
+
+    instance:collapse_all()
+    assert.are.same({ instance.root }, instance._watchers:paths())
+    for _, handle in ipairs({ a_handle, n_handle, b_handle }) do
+      assert.is_true(handle.closed)
+      assert.is_true(handle.timer.closed)
+    end
+    a_handle.callback(nil, "late", {})
+    stale_timer()
+    vim.wait(40, function() return false end, 10)
+    assert.is_nil(counts[a])
+    assert.is_nil(counts[n])
+    assert.is_nil(counts[b])
+    assert.is_false(instance.nodes_by_path[a].expanded)
+    assert.is_false(instance.nodes_by_path[n].expanded)
+    assert.is_false(instance.nodes_by_path[b].expanded)
+
+    instance:expand("a")
+    assert.are.same({ instance.root, a }, instance._watchers:paths())
+    assert.are_not.equal(a_handle, watcher:latest(a))
+    assert.is_false(instance.nodes_by_path[n].expanded)
+    wait_idle(instance)
+    assert.are.same({ instance.root, a }, instance._watchers:paths())
+  end)
+
+  it("follows canceled root watch refreshes after collapse_all, including a no-op collapse_all", function()
+    local instance = ready({ ["dir/old.txt"] = "old" })
+    instance:expand("dir")
+    wait_idle(instance)
+    instance:open()
+    local counts, pending = {}, {}
+    local delay_next_root = false
+    fre._set_fs_adapter({ load = function(scan_path, done)
+      counts[scan_path] = (counts[scan_path] or 0) + 1
+      if scan_path == instance.root and delay_next_root then
+        delay_next_root = false
+        pending[#pending + 1] = done
+      else
+        real_fs.load(scan_path, done)
+      end
+    end })
+
+    local function start_delayed_root_watch(filename)
+      fixture:write(filename, filename)
+      delay_next_root = true
+      watcher:emit(instance.root, nil, filename)
+      watcher:fire(instance.root)
+      wait_for(function()
+        return pending[#pending] ~= nil and instance._watch_refresh_request ~= nil
+      end)
+    end
+
+    start_delayed_root_watch("after-collapse.txt")
+    local first_stale = pending[1]
+    instance:collapse_all()
+    assert.is_false(instance.nodes_by_path[fixture:path("dir")].expanded)
+    wait_for(function()
+      return instance:get_pos("after-collapse.txt") ~= nil
+        and not instance.needs_refresh
+        and instance._refresh_request == nil
+        and instance._watch_refresh_request == nil
+    end)
+
+    start_delayed_root_watch("after-noop.txt")
+    local second_stale = pending[2]
+    instance:collapse_all()
+    wait_for(function()
+      return instance:get_pos("after-noop.txt") ~= nil
+        and not instance.needs_refresh
+        and instance._refresh_request == nil
+        and instance._watch_refresh_request == nil
+        and not instance._watch_followup_scheduled
+    end)
+
+    real_fs.load(instance.root, first_stale)
+    real_fs.load(instance.root, second_stale)
+    vim.wait(40, function() return false end, 10)
+    assert.are.equal(4, counts[instance.root])
+    assert.is_false(instance.needs_refresh)
+    assert.is_nil(instance._refresh_request)
+    assert.is_nil(instance._watch_refresh_request)
+  end)
+
   it("debounces each directory independently and ignores event filenames", function()
     local instance = ready({ ["a/old.txt"] = "a", ["b/old.txt"] = "b" })
     instance:expand("a")

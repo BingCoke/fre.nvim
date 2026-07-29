@@ -222,6 +222,11 @@ function M.collapse(ctx, opts)
   return instance:collapse(target)
 end
 
+function M.collapse_all(ctx, opts)
+  no_options(opts, "collapse_all")
+  return instance_from(ctx):collapse_all()
+end
+
 function M.toggle_expand(ctx, opts)
   no_options(opts, "toggle_expand")
   local instance, target = directory_action_target(ctx)

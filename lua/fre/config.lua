@@ -51,6 +51,7 @@ local function builtins()
     default_file_explorer = true,
     hidden_file = false,
     skip_confirm_for_simple_edits = false,
+    auto_expand_single_directory = false,
     sort = builtin_sort,
     columns = {
       columns.icon(),
@@ -302,6 +303,7 @@ local setup_fields = {
   default_file_explorer = true,
   hidden_file = true,
   skip_confirm_for_simple_edits = true,
+  auto_expand_single_directory = true,
   sort = true,
   columns = true,
   gc = true,
@@ -316,6 +318,7 @@ local new_fields = {
   root = true,
   hidden_file = true,
   skip_confirm_for_simple_edits = true,
+  auto_expand_single_directory = true,
   sort = true,
   expanded = true,
   columns = true,
@@ -362,6 +365,7 @@ end
 local function validate_common(config, setup)
   expect_type(config.hidden_file, "boolean", "hidden_file")
   expect_type(config.skip_confirm_for_simple_edits, "boolean", "skip_confirm_for_simple_edits")
+  expect_type(config.auto_expand_single_directory, "boolean", "auto_expand_single_directory")
   expect_type(config.sort, "function", "sort")
   validate_columns(config.columns, "columns")
   expect_type(config.use_mapping_default, "boolean", "use_mapping_default")
@@ -419,6 +423,9 @@ function M.resolve_setup(opts, ignore_default_file_explorer)
   end
   if opts.skip_confirm_for_simple_edits ~= nil then
     result.skip_confirm_for_simple_edits = copy(opts.skip_confirm_for_simple_edits)
+  end
+  if opts.auto_expand_single_directory ~= nil then
+    result.auto_expand_single_directory = copy(opts.auto_expand_single_directory)
   end
   if opts.sort ~= nil then
     result.sort = opts.sort
@@ -499,6 +506,7 @@ function M.resolve_instance(setup_defaults, opts, normalized_root)
   local result = {
     hidden_file = copy(setup_defaults.hidden_file),
     skip_confirm_for_simple_edits = copy(setup_defaults.skip_confirm_for_simple_edits),
+    auto_expand_single_directory = copy(setup_defaults.auto_expand_single_directory),
     sort = setup_defaults.sort,
     expanded = expanded,
     columns = copy(setup_defaults.columns),
@@ -518,6 +526,9 @@ function M.resolve_instance(setup_defaults, opts, normalized_root)
   end
   if opts.skip_confirm_for_simple_edits ~= nil then
     result.skip_confirm_for_simple_edits = copy(opts.skip_confirm_for_simple_edits)
+  end
+  if opts.auto_expand_single_directory ~= nil then
+    result.auto_expand_single_directory = copy(opts.auto_expand_single_directory)
   end
   if opts.sort ~= nil then
     result.sort = opts.sort

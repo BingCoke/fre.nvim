@@ -156,7 +156,7 @@ describe("fre ticket 17 actions and mappings", function()
 
   it("exports ordinary action functions without a registry protocol", function()
     local names = {
-      "context", "expand", "collapse", "toggle_expand", "reveal", "jump_to_path",
+      "context", "expand", "collapse", "collapse_all", "toggle_expand", "reveal", "jump_to_path",
       "open", "hidden", "toggle", "set_hidden_file", "toggle_hidden_file", "refresh",
       "select", "tab_select", "split_select", "confirm", "write", "destroy",
     }
@@ -244,13 +244,31 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_truthy(error_text(actions.context):find("row " .. entry_row, 1, true))
   end)
 
+  it("runs built-in collapse_all from an undecodable current row", function()
+    local instance = ready({ ["dir/file.txt"] = "x" })
+    instance:expand("dir")
+    wait_for(function() return instance:get_pos("dir/file.txt") ~= nil end)
+    local winid = open_current(instance)
+    local row = row_for(instance, "dir")
+    vim.api.nvim_win_set_cursor(winid, { row, 0 })
+    set_line(instance, row, string.char(31) .. "fre:bad" .. string.char(31) .. "dir/")
+    vim.bo[instance.bufnr].modified = false
+    assert.is_truthy(error_text(actions.context):find("row " .. row, 1, true))
+
+    local ok, err = pcall(invoke, instance.bufnr, "n", "zM")
+
+    assert.is_true(ok, tostring(err))
+    assert.is_false(instance.nodes_by_path[fixture:path("dir")].expanded)
+    assert.is_nil(instance:get_pos("dir/file.txt"))
+  end)
+
   it("installs the exact default normal map base with no h, l, insert, or visual defaults", function()
     local instance = ready({ ["a.txt"] = "a" })
     local normal = keymaps(instance.bufnr, "n")
     local actual = {}
     for lhs in pairs(normal) do actual[#actual + 1] = lhs end
     table.sort(actual)
-    assert.are.same({ "<CR>", "R", "g.", "q", "za", "zc", "zv" }, actual)
+    assert.are.same({ "<CR>", "R", "g.", "q", "zM", "za", "zc", "zv" }, actual)
     assert.is_nil(normal.h)
     assert.is_nil(normal.l)
     assert.are.same({}, keymaps(instance.bufnr, "i"))
@@ -318,6 +336,7 @@ describe("fre ticket 17 actions and mappings", function()
     fake.set_hidden_file = function(_, value) calls[#calls + 1] = { "set_hidden_file", value } end
     fake.toggle_hidden_file = function() calls[#calls + 1] = { "toggle_hidden_file" } end
     fake.destroy = function() calls[#calls + 1] = { "destroy" } end
+    fake.collapse_all = function() calls[#calls + 1] = { "collapse_all" } end
     local ctx = {
       instance = fake, bufnr = fake.bufnr,
       entry = { absolute_path = "snapshot/path", kind = "directory" },
@@ -325,6 +344,7 @@ describe("fre ticket 17 actions and mappings", function()
     actions.expand(ctx)
     actions.collapse(ctx)
     actions.toggle_expand(ctx)
+    actions.collapse_all(ctx)
     actions.reveal(ctx)
     actions.open(ctx, { layout = { position = "current" } })
     actions.hidden(ctx)
@@ -334,11 +354,66 @@ describe("fre ticket 17 actions and mappings", function()
     actions.destroy(ctx)
     assert.are.same({
       { "expand", "snapshot/path" }, { "collapse", "snapshot/path" },
-      { "toggle_expand", "snapshot/path" }, { "reveal", "snapshot/path" },
+      { "toggle_expand", "snapshot/path" }, { "collapse_all" }, { "reveal", "snapshot/path" },
       { "open", { position = "current" } }, { "hidden" },
       { "toggle", { position = "left", size = 10 } },
       { "set_hidden_file", true }, { "toggle_hidden_file" }, { "destroy" },
     }, calls)
+  end)
+
+  it("collapses every cached directory once through zM and preserves valid window cursors", function()
+    local instance = ready({ ["a/n/deep.txt"] = "x", ["b/file.txt"] = "y" })
+    instance:expand("a/n")
+    instance:expand("b")
+    wait_for(function()
+      return instance:get_pos("a/n/deep.txt") ~= nil and instance:get_pos("b/file.txt") ~= nil
+    end)
+    wait_for(function()
+      for _, node in pairs(instance.nodes_by_id) do
+        if node.kind == "directory"
+            and (node.load_state == "loading" or node.load_state == "refreshing") then
+          return false
+        end
+      end
+      return true
+    end)
+    local a = instance.nodes_by_path[fixture:path("a")]
+    local n = instance.nodes_by_path[fixture:path("a", "n")]
+    local b = instance.nodes_by_path[fixture:path("b")]
+    local deep = instance.nodes_by_path[fixture:path("a", "n", "deep.txt")]
+    local deep_id = deep.id
+    local first = open_current(instance)
+    vim.cmd("vsplit")
+    local second = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_cursor(first, instance:get_pos("a/n/deep.txt"))
+    vim.api.nvim_win_set_cursor(second, { 1, 0 })
+
+    local renders, syncs = 0, 0
+    local render = instance._render_success
+    local sync = instance._sync_watchers
+    instance._render_success = function(self) renders = renders + 1; return render(self) end
+    instance._sync_watchers = function(self, ...) syncs = syncs + 1; return sync(self, ...) end
+    invoke(instance.bufnr, "n", "zM")
+
+    assert.are.equal(1, renders)
+    assert.are.equal(1, syncs)
+    assert.is_true(instance.root_node.expanded)
+    assert.is_false(a.expanded)
+    assert.is_false(n.expanded)
+    assert.is_false(b.expanded)
+    assert.is_true(a.children_cached)
+    assert.is_true(n.children_cached)
+    assert.are.equal(deep, instance.nodes_by_id[deep_id])
+    assert.are.equal(deep, instance.nodes_by_path[deep.path])
+    local line_count = vim.api.nvim_buf_line_count(instance.bufnr)
+    for _, winid in ipairs({ first, second }) do
+      local cursor = vim.api.nvim_win_get_cursor(winid)
+      assert.is_true(cursor[1] >= 1 and cursor[1] <= line_count)
+    end
+
+    invoke(instance.bufnr, "n", "zM")
+    assert.are.equal(1, renders)
+    assert.are.equal(1, syncs)
   end)
 
   it("opens file and symlink snapshot paths and hides a final replaced source view", function()
