@@ -1,7 +1,6 @@
 local config = require("fre.config")
 local buffer = require("fre.buffer")
 local mapping = require("fre.mapping")
-local inheritance = require("fre.inheritance")
 local path = require("fre.path")
 local mutation_execute = require("fre.mutation.execute")
 local mutation_prepare = require("fre.mutation.prepare")
@@ -293,7 +292,6 @@ function Instance:_finish_initial(token, generation, err, children, real_root)
       self.needs_refresh = false
       self._tree_generation = self._tree_generation + 1
       self:_sync_watchers()
-      inheritance.start(self)
     end
   end
   self.manager:gc_visibility_changed(self)
@@ -810,15 +808,12 @@ function Instance:expand(snapshot_path)
       self:_render_success()
       self:_sync_watchers()
     end
-    local prefix = table.concat(vim.list_slice(segments, 1, index), "/")
     if child.loaded then
       if became_expanded then self:_rescan_directory(child) end
-      inheritance.resume(self, prefix)
       if index == #segments then stop(nil) else walk(child, index + 1) end
     else
       self:_ensure_directory_loaded(child, function(err)
         if err then stop(err); return end
-        inheritance.resume(self, prefix)
         if index == #segments then stop(nil) else walk(child, index + 1) end
       end)
     end
@@ -841,7 +836,6 @@ function Instance:collapse(snapshot_path)
   local node = self:_directory_or_fail(self:_cached_node(relative), relative)
   node.expanded = false
   self:_invalidate_subtree_loads(node)
-  inheritance.collapse(self, relative)
   self:_render_success()
   self:_sync_watchers()
   return nil
@@ -1725,7 +1719,7 @@ local function cleanup_failed_constructor(manager, self, bufnr)
   return wipe_failed_buffer(bufnr)
 end
 
-function Instance.new(manager, root, effective, expansion)
+function Instance.new(manager, root, effective)
   local bufnr = vim.api.nvim_create_buf(false, true)
   local self = setmetatable({
     manager = manager,
@@ -1761,7 +1755,6 @@ function Instance.new(manager, root, effective, expansion)
     self._pending_reveal = nil
     self._marker_width_stale = false
     self._pending_initial_cursor = {}
-    self._inheritance_trie = expansion
     self._last_layout_by_tab = {}
     self._next_node_id = 1
     self.nodes_by_id = {}

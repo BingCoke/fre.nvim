@@ -1,6 +1,5 @@
 local fre = require("fre")
 local manager_module = require("fre.manager")
-local real_fs = require("fre.fs").default
 local fs = require("tests.helpers.fs")
 local window = require("fre.window")
 
@@ -373,7 +372,7 @@ describe("fre ticket 19 destroy and GC", function()
     for _, field in ipairs({
       "manager", "config", "tree", "root_node", "nodes_by_id", "nodes_by_path", "view",
       "actions", "_execution", "_watchers", "_buffer_augroup", "_mapping_installed",
-      "_installed_mappings", "_inheritance_trie", "_pending_reveal", "_last_layout_by_tab",
+      "_installed_mappings", "_pending_reveal", "_last_layout_by_tab",
       "hidden_since", "_gc_timer", "_gc_expired_reconsider", "needs_refresh",
       "result", "error", "real_root",
     }) do
@@ -455,7 +454,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert_error_contains(function() post_effect:destroy() end, "destroyed")
   end)
 
-  it("makes late load, refresh, watch, inheritance, visibility, and timer callbacks inert", function()
+  it("makes late load, refresh, watch, visibility, and timer callbacks inert", function()
     local initial_done
     fre._set_fs_adapter({ load = function(_, done) initial_done = done end })
     local loading = keep(fre.new({
@@ -498,34 +497,6 @@ describe("fre ticket 19 destroy and GC", function()
     assert.are.equal("destroyed", watched.state)
 
     fre._reset_watch_adapter()
-    fixture:tree({ ["dir"] = true, ["dir/child.txt"] = "child" })
-    local predecessor = ready({ gc = { ttl_ms = 0 } })
-    predecessor:expand("dir")
-    wait_for(function()
-      local node = predecessor.nodes_by_path[fixture:path("dir")]
-      return node and node.loaded
-    end)
-    local inherited_done
-    local inherited_loads = 0
-    fre._set_fs_adapter({ load = function(scan_path, done)
-      inherited_loads = inherited_loads + 1
-      if inherited_loads == 1 then
-        real_fs.load(scan_path, done)
-      else
-        inherited_done = done
-      end
-    end })
-    local inherited = ready({ inherit = predecessor, gc = { ttl_ms = 50 } })
-    wait_for(function() return inherited_done ~= nil end)
-    local inherited_buf = inherited.bufnr
-    inherited:open({ position = "current" })
-    vim.api.nvim_win_set_buf(0, scratch())
-    inherited:destroy()
-    real_fs.load(fixture:path("dir"), inherited_done)
-    drain_editor()
-    clock:drain()
-    assert.are.equal("destroyed", inherited.state)
-    assert.is_false(vim.api.nvim_buf_is_valid(inherited_buf))
   end)
 
   it("delivers queued and already-scheduled when_ready observers exactly once on destroy", function()

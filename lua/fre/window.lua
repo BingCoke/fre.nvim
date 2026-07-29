@@ -115,8 +115,8 @@ local function allowed_fields(position)
 end
 
 --- Validate and copy a layout. Partial validation accepts omitted required
---- fields for configuration inheritance, but still rejects explicitly
---- position-incompatible fields.
+--- fields while setup and instance options are being merged, but still rejects
+--- explicitly position-incompatible fields.
 function M.normalize(layout, opts)
   opts = opts or {}
   local path = opts.path or "layout"

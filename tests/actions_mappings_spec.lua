@@ -373,7 +373,30 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_truthy(error_text(function() actions.select(dir_ctx) end):find("requires an entry", 1, true))
   end)
 
-  it("creates directory children in the exact target and a new tab with inherited effective overrides", function()
+  it("returns to the parent with the previous root selected but not expanded", function()
+    fixture:tree({
+      ["child/nested/file.txt"] = "x",
+      ["sibling.txt"] = "s",
+    })
+    local instance = wait_ready(fre.new({
+      root = fixture:path("child"),
+      columns = {},
+    }))
+    local winid = open_current(instance)
+    vim.api.nvim_win_set_cursor(winid, { 1, 0 })
+    local ctx = actions.context()
+    assert.are.equal("navigation", ctx.row_kind)
+    assert.are.equal("parent", ctx.navigation_kind)
+
+    local parent = wait_ready(actions.select(ctx))
+    local previous_root = parent.nodes_by_path[path.absolute(fixture:path("child"))]
+    assert.is_not_nil(previous_root)
+    assert.is_false(previous_root.expanded)
+    assert.is_nil(parent:get_pos("child/nested"))
+    assert.are.same(parent:get_pos("child"), vim.api.nvim_win_get_cursor(winid))
+  end)
+
+  it("creates directory children in the exact target and a new tab with explicit effective overrides", function()
     local sort_fn = function(_, a, b) return a.name > b.name end
     local instance = ready({ ["same/a.txt"] = "a", ["tab/b.txt"] = "b" }, {
       hidden_file = true,

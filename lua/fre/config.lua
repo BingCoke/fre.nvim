@@ -294,7 +294,6 @@ local setup_fields = {
 
 local new_fields = {
   root = true,
-  inherit = true,
   hidden_file = true,
   sort = true,
   columns = true,
@@ -444,30 +443,7 @@ function M.resolve_setup(opts, ignore_default_file_explorer)
   return copy(result)
 end
 
-local function predecessor_sort(predecessor)
-  if not predecessor then
-    return nil
-  end
-  return predecessor.current_sort or predecessor.sort or (predecessor.config and predecessor.config.sort)
-end
-
-local function predecessor_hidden_file(predecessor)
-  if not predecessor then
-    return nil
-  end
-  if predecessor.current_hidden_file ~= nil then
-    return predecessor.current_hidden_file
-  end
-  if predecessor.hidden_file ~= nil then
-    return predecessor.hidden_file
-  end
-  if predecessor.config then
-    return predecessor.config.hidden_file
-  end
-  return nil
-end
-
-function M.resolve_instance(setup_defaults, opts, predecessor)
+function M.resolve_instance(setup_defaults, opts)
   expect_table(setup_defaults, "setup defaults")
   opts = opts or {}
   expect_table(opts, "new options")
@@ -477,9 +453,6 @@ function M.resolve_instance(setup_defaults, opts, predecessor)
   check_known_keys(opts, new_fields, "new options")
   if opts.root ~= nil then
     expect_type(opts.root, "string", "root")
-  end
-  if opts.inherit ~= nil and type(opts.inherit) ~= "table" then
-    fail("inherit must be an instance table")
   end
   if opts.columns ~= nil then
     validate_columns(opts.columns, "columns")
@@ -496,7 +469,6 @@ function M.resolve_instance(setup_defaults, opts, predecessor)
   if opts.window ~= nil then
     validate_window(opts.window, "window")
   end
-  predecessor = predecessor or opts.inherit
   local result = {
     hidden_file = copy(setup_defaults.hidden_file),
     sort = setup_defaults.sort,
@@ -512,14 +484,6 @@ function M.resolve_instance(setup_defaults, opts, predecessor)
     buffer = copy(setup_defaults.buffer),
     window = copy(setup_defaults.window),
   }
-  local inherited_sort = predecessor_sort(predecessor)
-  if inherited_sort ~= nil then
-    result.sort = inherited_sort
-  end
-  local inherited_hidden = predecessor_hidden_file(predecessor)
-  if inherited_hidden ~= nil then
-    result.hidden_file = copy(inherited_hidden)
-  end
   if opts.hidden_file ~= nil then
     result.hidden_file = copy(opts.hidden_file)
   end

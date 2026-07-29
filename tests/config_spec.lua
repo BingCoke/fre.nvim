@@ -258,33 +258,25 @@ describe("fre configuration", function()
     assert.are.equal(effective.columns[1], effective.columns[1].self)
   end)
 
-  it("applies explicit sort and hidden state over predecessor dynamic state", function()
+  it("rejects instance inheritance and resolves only setup defaults plus explicit options", function()
     local manager = new_manager()
     local setup_sort = function() end
-    local predecessor_sort = function() end
     local explicit_sort = function() end
     manager:setup({ sort = setup_sort, hidden_file = false })
 
-    local inherited = manager:resolve_instance_config({}, {
-      current_sort = predecessor_sort,
-      current_hidden_file = true,
-      config = { gc = { ttl_ms = 1, include_modified = true, group = "project" } },
-    })
-    assert.are.equal(predecessor_sort, inherited.sort)
-    assert.is_true(inherited.hidden_file)
-    assert.are.equal(60000, inherited.gc.ttl_ms)
-    assert.is_false(inherited.gc.include_modified)
-    assert.are.equal("default", inherited.gc.group)
+    assert_error_contains("unknown field inherit", function()
+      manager:resolve_instance_config({ inherit = {} })
+    end)
 
-    local explicit = manager:resolve_instance_config({
+    local effective = manager:resolve_instance_config({
       sort = explicit_sort,
-      hidden_file = false,
-    }, {
-      current_sort = predecessor_sort,
-      current_hidden_file = true,
+      hidden_file = true,
     })
-    assert.are.equal(explicit_sort, explicit.sort)
-    assert.is_false(explicit.hidden_file)
+    assert.are.equal(explicit_sort, effective.sort)
+    assert.is_true(effective.hidden_file)
+    assert.are.equal(60000, effective.gc.ttl_ms)
+    assert.is_false(effective.gc.include_modified)
+    assert.are.equal("default", effective.gc.group)
   end)
 
   it("resolves effective GC fields and rejects setup-only or unknown groups", function()

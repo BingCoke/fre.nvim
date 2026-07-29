@@ -241,14 +241,13 @@ fre.setup({
 - 不支持用 `false` 单独删除某个内置映射。若要完全控制按键，设置 `use_mapping_default = false`，再声明所有需要的映射。
 - `gc.include_modified = true` 允许 GC 强制丢弃隐藏 buffer 中未保存的文件系统草稿，请谨慎启用。
 
-## 实例配置与继承
+## 实例配置
 
 `fre.new()` 接受：
 
 ```lua
 local instance = require("fre").new({
   root = "/absolute/path/to/project", -- 必填
-  inherit = parent_instance,
   hidden_file = true,
   sort = custom_sort,
   columns = custom_columns,
@@ -265,13 +264,7 @@ local instance = require("fre").new({
 })
 ```
 
-实例选项覆盖 setup 默认值。`inherit` 只继承前一个实例创建时快照到的视图状态：
-
-- 当前 sort 函数。
-- 当前点文件显示状态。
-- 与新 root 有祖先/后代关系的目录展开状态。
-
-列、GC、布局、映射、buffer/window 选项和可变节点状态不会从前一个实例共享。`default_file_explorer`、`gc.groups` 和 `gc.default_group` 是 setup-only 配置，不能传给 `fre.new()`。
+实例选项覆盖 setup 默认值。每个实例完全由本次传入的值选项决定；`fre.new()` 不接受来源实例，也不会共享或恢复其他实例的目录展开状态。`default_file_explorer`、`gc.groups` 和 `gc.default_group` 是 setup-only 配置，不能传给 `fre.new()`。
 
 ## 窗口布局
 
@@ -346,7 +339,7 @@ actions.split_select(ctx, {
 })
 ```
 
-对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会使用源实例所属的 Manager 创建实例，并自动设置真实目录或词法父目录为 root、当前实例为 `inherit`。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`opts.instance` 可以覆盖其他实例配置，但不能覆盖 `root` 或 `inherit`。
+对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会使用当前实例所属的 Manager 创建一个独立实例，并把当前 sort 和点文件显示状态作为普通值选项传入。选择 `../` 后，刚离开的目录保持折叠，cursor 定位到它的条目；不会恢复任何展开状态。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`opts.instance` 可以覆盖这些普通实例选项，但不能覆盖 action 决定的 `root`。
 
 ## 列
 

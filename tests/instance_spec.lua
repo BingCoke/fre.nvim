@@ -426,7 +426,7 @@ describe("fre async hidden instances", function()
       gc = { ttl_ms = 100 },
     })
     local root = path.absolute(fixture.root)
-    local effective = manager:resolve_instance_config({ root = root }, nil)
+    local effective = manager:resolve_instance_config({ root = root })
 
     local stages = {
       {
@@ -481,7 +481,7 @@ describe("fre async hidden instances", function()
       local before_buffers = vim.api.nvim_list_bufs()
       local failed_id = manager._next_id
       local restore = stage.install()
-      local ok, err = pcall(Instance.new, manager, root, effective, nil)
+      local ok, err = pcall(Instance.new, manager, root, effective)
       restore()
 
       assert.is_false(ok, stage.name)

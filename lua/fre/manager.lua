@@ -118,11 +118,8 @@ function Manager:create_instance(opts)
   end
 
   local root = require("fre.path").absolute(opts.root)
-  local inheritance = require("fre.inheritance")
-  local snapshot = inheritance.snapshot(opts.inherit)
-  local expansion = snapshot and inheritance.compile(snapshot, root) or nil
-  local effective = self:resolve_instance_config(opts, opts.inherit)
-  return require("fre.instance").new(self, root, effective, expansion)
+  local effective = self:resolve_instance_config(opts)
+  return require("fre.instance").new(self, root, effective)
 end
 
 function Manager:get_setup_defaults()
@@ -236,8 +233,8 @@ function Manager:setup(opts)
   return self:get_setup_defaults()
 end
 
-function Manager:resolve_instance_config(opts, predecessor)
-  return config.resolve_instance(self._setup_defaults, opts, predecessor)
+function Manager:resolve_instance_config(opts)
+  return config.resolve_instance(self._setup_defaults, opts)
 end
 
 function Manager:register(instance)

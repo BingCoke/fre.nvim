@@ -75,7 +75,12 @@ local function selection_target(ctx, instance)
     if ctx.source_instance_id ~= instance.id or ctx.navigation_kind == "root" then
       return { kind = "noop" }
     end
-    return { kind = "directory", root = assert(path.parent(instance.root)) }
+    local parent = assert(path.parent(instance.root))
+    return {
+      kind = "directory",
+      root = parent,
+      cursor = assert(path.relative(parent, instance.root)),
+    }
   end
   local entry = entry_from(ctx)
   if entry.kind == "directory" then
@@ -88,11 +93,23 @@ local function child_options(instance, overrides, root)
   if overrides == nil then overrides = {} end
   if type(overrides) ~= "table" then fail("opts.instance must be a table", 4) end
   if overrides.root ~= nil then fail("opts.instance.root is action-owned", 4) end
-  if overrides.inherit ~= nil then fail("opts.instance.inherit is action-owned", 4) end
   local result = config.copy(overrides)
+  if result.sort == nil then result.sort = instance.current_sort end
+  if result.hidden_file == nil then result.hidden_file = instance.current_hidden_file end
   result.root = root
-  result.inherit = instance
   return result
+end
+
+local function place_selection_cursor(instance, winid, snapshot_path)
+  if snapshot_path == nil then return end
+  instance:when_ready(function(err)
+    if err or instance._destroyed or not vim.api.nvim_win_is_valid(winid)
+        or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then
+      return
+    end
+    local position = instance:get_pos(snapshot_path)
+    if position then vim.api.nvim_win_set_cursor(winid, position) end
+  end)
 end
 
 local function file_buffer(filename)
@@ -258,6 +275,7 @@ function M.select(ctx, opts)
   end
   window.sync_visibility(instance)
   child:_on_visibility_enter()
+  place_selection_cursor(child, target_winid, target.cursor)
   return child
 end
 
@@ -284,6 +302,7 @@ function M.tab_select(ctx, opts)
     if child then
       window.replace(child, target_winid)
       child:_on_visibility_enter()
+      place_selection_cursor(child, target_winid, target.cursor)
       return child
     end
     file_bufnr, file_created = file_buffer(target.path)
@@ -310,11 +329,12 @@ function M.split_select(ctx, opts)
   if target.kind == "directory" then
     local prepared = child_options(instance, opts.instance, target.root)
     local child = instance.manager:create_instance(prepared)
-    local ok, err = pcall(child.open, child, config.copy(opts.layout))
+    local ok, winid = pcall(child.open, child, config.copy(opts.layout))
     if not ok then
       pcall(child.destroy, child)
-      error(err, 0)
+      error(winid, 0)
     end
+    place_selection_cursor(child, winid, target.cursor)
     return child
   end
 
