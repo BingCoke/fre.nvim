@@ -392,6 +392,7 @@ describe("fre ticket 19 destroy and GC", function()
       function() instance:get_pos("one.txt") end,
       function() instance:set_sort(function() return false end) end,
       function() instance:set_hidden_file(true) end,
+      function() instance:setGroup("project") end,
       function() instance:expand("one.txt") end,
       function() instance:collapse("one.txt") end,
       function() instance:reveal("one.txt") end,
@@ -720,6 +721,115 @@ describe("fre ticket 19 destroy and GC", function()
     set_modified(discarded, true)
     clock:advance(20)
     assert.are.equal("destroyed", discarded.state)
+  end)
+
+  it("migrates GC membership and metadata without resetting the hidden TTL interval", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 100, groups = { default = 0, project = 0 },
+    } })
+    local instance = ready()
+    local timer = instance._gc_timer
+    local generation = instance._gc_generation
+    local hidden_since = instance.hidden_since
+    clock:advance(25)
+
+    assert.are.equal(instance, instance:setGroup("project"))
+    assert.is_nil(manager_module.default.groups.default.instances[instance.id])
+    assert.are.equal(instance, manager_module.default.groups.project.instances[instance.id])
+    assert.are.equal("project", instance.config.gc.group)
+    assert.are.equal("project", vim.b[instance.bufnr].fre.gc_group)
+    assert.is_true(manager_module.default:is_gc_eligible(instance))
+    assert.are.equal(timer, instance._gc_timer)
+    assert.are.equal(generation, instance._gc_generation)
+    assert.are.equal(hidden_since, instance.hidden_since)
+
+    assert.are.equal(instance, instance:setGroup("project"))
+    assert.are.equal(timer, instance._gc_timer)
+    assert.are.equal(generation, instance._gc_generation)
+    assert.are.equal(hidden_since, instance.hidden_since)
+
+    clock:advance(74)
+    assert.are_not.equal("destroyed", instance.state)
+    clock:advance(1)
+    assert.are.equal("destroyed", instance.state)
+    assert.is_nil(manager_module.default.groups.project.instances[instance.id])
+  end)
+
+  it("atomically rejects invalid and unregistered group migrations", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 100, groups = { default = 0, project = 0 },
+    } })
+    local instance = ready()
+    local timer = instance._gc_timer
+    local generation = instance._gc_generation
+    local hidden_since = instance.hidden_since
+    local metadata = vim.b[instance.bufnr].fre
+
+    for _, invalid in ipairs({ false, 1, {}, "" }) do
+      assert_error_contains(function() instance:setGroup(invalid) end,
+        "group must be a non-empty string")
+    end
+    assert_error_contains(function() instance:setGroup("missing") end, "unknown GC group")
+
+    assert.are.equal("default", instance.config.gc.group)
+    assert.are.equal(instance, manager_module.default.groups.default.instances[instance.id])
+    assert.is_nil(manager_module.default.groups.project.instances[instance.id])
+    assert.are.same(metadata, vim.b[instance.bufnr].fre)
+    assert.are.equal(timer, instance._gc_timer)
+    assert.are.equal(generation, instance._gc_generation)
+    assert.are.equal(hidden_since, instance.hidden_since)
+
+    instance.manager:remove(instance)
+    assert_error_contains(function() instance:setGroup("project") end, "not registered")
+    assert.are.equal("default", instance.config.gc.group)
+    assert.are.equal("default", vim.b[instance.bufnr].fre.gc_group)
+  end)
+
+  it("enforces target capacity while protecting the moved instance", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 0, groups = { default = 0, project = 1 },
+    } })
+    local existing = ready({ gc = { group = "project" } })
+    clock:advance(1)
+    local moved = ready()
+
+    moved:setGroup("project")
+
+    assert.are.equal("destroyed", existing.state)
+    assert.are_not.equal("destroyed", moved.state)
+    assert.is_nil(manager_module.default.groups.default.instances[moved.id])
+    assert.are.equal(moved, manager_module.default.groups.project.instances[moved.id])
+    assert.are.equal("project", moved.config.gc.group)
+    assert.are.equal("project", vim.b[moved.bufnr].fre.gc_group)
+  end)
+
+  it("rolls back migration when target capacity enforcement fails", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 100, groups = { default = 0, project = 1 },
+    } })
+    local existing = ready({ gc = { group = "project" } })
+    clock:advance(1)
+    local moved = ready()
+    local timer = moved._gc_timer
+    local generation = moved._gc_generation
+    local hidden_since = moved.hidden_since
+    local destroy = existing.destroy
+    existing.destroy = function() error("injected target destroy failure") end
+
+    local ok, err = pcall(moved.setGroup, moved, "project")
+    existing.destroy = destroy
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):find("injected target destroy failure", 1, true))
+
+    assert.are_not.equal("destroyed", existing.state)
+    assert.are.equal(existing, manager_module.default.groups.project.instances[existing.id])
+    assert.are.equal(moved, manager_module.default.groups.default.instances[moved.id])
+    assert.is_nil(manager_module.default.groups.project.instances[moved.id])
+    assert.are.equal("default", moved.config.gc.group)
+    assert.are.equal("default", vim.b[moved.bufnr].fre.gc_group)
+    assert.are.equal(timer, moved._gc_timer)
+    assert.are.equal(generation, moved._gc_generation)
+    assert.are.equal(hidden_since, moved.hidden_since)
   end)
 
   it("protects registration self and performs deterministic same-pass multi-eviction", function()
