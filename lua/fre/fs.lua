@@ -1,4 +1,5 @@
 local uv = vim.uv
+local MAX_CONCURRENT_STATS = 32
 
 local M = {}
 
@@ -43,40 +44,71 @@ local function default_load(root, done)
         end
 
         local children = {}
-        local index = 0
-        local function load_next()
-          index = index + 1
-          local entry = pending[index]
-          if not entry then
-            done(nil, children, real_root)
+        local errors = {}
+        local total = #pending
+        if total == 0 then
+          done(nil, children, real_root)
+          return
+        end
+
+        local initial_count = math.min(MAX_CONCURRENT_STATS, total)
+        local next_index = initial_count + 1
+        local completed = 0
+        local finished = false
+
+        local function finish_if_ready()
+          if finished or completed < total then
             return
           end
+          finished = true
+          for error_index = 1, total do
+            if errors[error_index] then
+              done(errors[error_index])
+              return
+            end
+          end
+          done(nil, children, real_root)
+        end
+
+        local load_entry
+        load_entry = function(index)
+          local entry = pending[index]
           local child_path = vim.fs.joinpath(real_root, entry.name)
           uv.fs_lstat(child_path, function(child_err, child_stat)
             if child_err or not child_stat then
-              done(error_message("cannot stat entry", child_path, child_err))
-              return
-            end
-            local child_kind = child_stat.type
-            if child_kind == "directory" then
-              entry.kind = "directory"
-            elseif child_kind == "link" then
-              entry.kind = "symlink"
-            elseif child_kind == "file" then
-              entry.kind = "file"
+              errors[index] = error_message("cannot stat entry", child_path, child_err)
             else
-              entry.kind = child_kind or entry.kind or "other"
+              local child_kind = child_stat.type
+              if child_kind == "directory" then
+                entry.kind = "directory"
+              elseif child_kind == "link" then
+                entry.kind = "symlink"
+              elseif child_kind == "file" then
+                entry.kind = "file"
+              else
+                entry.kind = child_kind or entry.kind or "other"
+              end
+              children[index] = {
+                name = entry.name,
+                kind = entry.kind,
+                real_path = child_path,
+                stat = child_stat,
+              }
             end
-            children[#children + 1] = {
-              name = entry.name,
-              kind = entry.kind,
-              real_path = child_path,
-              stat = child_stat,
-            }
-            load_next()
+
+            completed = completed + 1
+            if next_index <= total then
+              local queued_index = next_index
+              next_index = next_index + 1
+              load_entry(queued_index)
+            end
+            finish_if_ready()
           end)
         end
-        load_next()
+
+        for index = 1, initial_count do
+          load_entry(index)
+        end
       end)
     end)
   end)
