@@ -418,6 +418,22 @@ local function report_outcome(ctx, outcome, reconciliation_error)
   if not ok then report_internal(instance, "write UI report failed: " .. tostring(err)) end
 end
 
+local function is_simple_edit(operations)
+  local creates, moves, copies = 0, 0, 0
+  for _, operation in ipairs(operations) do
+    if operation.type == "create_file" or operation.type == "create_directory" then
+      creates = creates + 1
+    elseif operation.type == "move" then
+      moves = moves + 1
+    elseif operation.type == "copy" then
+      copies = copies + 1
+    else
+      return false
+    end
+  end
+  return creates <= 5 and moves <= 1 and copies <= 1
+end
+
 function M.write(ctx, _opts)
   local instance = instance_from(ctx)
   local token = instance:_acquire_write_lock()
@@ -520,6 +536,20 @@ function M.write(ctx, _opts)
     return execution
   end
 
+  local function start_execution(plan)
+    local ok, err = pcall(begin_execution, plan)
+    if ok then return end
+    if token.execution ~= nil then
+      local cancel_ok, cancel_error = pcall(token.execution.cancel, token.execution)
+      if not cancel_ok then
+        report_internal(instance, "write cancellation failed: " .. tostring(cancel_error))
+      end
+    else
+      finish_before_execution()
+    end
+    report_internal(instance, err)
+  end
+
   local prepare_ok, plan_or_error = pcall(instance._prepare_write, instance, token)
   if not prepare_ok then
     finish_before_execution()
@@ -530,6 +560,10 @@ function M.write(ctx, _opts)
     reconcile(nil)
     return nil
   end
+  if instance.config.skip_confirm_for_simple_edits and is_simple_edit(plan.operations) then
+    start_execution(plan)
+    return nil
+  end
 
   token.phase = "confirming"
   local function decide(accepted)
@@ -538,18 +572,7 @@ function M.write(ctx, _opts)
       finish_before_execution()
       return
     end
-    local ok, err = pcall(begin_execution, plan)
-    if not ok then
-      if token.execution ~= nil then
-        local cancel_ok, cancel_error = pcall(token.execution.cancel, token.execution)
-        if not cancel_ok then
-          report_internal(instance, "write cancellation failed: " .. tostring(cancel_error))
-        end
-      else
-        finish_before_execution()
-      end
-      report_internal(instance, err)
-    end
+    start_execution(plan)
   end
   local confirm_ok, confirmation_or_error = pcall(M.confirm, ctx, plan.display, decide)
   if not confirm_ok then

@@ -163,6 +163,7 @@ fre.setup({
   default_file_explorer = true,
 
   hidden_file = false,
+  skip_confirm_for_simple_edits = false,
 
   columns = {
     columns.icon(),
@@ -221,6 +222,7 @@ fre.setup({
 | --- | --- | --- |
 | `default_file_explorer` | `true` | 第一次 `setup()` 是否接管本地目录 buffer；仅 setup 可用 |
 | `hidden_file` | `false` | 是否投影 basename 以 `.` 开头的条目 |
+| `skip_confirm_for_simple_edits` | `false` | 是否跳过简单文件系统编辑的写入确认 |
 | `sort` | 目录优先、ASCII 不区分大小写名称排序 | 每个父目录独立调用的比较函数 |
 | `columns` | icon、permissions、size、mtime | 完整替换列描述符序列；path 始终是最后的专用字段 |
 | `gc.ttl_ms` | `60000` | 隐藏实例的回收延迟；`0` 禁用 TTL 回收 |
@@ -240,6 +242,7 @@ fre.setup({
 - `mapping` 的值必须是函数，不能使用 action 名字符串或 `{ action = ... }` 描述符。
 - 不支持用 `false` 单独删除某个内置映射。若要完全控制按键，设置 `use_mapping_default = false`，再声明所有需要的映射。
 - `gc.include_modified = true` 允许 GC 强制丢弃隐藏 buffer 中未保存的文件系统草稿，请谨慎启用。
+- `skip_confirm_for_simple_edits = true` 时，无删除、创建不超过 5 个、move 不超过 1 个且 copy 不超过 1 个的 `:write` 会直接执行。删除、超过阈值和未知操作仍需确认；`R` 丢弃已修改草稿时也始终确认。
 
 ## 实例配置
 
@@ -249,6 +252,7 @@ fre.setup({
 local instance = require("fre").new({
   root = "/absolute/path/to/project", -- 必填
   hidden_file = true,
+  skip_confirm_for_simple_edits = true,
   sort = custom_sort,
   expanded = { "src", "src/x" }, -- 相对于 root 的初始展开目录
   columns = custom_columns,

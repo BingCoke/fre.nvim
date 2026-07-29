@@ -28,9 +28,10 @@ local function wait_ready(instance)
   return instance
 end
 
-local function ready(entries)
+local function ready(entries, opts)
   fixture:tree(entries or {})
-  return wait_ready(keep(fre.new({ root = fixture.root, columns = {} })))
+  opts = vim.tbl_extend("force", { root = fixture.root, columns = {} }, opts or {})
+  return wait_ready(keep(fre.new(opts)))
 end
 
 local function lines(instance)
@@ -266,6 +267,106 @@ describe("fre ticket 11 write workflow", function()
     assert.is_nil(instance._last_write_result.reconciliation_error)
   end)
 
+  it("skips confirmation at the exact Oil-style simple-edit limits", function()
+    local instance = ready({ ["move.txt"] = "move", ["copy.txt"] = "copy" }, {
+      skip_confirm_for_simple_edits = true,
+    })
+    local ui = scripted_ui()
+    set_lines(instance, {
+      edited_line(instance, "move.txt", "moved.txt"),
+      physical_line(instance, "copy.txt"),
+      edited_line(instance, "copy.txt", "copied.txt"),
+      "created-1.txt",
+      "created-2.txt",
+      "created-3.txt",
+      "created-4.txt",
+      "created-dir/",
+    })
+
+    local counts = {}
+    for _, operation in ipairs(instance:prepare().operations) do
+      counts[operation.type] = (counts[operation.type] or 0) + 1
+    end
+    assert.are.same({
+      copy = 1,
+      create_directory = 1,
+      create_file = 4,
+      move = 1,
+    }, counts)
+
+    assert.is_true(write_command(instance))
+    wait_unlocked(instance)
+    assert.are.equal(0, #ui.confirmations)
+    assert.is_nil(vim.uv.fs_lstat(fixture:path("move.txt")))
+    assert.is_not_nil(vim.uv.fs_lstat(fixture:path("moved.txt")))
+    assert.is_not_nil(vim.uv.fs_lstat(fixture:path("copy.txt")))
+    assert.is_not_nil(vim.uv.fs_lstat(fixture:path("copied.txt")))
+    for index = 1, 4 do
+      assert.is_not_nil(vim.uv.fs_lstat(fixture:path("created-" .. index .. ".txt")))
+    end
+    assert.are.equal("directory", vim.uv.fs_lstat(fixture:path("created-dir")).type)
+    assert.are.equal("succeeded", instance._last_write_result.execution.state)
+  end)
+
+  it("keeps confirmation for deletes, unknown operations, and edits beyond simple limits", function()
+    local function operation_counts(instance)
+      local counts = {}
+      for _, operation in ipairs(instance:prepare().operations) do
+        counts[operation.type] = (counts[operation.type] or 0) + 1
+      end
+      return counts
+    end
+
+    local function expect_confirmation(expected, replacement)
+      local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b" }, {
+        skip_confirm_for_simple_edits = true,
+      })
+      local ui = scripted_ui()
+      set_lines(instance, replacement(instance))
+      assert.are.same(expected, operation_counts(instance))
+      assert.is_true(write_command(instance))
+      assert.are.equal(1, #ui.confirmations)
+      ui.decide(false)
+      assert.is_nil(instance.actions)
+    end
+
+    expect_confirmation({ delete = 1 }, function(instance)
+      return { physical_line(instance, "b.txt") }
+    end)
+    expect_confirmation({ move = 2 }, function(instance)
+      return {
+        edited_line(instance, "a.txt", "moved-a.txt"),
+        edited_line(instance, "b.txt", "moved-b.txt"),
+      }
+    end)
+    expect_confirmation({ copy = 2 }, function(instance)
+      return {
+        physical_line(instance, "a.txt"),
+        edited_line(instance, "a.txt", "copied-a.txt"),
+        physical_line(instance, "b.txt"),
+        edited_line(instance, "b.txt", "copied-b.txt"),
+      }
+    end)
+    expect_confirmation({ create_file = 6 }, function(instance)
+      local replacement = {
+        physical_line(instance, "a.txt"),
+        physical_line(instance, "b.txt"),
+      }
+      for index = 1, 6 do replacement[#replacement + 1] = "created-" .. index .. ".txt" end
+      return replacement
+    end)
+
+    local unknown = ready({}, { skip_confirm_for_simple_edits = true })
+    local ui = scripted_ui()
+    unknown._prepare_write = function()
+      return { operations = { { type = "future_operation" } }, display = { "FUTURE" } }
+    end
+    assert.is_true(write_command(unknown))
+    assert.are.same({ "FUTURE" }, ui.confirmations[1])
+    ui.decide(false)
+    assert.is_nil(unknown.actions)
+  end)
+
   it("holds one nonmodifiable lock, rejects mutators, and allows snapshot lookup, reveal, and windows", function()
     local instance = ready({ ["a.txt"] = "a", ["dir/child.txt"] = "child" })
     local ui = scripted_ui()
@@ -383,6 +484,38 @@ describe("fre ticket 11 write workflow", function()
     completed:close()
     vim.wait(30, function() return false end, 10)
     assert.are.equal(0, completion_cancel)
+  end)
+
+  it("refocuses the restored caller without overriding a later window selection", function()
+    actions._reset_ui_adapter()
+    local instance = ready({ ["a.txt"] = "a" })
+    instance:open({ position = "current" })
+    set_lines(instance, { physical_line(instance, "a.txt"), "new.txt" })
+    local caller_win = vim.api.nvim_get_current_win()
+
+    assert.is_true(write_command(instance))
+    local confirmation = assert(instance.actions.write.confirmation_ui)
+    vim.api.nvim_set_current_win(caller_win)
+    wait_for(function() return vim.api.nvim_get_current_win() == confirmation.winid end)
+    invoke_mapping(confirmation.bufnr, "q")
+    wait_unlocked(instance)
+
+    local source_win = vim.api.nvim_get_current_win()
+    vim.cmd("vsplit")
+    local alternate_win = vim.api.nvim_get_current_win()
+    vim.api.nvim_set_current_win(source_win)
+
+    local second = ready({ ["a.txt"] = "a" })
+    second:open({ position = "current" })
+    set_lines(second, { physical_line(second, "a.txt"), "other.txt" })
+    assert.is_true(write_command(second))
+    local second_confirmation = assert(second.actions.write.confirmation_ui)
+    vim.api.nvim_set_current_win(alternate_win)
+    vim.wait(50, function() return false end, 10)
+    assert.are.equal(alternate_win, vim.api.nvim_get_current_win())
+
+    invoke_mapping(second_confirmation.bufnr, "q")
+    wait_unlocked(second)
   end)
 
   it("rolls back partial scratch floats when window creation or float autocmd initialization throws", function()

@@ -897,7 +897,9 @@ describe("fre ticket 17 actions and mappings", function()
   end)
 
   it("uses public refresh forms and confirms modified drafts exactly once", function()
-    local instance = ready({ ["a.txt"] = "a" })
+    local instance = ready({ ["a.txt"] = "a" }, {
+      skip_confirm_for_simple_edits = true,
+    })
     local ctx = context_for(instance, "a.txt")
     local calls = {}
     instance.refresh = function(_, ...)

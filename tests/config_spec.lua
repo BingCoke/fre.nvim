@@ -32,6 +32,7 @@ describe("fre configuration", function()
     local defaults = config.builtins()
     assert.is_true(defaults.default_file_explorer)
     assert.is_false(defaults.hidden_file)
+    assert.is_false(defaults.skip_confirm_for_simple_edits)
     assert.is_true(defaults.use_mapping_default)
     assert.are.same({ "icon", "permissions", "size", "mtime" }, {
       defaults.columns[1].id,
@@ -91,6 +92,23 @@ describe("fre configuration", function()
     assert.is_nil(second.gc.groups.extra)
     assert.is_nil(second.buffer.options.modifiable)
     assert.is_true(second.window.options.cursorline)
+  end)
+
+  it("inherits and overrides skip_confirm_for_simple_edits and rejects non-booleans", function()
+    local manager = new_manager()
+    assert_error_contains("skip_confirm_for_simple_edits must be a boolean", function()
+      manager:setup({ skip_confirm_for_simple_edits = "yes" })
+    end)
+
+    manager:setup({ skip_confirm_for_simple_edits = true })
+    assert.is_true(manager:get_setup_defaults().skip_confirm_for_simple_edits)
+    assert.is_true(manager:resolve_instance_config().skip_confirm_for_simple_edits)
+    assert.is_false(manager:resolve_instance_config({
+      skip_confirm_for_simple_edits = false,
+    }).skip_confirm_for_simple_edits)
+    assert_error_contains("skip_confirm_for_simple_edits must be a boolean", function()
+      manager:resolve_instance_config({ skip_confirm_for_simple_edits = 1 })
+    end)
   end)
 
   it("rejects winfixbuf true while accepting false", function()

@@ -114,7 +114,8 @@ local function initialize_handle(handle, callback)
   return handle
 end
 
-function M.confirm(_ctx, display, on_decision)
+function M.confirm(ctx, display, on_decision)
+  local source_winid = type(ctx) == "table" and ctx.winid or nil
   local decided = false
   local handle
   local function decide(accepted)
@@ -127,12 +128,23 @@ function M.confirm(_ctx, display, on_decision)
   end)
   local function accept() decide(true) end
   local function cancel() decide(false) end
-  return initialize_handle(handle, function()
+  handle = initialize_handle(handle, function()
     vim.keymap.set("n", "<CR>", accept, { buffer = handle.bufnr, nowait = true, silent = true })
     vim.keymap.set("n", "y", accept, { buffer = handle.bufnr, nowait = true, silent = true })
     vim.keymap.set("n", "q", cancel, { buffer = handle.bufnr, nowait = true, silent = true })
     vim.keymap.set("n", "<Esc>", cancel, { buffer = handle.bufnr, nowait = true, silent = true })
   end)
+  vim.schedule(function()
+    if type(source_winid) ~= "number" or handle.closed
+        or not vim.api.nvim_win_is_valid(handle.winid)
+        or vim.api.nvim_win_get_buf(handle.winid) ~= handle.bufnr then
+      return
+    end
+    local current_winid = vim.api.nvim_get_current_win()
+    if current_winid ~= source_winid and current_winid ~= handle.winid then return end
+    pcall(vim.api.nvim_set_current_win, handle.winid)
+  end)
+  return handle
 end
 
 local function inspect_one_line(value)

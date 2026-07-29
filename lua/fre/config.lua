@@ -50,6 +50,7 @@ local function builtins()
   return {
     default_file_explorer = true,
     hidden_file = false,
+    skip_confirm_for_simple_edits = false,
     sort = builtin_sort,
     columns = {
       columns.icon(),
@@ -300,6 +301,7 @@ end
 local setup_fields = {
   default_file_explorer = true,
   hidden_file = true,
+  skip_confirm_for_simple_edits = true,
   sort = true,
   columns = true,
   gc = true,
@@ -313,6 +315,7 @@ local setup_fields = {
 local new_fields = {
   root = true,
   hidden_file = true,
+  skip_confirm_for_simple_edits = true,
   sort = true,
   expanded = true,
   columns = true,
@@ -358,6 +361,7 @@ end
 
 local function validate_common(config, setup)
   expect_type(config.hidden_file, "boolean", "hidden_file")
+  expect_type(config.skip_confirm_for_simple_edits, "boolean", "skip_confirm_for_simple_edits")
   expect_type(config.sort, "function", "sort")
   validate_columns(config.columns, "columns")
   expect_type(config.use_mapping_default, "boolean", "use_mapping_default")
@@ -412,6 +416,9 @@ function M.resolve_setup(opts, ignore_default_file_explorer)
   end
   if opts.hidden_file ~= nil then
     result.hidden_file = copy(opts.hidden_file)
+  end
+  if opts.skip_confirm_for_simple_edits ~= nil then
+    result.skip_confirm_for_simple_edits = copy(opts.skip_confirm_for_simple_edits)
   end
   if opts.sort ~= nil then
     result.sort = opts.sort
@@ -491,6 +498,7 @@ function M.resolve_instance(setup_defaults, opts, normalized_root)
   local expanded = normalize_expanded(opts.expanded or {}, "expanded", normalized_root)
   local result = {
     hidden_file = copy(setup_defaults.hidden_file),
+    skip_confirm_for_simple_edits = copy(setup_defaults.skip_confirm_for_simple_edits),
     sort = setup_defaults.sort,
     expanded = expanded,
     columns = copy(setup_defaults.columns),
@@ -507,6 +515,9 @@ function M.resolve_instance(setup_defaults, opts, normalized_root)
   }
   if opts.hidden_file ~= nil then
     result.hidden_file = copy(opts.hidden_file)
+  end
+  if opts.skip_confirm_for_simple_edits ~= nil then
+    result.skip_confirm_for_simple_edits = copy(opts.skip_confirm_for_simple_edits)
   end
   if opts.sort ~= nil then
     result.sort = opts.sort
