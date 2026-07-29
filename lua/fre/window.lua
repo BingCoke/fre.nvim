@@ -940,7 +940,7 @@ local function open_prepared(instance, tabpage, layout, effective, selected, cal
   if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_get_current_win() ~= winid then
     pcall(vim.api.nvim_set_current_win, winid)
   end
-  if newly_presented then place_initial_cursor(instance, winid) end
+  if newly_presented and not selected then place_initial_cursor(instance, winid) end
   remember(instance, tabpage, remembered)
   pcall(M.sync_visibility, instance)
   return winid

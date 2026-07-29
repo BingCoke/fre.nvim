@@ -32,16 +32,24 @@ local function lines(instance)
 end
 
 local function set_lines(instance, replacement)
+  local navigation = lines(instance)[1]
+  assert.are.equal("navigation", assert(buffer.decode(instance, 1)).row_kind)
+  local next_lines = {}
+  if replacement[1] ~= navigation then next_lines[1] = navigation end
+  vim.list_extend(next_lines, replacement)
   local modifiable = vim.bo[instance.bufnr].modifiable
   vim.bo[instance.bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, replacement)
+  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, next_lines)
   vim.bo[instance.bufnr].modifiable = modifiable
 end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
     local decoded = buffer.decode(instance, row)
-    if decoded and decoded.marked and decoded.entry.relative_path == relative then return row end
+    if decoded and decoded.row_kind == "entry"
+        and decoded.entry.relative_path == relative then
+      return row
+    end
   end
   error("missing row " .. relative)
 end
@@ -108,8 +116,9 @@ end
 
 local function projected_paths(instance)
   local result = {}
-  for row = 1, #(instance.view.visible_nodes or {}) do
-    result[#result + 1] = assert(buffer.decode(instance, row)).path
+  for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
+    local decoded = assert(buffer.decode(instance, row))
+    if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
 end
@@ -321,12 +330,13 @@ describe("fre ticket 12 duplicate and directory semantics", function()
     end
   end)
 
-  it("orders carried new rows and rejects new rows under a deleted directory", function()
+  it("recreates moved parent paths for new rows and rejects rows under a deleted directory", function()
     local instance = ready({ ["dir"] = true })
     set_lines(instance, { edited_line(instance, "dir", "moved/"), "dir/new.txt" })
     assert.are.same({
-      { type = "create_file", path = fixture:path("dir", "new.txt") },
       { type = "move", from = fixture:path("dir"), to = fixture:path("moved"), kind = "directory" },
+      { type = "create_directory", path = fixture:path("dir") },
+      { type = "create_file", path = fixture:path("dir", "new.txt") },
     }, instance:prepare().operations)
 
     set_lines(instance, { "dir/new.txt" })

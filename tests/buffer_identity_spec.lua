@@ -1,6 +1,7 @@
 local fre = require("fre")
 local buffer = require("fre.buffer")
 local path = require("fre.path")
+local row = require("fre.row")
 local fs = require("tests.helpers.fs")
 
 local unit_separator = string.char(31)
@@ -29,6 +30,16 @@ end
 
 local function lines(instance)
   return vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false)
+end
+
+local function row_for(instance, relative)
+  for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
+    local decoded = assert(buffer.decode(instance, row))
+    if decoded.row_kind == "entry" and decoded.entry.relative_path == relative then
+      return row
+    end
+  end
+  error("missing row for " .. relative)
 end
 
 local function set_lines(instance, start_row, end_row, replacement)
@@ -80,19 +91,22 @@ describe("fre stable row identity", function()
     fixture:cleanup()
   end)
 
-  it("uses canonical unit-separator base36 markers and returns fresh exact Entries", function()
-    assert.are.equal(unit_separator .. "fre:10:1z" .. unit_separator, buffer.marker(36, 71))
+  it("uses canonical zero-padded decimal markers and returns fresh exact Entries", function()
+    assert.are.equal(unit_separator .. "fre:036:071" .. unit_separator,
+      row.marker(nil, 36, 71, { instance = 3, node = 3 }))
 
     local instance = ready({ ["a.txt"] = "x" })
-    local first = instance:get_entry(1)
-    local marker = buffer.marker(instance.id, first.node_id)
-    local physical = lines(instance)[1]
+    local entry_row = row_for(instance, "a.txt")
+    local decoded = buffer.decode(instance, entry_row)
+    local first = instance:get_entry(entry_row)
+    local marker = decoded.marker
+    local physical = lines(instance)[entry_row]
     assert.are.equal(marker, physical:sub(1, #marker))
-    assert.are.equal("a.txt", buffer.decode(instance, 1).path)
+    assert.are.equal("a.txt", decoded.path)
     assert.are.equal(unit_separator, marker:sub(1, 1))
     assert.are.equal(unit_separator, marker:sub(-1))
     assert.is_truthy(marker:match("^" .. unit_separator
-      .. "fre:[0-9a-z]+:[0-9a-z]+" .. unit_separator .. "$"))
+      .. "fre:[0-9]+:[0-9]+" .. unit_separator .. "$"))
 
     assert_exact_entry(first, {
       instance_id = instance.id,
@@ -103,7 +117,7 @@ describe("fre stable row identity", function()
       kind = "file",
     })
     first.name = "caller mutation"
-    local second = instance:get_entry(1)
+    local second = instance:get_entry(entry_row)
     assert.are_not.equal(first, second)
     assert.are.equal("a.txt", second.name)
   end)
@@ -122,8 +136,8 @@ describe("fre stable row identity", function()
   it("reports malformed and unknown markers with their row numbers", function()
     local instance = ready({ ["a.txt"] = "x" })
     local malformed = unit_separator .. "fre:" .. instance.id .. ":"
-    local unknown_instance = buffer.marker(999999, 2) .. "foreign.txt"
-    local unknown_node = buffer.marker(instance.id, 999999) .. "missing.txt"
+    local unknown_instance = row.marker(instance.manager, 999, 2) .. "foreign.txt"
+    local unknown_node = row.marker(instance.manager, instance.id, 999) .. "missing.txt"
     set_lines(instance, 0, -1, { malformed, unknown_instance, unknown_node })
 
     assert_row_error(1, "malformed reserved row marker", function()
@@ -139,46 +153,51 @@ describe("fre stable row identity", function()
 
   it("looks up snapshot keys after path edits and row moves", function()
     local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b" })
-    local original = lines(instance)[1]
-    local decoded = assert(buffer.decode(instance, 1))
+    local row = row_for(instance, "a.txt")
+    local original = lines(instance)[row]
+    local decoded = assert(buffer.decode(instance, row))
     local path_start = decoded.path_range.start_byte
-    set_lines(instance, 0, 1, { original:sub(1, path_start) .. "renamed.txt" })
+    set_lines(instance, row - 1, row, { original:sub(1, path_start) .. "renamed.txt" })
 
     local edited_pos = instance:get_pos("a.txt")
-    assert.are.same({ 1, path_start }, edited_pos)
+    assert.are.same({ row, path_start }, edited_pos)
     assert.is_nil(instance:get_pos("renamed.txt"))
 
-    local moved = lines(instance)[1]
-    set_lines(instance, 0, 1, {})
+    local moved = lines(instance)[row]
+    set_lines(instance, row - 1, row, {})
     set_lines(instance, -1, -1, { moved })
-    assert.are.same({ 2, path_start }, instance:get_pos("a.txt"))
+    assert.are.same({ vim.api.nvim_buf_line_count(instance.bufnr), path_start },
+      instance:get_pos("a.txt"))
   end)
 
   it("keeps the moved original occurrence authoritative when a duplicate is inserted before it", function()
     local instance = ready({ ["a.txt"] = "a" })
-    local original = lines(instance)[1]
-    set_lines(instance, 0, 0, { original })
+    local row = row_for(instance, "a.txt")
+    local original = lines(instance)[row]
+    set_lines(instance, row - 1, row - 1, { original })
 
-    local expected_col = assert(buffer.decode(instance, 1)).path_range.start_byte
-    assert.are.same({ 2, expected_col }, instance:get_pos("a.txt"))
+    local expected_col = assert(buffer.decode(instance, row)).path_range.start_byte
+    assert.are.same({ row + 1, expected_col }, instance:get_pos("a.txt"))
   end)
 
   it("rejects directory and nondirectory trailing-slash mismatches", function()
     local instance = ready({ ["dir"] = true, ["file.txt"] = "x" })
+    local directory_row = row_for(instance, "dir")
+    local file_row = row_for(instance, "file.txt")
     local physical = lines(instance)
-    local directory_entry = instance:get_entry(1)
-    local file_entry = instance:get_entry(2)
+    local directory_entry = instance:get_entry(directory_row)
+    local file_entry = instance:get_entry(file_row)
     assert.are.equal("directory", directory_entry.kind)
     assert.are.equal("file", file_entry.kind)
 
-    set_lines(instance, 0, 1, { physical[1]:sub(1, -2) })
-    assert_row_error(1, "directory path must end in /", function()
-      instance:get_entry(1)
+    set_lines(instance, directory_row - 1, directory_row, { physical[directory_row]:sub(1, -2) })
+    assert_row_error(directory_row, "directory path must end in /", function()
+      instance:get_entry(directory_row)
     end)
 
-    set_lines(instance, 1, 2, { physical[2] .. "/" })
-    assert_row_error(2, "file path must not end in /", function()
-      instance:get_entry(2)
+    set_lines(instance, file_row - 1, file_row, { physical[file_row] .. "/" })
+    assert_row_error(file_row, "file path must not end in /", function()
+      instance:get_entry(file_row)
     end)
   end)
 
@@ -209,33 +228,35 @@ describe("fre stable row identity", function()
     fixture:write("destination/to.txt", "y")
     local source = ready(nil, source_root)
     local destination = ready(nil, destination_root)
-    local source_line = lines(source)[1]
-    set_lines(destination, 0, 1, { source_line })
+    local source_line = lines(source)[row_for(source, "from.txt")]
+    local destination_row = row_for(destination, "to.txt")
+    set_lines(destination, destination_row - 1, destination_row, { source_line })
 
-    local entry = destination:get_entry(1)
+    local entry = destination:get_entry(destination_row)
     assert.are.equal(source.id, entry.instance_id)
     assert.are.equal("from.txt", entry.relative_path)
     assert.are.equal(path.resolve(source.root, "from.txt"), entry.absolute_path)
   end)
 
-  it("clamps normal and insert cursors to decoded row boundaries", function()
+  it("clamps normal and insert cursors to the decoded navigable boundary", function()
     local instance = ready({ ["a.txt"] = "x" })
     instance:open()
-    local decoded = assert(buffer.decode(instance, 1))
-    local normal_boundary = decoded.visible_range.start_byte
-    local insert_boundary = decoded.path_range.start_byte
+    local entry_row = row_for(instance, "a.txt")
+    local decoded = assert(buffer.decode(instance, entry_row))
+    local boundary = decoded.navigable_range.start_byte
 
-    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    vim.api.nvim_win_set_cursor(0, { entry_row, 0 })
     vim.api.nvim_exec_autocmds("CursorMoved", { buffer = instance.bufnr })
-    assert.are.same({ 1, normal_boundary }, vim.api.nvim_win_get_cursor(0))
+    assert.are.same({ entry_row, boundary }, vim.api.nvim_win_get_cursor(0))
 
-    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    vim.api.nvim_win_set_cursor(0, { entry_row, 0 })
     vim.api.nvim_exec_autocmds("InsertEnter", { buffer = instance.bufnr })
-    assert.are.same({ 1, insert_boundary }, vim.api.nvim_win_get_cursor(0))
+    assert.are.same({ entry_row, boundary }, vim.api.nvim_win_get_cursor(0))
 
     set_lines(instance, -1, -1, { "new.txt" })
-    vim.api.nvim_win_set_cursor(0, { 2, 0 })
+    local new_row = vim.api.nvim_buf_line_count(instance.bufnr)
+    vim.api.nvim_win_set_cursor(0, { new_row, 0 })
     vim.api.nvim_exec_autocmds("InsertEnter", { buffer = instance.bufnr })
-    assert.are.same({ 2, 0 }, vim.api.nvim_win_get_cursor(0))
+    assert.are.same({ new_row, 0 }, vim.api.nvim_win_get_cursor(0))
   end)
 end)

@@ -32,7 +32,8 @@ local function visual_range(mode, row, col)
   }
 end
 
-function M.context(expected_instance)
+function M.context(expected_instance, opts)
+  opts = opts or {}
   local bufnr = vim.api.nvim_get_current_buf()
   local instance
   if expected_instance ~= nil then
@@ -59,7 +60,13 @@ function M.context(expected_instance)
   local cursor = vim.api.nvim_win_get_cursor(winid)
   local mode = vim.api.nvim_get_mode().mode
   local row, col = cursor[1], cursor[2]
-  local decoded = buffer.decode(instance, row)
+  local decoded
+  if opts.allow_undecodable_row then
+    local ok, value = pcall(buffer.decode, instance, row)
+    if ok then decoded = value end
+  else
+    decoded = buffer.decode(instance, row)
+  end
   return {
     instance = instance,
     bufnr = bufnr,
@@ -72,6 +79,7 @@ function M.context(expected_instance)
     navigation_kind = decoded and decoded.navigation_kind or nil,
     source_instance_id = decoded and decoded.source_instance_id or nil,
     entry = decoded and decoded.entry or nil,
+    path_range = decoded and decoded.path_range or nil,
     range = visual_range(mode, row, col),
   }
 end
@@ -114,6 +122,7 @@ end
 
 function M.setup(instance)
   if instance._mapping_installed then fail("instance mappings are already installed", 2) end
+  local jump_to_path = require("fre.actions").jump_to_path
   local base = instance.config.use_mapping_default and mapping_base() or {}
   local installed_maps = overlay(base, copy_maps(instance.config.mapping))
   local installed = {}
@@ -121,7 +130,9 @@ function M.setup(instance)
     for mode, mode_map in pairs(installed_maps) do
       for lhs, handler in pairs(mode_map) do
         vim.keymap.set(mode, lhs, function()
-          return handler(M.context(instance))
+          local context_opts = handler == jump_to_path
+            and { allow_undecodable_row = true } or nil
+          return handler(M.context(instance, context_opts))
         end, {
           buffer = instance.bufnr,
           nowait = true,

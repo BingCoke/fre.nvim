@@ -1,3 +1,4 @@
+local buffer = require("fre.buffer")
 local fre = require("fre")
 local fs = require("tests.helpers.fs")
 
@@ -815,15 +816,16 @@ describe("fre ticket 16 window layouts", function()
     assert.are_not.equal(initiating_tab, other_tab)
     assert.are.equal(initiating_window, vim.api.nvim_get_current_win())
 
-    local other_cursor = vim.api.nvim_win_get_cursor(other_window)
     vim.api.nvim_win_set_buf(other_window, instance.bufnr)
-    assert.are.same(other_cursor, vim.api.nvim_win_get_cursor(other_window))
+    local navigation = assert(buffer.decode(instance, 1))
+    local navigation_cursor = { 1, navigation.path_range.start_byte }
+    assert.are.same(navigation_cursor, vim.api.nvim_win_get_cursor(other_window))
     assert.are.equal(request, instance._pending_reveal)
 
     vim.api.nvim_win_set_buf(initiating_window, instance.bufnr)
     assert.are.same(instance:get_pos("c.txt"), vim.api.nvim_win_get_cursor(initiating_window))
     assert.is_nil(instance._pending_reveal)
-    assert.are.same(other_cursor, vim.api.nvim_win_get_cursor(other_window))
+    assert.are.same(navigation_cursor, vim.api.nvim_win_get_cursor(other_window))
   end)
 
 

@@ -33,12 +33,13 @@ describe("fre configuration", function()
     assert.is_true(defaults.default_file_explorer)
     assert.is_false(defaults.hidden_file)
     assert.is_true(defaults.use_mapping_default)
-    assert.are.same({ "icon", "permissions", "mtime" }, {
+    assert.are.same({ "icon", "permissions", "size", "mtime" }, {
       defaults.columns[1].id,
       defaults.columns[2].id,
       defaults.columns[3].id,
+      defaults.columns[4].id,
     })
-    assert.are.equal("%Y-%m-%d %H:%M", defaults.columns[3].format)
+    assert.are.equal("%Y-%m-%d %H:%M", defaults.columns[4].format)
     assert.are.same({ ttl_ms = 60000, include_modified = false, default_group = "default", groups = {
       default = 10,
       project = 5,
@@ -271,12 +272,43 @@ describe("fre configuration", function()
     local effective = manager:resolve_instance_config({
       sort = explicit_sort,
       hidden_file = true,
+      expanded = { "src", "src/x" },
     })
     assert.are.equal(explicit_sort, effective.sort)
     assert.is_true(effective.hidden_file)
+    assert.are.same({ "src", "src/x" }, effective.expanded)
     assert.are.equal(60000, effective.gc.ttl_ms)
     assert.is_false(effective.gc.include_modified)
     assert.are.equal("default", effective.gc.group)
+  end)
+
+  it("validates expanded as a sequence of root-relative directory paths", function()
+    local manager = new_manager()
+    assert_error_contains("must be a table", function()
+      manager:resolve_instance_config({ expanded = "src" })
+    end)
+    assert_error_contains("must be a string", function()
+      manager:resolve_instance_config({ expanded = { 1 } })
+    end)
+    for _, invalid in ipairs({ "", "/src", "../src" }) do
+      assert_error_contains("root-relative", function()
+        manager:resolve_instance_config({ expanded = { invalid } })
+      end)
+    end
+  end)
+
+  it("normalizes expanded paths with the normalized root platform semantics", function()
+    local manager = new_manager()
+    local effective = manager:resolve_instance_config({
+      expanded = { "src\\x", "src\\x\\deep" },
+    }, "C:/project")
+    assert.are.same({ "src/x", "src/x/deep" }, effective.expanded)
+
+    for _, invalid in ipairs({ "..\\escape", "\\rooted", "C:\\other" }) do
+      assert_error_contains("root-relative", function()
+        manager:resolve_instance_config({ expanded = { invalid } }, "C:/project")
+      end)
+    end
   end)
 
   it("resolves effective GC fields and rejects setup-only or unknown groups", function()

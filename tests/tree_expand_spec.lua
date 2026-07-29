@@ -28,8 +28,9 @@ end
 
 local function projected_paths(instance)
   local result = {}
-  for row = 1, #instance.view.visible_nodes do
-    result[#result + 1] = assert(buffer.decode(instance, row)).path
+  for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
+    local decoded = assert(buffer.decode(instance, row))
+    if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
 end
@@ -111,6 +112,70 @@ describe("fre directory tree expansion", function()
     fre._reset_fs_adapter()
     fixture:cleanup()
   end)
+
+  it("applies configured expansions before delivering readiness", function()
+    fixture:tree({ ["src/x/deep.txt"] = "x", ["other.txt"] = "o" })
+    local adapter, _, _, release = deferred_loader()
+    fre._set_fs_adapter(adapter)
+    local requested = { "src", "src/x" }
+    local callback_count = 0
+    local callback_error
+    local instance = keep(fre.new({
+      root = fixture.root,
+      expanded = requested,
+    }))
+    instance:when_ready(function(err)
+      callback_count = callback_count + 1
+      callback_error = err
+    end)
+    requested[1] = "other"
+
+    release(instance.root)
+    release(path.resolve(instance.root, "src"))
+    assert.are.equal("creating", instance.state)
+    assert.are.equal(0, callback_count)
+    release(path.resolve(instance.root, "src/x"))
+
+    wait_ready(instance)
+    wait_for(function() return callback_count == 1 end)
+    assert.is_nil(callback_error)
+    assert.are.same({ "src", "src/x" }, instance.config.expanded)
+    assert.is_not_nil(instance:get_pos("src/x/deep.txt"))
+    assert.is_true(instance.nodes_by_path[fixture:path("src")].expanded)
+    assert.is_true(instance.nodes_by_path[fixture:path("src", "x")].expanded)
+  end)
+
+  it("reports configured expansion load failures through readiness", function()
+    fixture:tree({ ["src/deep.txt"] = "x" })
+    local adapter, _, _, release = deferred_loader()
+    fre._set_fs_adapter(adapter)
+    local callback_count = 0
+    local callback_error
+    local event
+    vim.api.nvim_create_autocmd("User", {
+      pattern = "FreReady",
+      once = true,
+      callback = function(args) event = args.data end,
+    })
+    local instance = keep(fre.new({
+      root = fixture.root,
+      expanded = { "src" },
+    }))
+    instance:when_ready(function(err)
+      callback_count = callback_count + 1
+      callback_error = err
+    end)
+
+    release(instance.root)
+    release(path.resolve(instance.root, "src"), nil, "configured expansion exploded")
+    wait_for(function() return instance.state == "load-failed" and callback_count == 1 and event end)
+
+    assert.is_truthy(tostring(instance.error):find("initial expansion failed for src", 1, true))
+    assert.is_truthy(tostring(callback_error):find("configured expansion exploded", 1, true))
+    assert.are.equal(instance.id, event.instance_id)
+    assert.are.equal(instance.error, event.error)
+  end)
+
 
   it("loads a deep path segment-by-segment into one instance-local tree", function()
     fixture:tree({
@@ -465,13 +530,13 @@ describe("fre directory tree expansion", function()
     instance:expand("d")
     wait_for(function() return instance:get_pos("d/file.txt") ~= nil end)
     assert.are.equal("interval", instance.view.last_patch.kind)
-    assert.are.equal(2, instance.view.last_patch.start_row)
+    assert.are.equal(instance:get_pos("d/file.txt")[1], instance.view.last_patch.start_row)
     assert.are.same({ "d/", "d/file.txt", "tail.txt" }, projected_paths(instance))
     assert.is_false(vim.bo[instance.bufnr].modified)
 
     instance:collapse("d")
     assert.are.equal("interval", instance.view.last_patch.kind)
-    assert.are.equal(2, instance.view.last_patch.start_row)
+    assert.are.equal(instance:get_pos("d")[1] + 1, instance.view.last_patch.start_row)
     assert.are.same({ "d/", "tail.txt" }, projected_paths(instance))
   end)
 
@@ -479,16 +544,16 @@ describe("fre directory tree expansion", function()
     fixture:tree({ ["d/very-long-name.txt"] = "x", ["x"] = "x" })
     local descriptor = custom_value_column(function(entry) return entry.name end)
     local instance = wait_ready(keep(fre.new({ root = fixture.root, columns = { descriptor } })))
-    assert.are.equal(1, instance.view.column_widths[1])
+    assert.are.equal(2, instance.view.column_widths[1])
     instance:expand("d")
     wait_for(function() return instance:get_pos("d/very-long-name.txt") ~= nil end)
     assert.are.equal(#"very-long-name.txt", instance.view.column_widths[1])
     assert.are.equal("full", instance.view.last_patch.kind)
-    local first = buffer.decode(instance, 1)
+    local first = buffer.decode(instance, instance:get_pos("d")[1])
     assert.are.equal("d", first.column_values.value)
 
     instance:collapse("d")
-    assert.are.equal(1, instance.view.column_widths[1])
+    assert.are.equal(2, instance.view.column_widths[1])
     assert.are.equal("full", instance.view.last_patch.kind)
     assert.are.same({ "d/", "x" }, projected_paths(instance))
   end)
@@ -501,12 +566,13 @@ describe("fre directory tree expansion", function()
 
     assert.are.equal(#instance.view.visible_nodes, instance.root_node.visible_size)
     for row, node in ipairs(instance.view.visible_nodes) do
-      local decoded = buffer.decode(instance, row)
+      local buffer_row = row + instance.view.row_offset
+      local decoded = buffer.decode(instance, buffer_row)
       local relative = assert(path.relative(instance.root, node.path))
       assert.are.equal(node.id, decoded.entry.node_id)
       assert.are.equal(node.path, instance.view.baseline[node.id])
-      assert.are.equal(row, buffer.hint_row(instance, node))
-      assert.are.same({ row, decoded.path_range.start_byte }, instance:get_pos(relative))
+      assert.are.equal(buffer_row, buffer.hint_row(instance, node))
+      assert.are.same({ buffer_row, decoded.path_range.start_byte }, instance:get_pos(relative))
       assert.are.equal(row, node.visible_start)
       assert.is_true(node.visible_end >= node.visible_start)
       assert.are.equal(node.visible_end - node.visible_start + 1, node.visible_size)

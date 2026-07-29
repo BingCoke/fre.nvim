@@ -250,6 +250,7 @@ local instance = require("fre").new({
   root = "/absolute/path/to/project", -- 必填
   hidden_file = true,
   sort = custom_sort,
+  expanded = { "src", "src/x" }, -- 相对于 root 的初始展开目录
   columns = custom_columns,
   gc = {
     group = "project",
@@ -264,7 +265,7 @@ local instance = require("fre").new({
 })
 ```
 
-实例选项覆盖 setup 默认值。每个实例完全由本次传入的值选项决定；`fre.new()` 不接受来源实例，也不会共享或恢复其他实例的目录展开状态。`default_file_explorer`、`gc.groups` 和 `gc.default_group` 是 setup-only 配置，不能传给 `fre.new()`。
+实例选项覆盖 setup 默认值。每个实例完全由本次传入的值选项决定；`expanded` 是 root-relative 目录列表，会按 root 的平台路径语义规范化，并在 root 加载后通过普通展开流程逐项应用。全部初始展开完成后实例才 ready；路径缺失、不是目录或加载失败都会使本次初始化失败。`fre.new()` 不接受来源实例或实例引用，也不会在实例之间建立状态关系。`default_file_explorer`、`gc.groups` 和 `gc.default_group` 是 setup-only 配置，不能传给 `fre.new()`。
 
 ## 窗口布局
 
@@ -304,6 +305,7 @@ instance:open({
   navigation_kind = "parent" | "root" | nil,
   source_instance_id = instance_id_or_nil,
   entry = entry_or_nil,
+  path_range = { start_byte = 0, end_byte = 4 } | nil,
   range = visual_range_or_nil,
 }
 ```
@@ -330,6 +332,7 @@ actions.collapse(ctx)
 actions.toggle_expand(ctx)
 actions.toggle_hidden_file(ctx)
 actions.refresh(ctx)
+actions.jump_to_path(ctx) -- 当前 entry/navigation 行的 path 字段起点
 
 actions.select(ctx, { target_winid = ctx.winid })
 actions.tab_select(ctx)
@@ -339,7 +342,7 @@ actions.split_select(ctx, {
 })
 ```
 
-对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会使用当前实例所属的 Manager 创建一个独立实例，并把当前 sort 和点文件显示状态作为普通值选项传入。选择 `../` 后，刚离开的目录保持折叠，cursor 定位到它的条目；不会恢复任何展开状态。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`opts.instance` 可以覆盖这些普通实例选项，但不能覆盖 action 决定的 `root`。
+对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会使用当前实例所属的 Manager 创建一个独立实例，并把当前 sort 和点文件显示状态作为普通值选项传入。这里的 `opts.instance` 是新实例的普通值选项 table，不是 Instance 引用。进入目录时，目标目录下当前有效的展开路径会转换成新 root-relative 的 `expanded` 值；例如进入已展开的 `src` 时使用 `{ "x", "x/x" }`。选择 `../` 时固定使用空 `expanded`，因此刚离开的目录保持折叠，并在新实例 ready 后通过 `set_cursor_to_path()` 定位到它的条目。action 计算的 `expanded` 会覆盖 `opts.instance.expanded`，而 `opts.instance.root` 是参数错误。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`actions.jump_to_path()` 只把 entry 或 navigation 行的 cursor 移到 path 字段；new、缺少 path range 或不可解析的行会静默忽略。它没有默认映射。
 
 ## 列
 
@@ -439,7 +442,7 @@ instance.config
 ```lua
 instance:when_ready(function(err) end)
 
-instance:open(layout)
+local opened, winid = instance:open(layout) -- opened == instance
 instance:hidden()
 instance:toggle(layout)
 
@@ -454,6 +457,7 @@ instance:toggle_hidden_file()
 
 instance:get_entry(row)
 instance:get_pos(snapshot_path) -- { row, byte_col } 或 nil
+instance:set_cursor_to_path(snapshot_path, winid)
 
 instance:refresh()
 instance:refresh({ force = true, on_complete = function(err) end })
@@ -473,7 +477,7 @@ instance:destroy()
 }
 ```
 
-`expand`、`collapse`、`toggle_expand` 和 `reveal` 接受 root 内的 snapshot 相对路径，也可接受 root 内绝对路径；`get_pos` 只接受 snapshot 相对路径。会改变投影的操作在 buffer 已修改时会直接报错，以避免覆盖草稿；窗口操作和 lookup 仍可使用。
+`expand`、`collapse`、`toggle_expand` 和 `reveal` 接受 root 内的 snapshot 相对路径，也可接受 root 内绝对路径；`get_pos` 和 `set_cursor_to_path` 接受 snapshot 相对路径。`set_cursor_to_path` 可以在创建期间调用：它等待实例 ready 后，把指定窗口的 cursor 放到目标条目的 path 起点，不展开目录或保存 cursor 状态。会改变投影的操作在 buffer 已修改时会直接报错，以避免覆盖草稿；窗口操作和 lookup 仍可使用。
 
 ### 异步就绪
 
@@ -488,6 +492,8 @@ instance:when_ready(function(err)
   vim.notify("Fre is ready")
 end)
 ```
+
+配置了 `expanded` 时，root 和全部初始展开目录完成加载后才会调用 `when_ready` 并触发 `FreReady`。初始化展开失败时，Instance 进入 `load-failed`，错误同时传给 callback 和事件的 `data.error`。
 
 也可以监听 `User FreReady`：
 

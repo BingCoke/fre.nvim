@@ -5,6 +5,7 @@ local move_graph = require("fre.mutation.move_graph")
 local mutation_fs = require("fre.mutation.fs")
 local mutation_prepare = require("fre.mutation.prepare")
 local path = require("fre.path")
+local row = require("fre.row")
 local fs = require("tests.helpers.fs")
 
 local fixture
@@ -36,16 +37,24 @@ local function lines(instance)
 end
 
 local function set_lines(instance, replacement)
+  local navigation = lines(instance)[1]
+  assert.are.equal("navigation", assert(buffer.decode(instance, 1)).row_kind)
+  local next_lines = {}
+  if replacement[1] ~= navigation then next_lines[1] = navigation end
+  vim.list_extend(next_lines, replacement)
   local modifiable = vim.bo[instance.bufnr].modifiable
   vim.bo[instance.bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, replacement)
+  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, next_lines)
   vim.bo[instance.bufnr].modifiable = modifiable
 end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
     local decoded = buffer.decode(instance, row)
-    if decoded and decoded.marked and decoded.entry.relative_path == relative then return row end
+    if decoded and decoded.row_kind == "entry"
+        and decoded.entry.relative_path == relative then
+      return row
+    end
   end
   error("missing row " .. relative)
 end
@@ -86,8 +95,9 @@ end
 
 local function projected_paths(instance)
   local result = {}
-  for row = 1, #(instance.view.visible_nodes or {}) do
-    result[#result + 1] = assert(buffer.decode(instance, row)).path
+  for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
+    local decoded = assert(buffer.decode(instance, row))
+    if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
 end
@@ -124,6 +134,7 @@ local function fake_plan(root_path, definitions)
   local root = { id = 1, path = root_path, kind = "directory" }
   local nodes_by_id = { [1] = root }
   local baseline, visible, replacement = {}, {}, {}
+  local marker_widths = { instance = 3, node = 3 }
   for index, definition in ipairs(definitions) do
     local id = index + 1
     local absolute = path.resolve(root_path, definition.source)
@@ -137,7 +148,7 @@ local function fake_plan(root_path, definitions)
     nodes_by_id[id] = node
     baseline[id] = absolute
     visible[#visible + 1] = node
-    replacement[#replacement + 1] = buffer.marker(900, id) .. definition.target
+    replacement[#replacement + 1] = row.marker(nil, 900, id, marker_widths) .. definition.target
   end
   local fake = {
     id = 900,
@@ -159,7 +170,10 @@ local function fake_plan(root_path, definitions)
       kind = node.kind,
     }
   end
-  fake.manager = { find_by_id = function(_, id) return id == fake.id and fake or nil end }
+  fake.manager = {
+    find_by_id = function(_, id) return id == fake.id and fake or nil end,
+    get_marker_widths = function() return marker_widths end,
+  }
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, replacement)
   local ok, plan_or_error = pcall(mutation_prepare.prepare, fake)
   vim.api.nvim_buf_delete(bufnr, { force = true })

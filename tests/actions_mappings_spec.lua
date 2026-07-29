@@ -1,5 +1,6 @@
 local actions = require("fre.actions")
 local buffer = require("fre.buffer")
+local columns = require("fre.columns")
 local fre = require("fre")
 local manager_module = require("fre.manager")
 local path = require("fre.path")
@@ -155,7 +156,7 @@ describe("fre ticket 17 actions and mappings", function()
 
   it("exports ordinary action functions without a registry protocol", function()
     local names = {
-      "context", "expand", "collapse", "toggle_expand", "reveal",
+      "context", "expand", "collapse", "toggle_expand", "reveal", "jump_to_path",
       "open", "hidden", "toggle", "set_hidden_file", "toggle_hidden_file", "refresh",
       "select", "tab_select", "split_select", "confirm", "write", "destroy",
     }
@@ -204,6 +205,43 @@ describe("fre ticket 17 actions and mappings", function()
 
     vim.cmd("enew")
     assert.is_truthy(error_text(actions.context):find("not a live Fre instance", 1, true))
+  end)
+
+  it("jumps entry and navigation rows to path while ignoring new and malformed rows", function()
+    fixture:tree({ ["child/a.txt"] = "a" })
+    local instance = wait_ready(fre.new({
+      root = fixture:path("child"),
+      columns = { columns.size() },
+      mapping = { n = { gp = actions.jump_to_path } },
+    }))
+    local winid = open_current(instance)
+
+    local navigation = assert(buffer.decode(instance, 1))
+    vim.api.nvim_win_set_cursor(winid, { 1, navigation.column_ranges[1].start_byte })
+    invoke(instance.bufnr, "n", "gp")
+    assert.are.same({ 1, navigation.path_range.start_byte }, vim.api.nvim_win_get_cursor(winid))
+
+    local entry_row = row_for(instance, "a.txt")
+    local entry = assert(buffer.decode(instance, entry_row))
+    vim.api.nvim_win_set_cursor(winid, { entry_row, entry.column_ranges[1].start_byte })
+    invoke(instance.bufnr, "n", "gp")
+    assert.are.same(
+      { entry_row, entry.path_range.start_byte }, vim.api.nvim_win_get_cursor(winid))
+
+    set_line(instance, entry_row, "draft.txt")
+    vim.api.nvim_win_set_cursor(winid, { entry_row, 2 })
+    local before = vim.api.nvim_win_get_cursor(winid)
+    local ok, err = pcall(invoke, instance.bufnr, "n", "gp")
+    assert.is_true(ok, tostring(err))
+    assert.are.same(before, vim.api.nvim_win_get_cursor(winid))
+
+    set_line(instance, entry_row, string.char(31) .. "fre:bad" .. string.char(31) .. "a.txt")
+    vim.api.nvim_win_set_cursor(winid, { entry_row, 0 })
+    before = vim.api.nvim_win_get_cursor(winid)
+    ok, err = pcall(invoke, instance.bufnr, "n", "gp")
+    assert.is_true(ok, tostring(err))
+    assert.are.same(before, vim.api.nvim_win_get_cursor(winid))
+    assert.is_truthy(error_text(actions.context):find("row " .. entry_row, 1, true))
   end)
 
   it("installs the exact default normal map base with no h, l, insert, or visual defaults", function()
@@ -388,12 +426,79 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal("navigation", ctx.row_kind)
     assert.are.equal("parent", ctx.navigation_kind)
 
-    local parent = wait_ready(actions.select(ctx))
+    local parent = wait_ready(actions.select(ctx, {
+      instance = { expanded = { "child" } },
+    }))
+    assert.are.same({}, parent.config.expanded)
     local previous_root = parent.nodes_by_path[path.absolute(fixture:path("child"))]
     assert.is_not_nil(previous_root)
     assert.is_false(previous_root.expanded)
     assert.is_nil(parent:get_pos("child/nested"))
     assert.are.same(parent:get_pos("child"), vim.api.nvim_win_get_cursor(winid))
+  end)
+
+  it("returns to the parent with the previous root selected in tabs and splits", function()
+    fixture:tree({ ["child/nested/file.txt"] = "x" })
+    local cases = {
+      { kind = "tab" },
+      { kind = "split", layout = { position = "right", size = 20 } },
+    }
+    for _, case in ipairs(cases) do
+      pcall(vim.cmd, "silent! tabonly")
+      pcall(vim.cmd, "silent! only")
+      vim.cmd("enew")
+      local instance = wait_ready(fre.new({
+        root = fixture:path("child"),
+        columns = {},
+      }))
+      open_current(instance)
+      vim.api.nvim_win_set_cursor(0, { 1, 0 })
+      local ctx = actions.context()
+      local parent
+      if case.kind == "tab" then
+        parent = actions.tab_select(ctx)
+      else
+        parent = actions.split_select(ctx, { layout = case.layout })
+      end
+      wait_ready(parent)
+      local winid = vim.api.nvim_get_current_win()
+      assert.are.same({}, parent.config.expanded)
+      assert.is_false(parent.nodes_by_path[path.absolute(fixture:path("child"))].expanded)
+      assert.are.same(parent:get_pos("child"), vim.api.nvim_win_get_cursor(winid))
+      parent:destroy()
+      instance:destroy()
+    end
+  end)
+
+  it("passes expanded descendants as values when entering a directory", function()
+    fixture:tree({ ["src/x/x/file.txt"] = "x" })
+    local instance = wait_ready(fre.new({ root = fixture.root, columns = {} }))
+    instance:expand("src")
+    wait_for(function()
+      local node = instance.nodes_by_path[path.absolute(fixture:path("src"))]
+      return node and node.loaded
+    end)
+    instance:expand("src/x")
+    wait_for(function()
+      local node = instance.nodes_by_path[path.absolute(fixture:path("src/x"))]
+      return node and node.loaded
+    end)
+    instance:expand("src/x/x")
+    wait_for(function()
+      local node = instance.nodes_by_path[path.absolute(fixture:path("src/x/x"))]
+      return node and node.loaded
+    end)
+
+    local child = wait_ready(actions.select(context_for(instance, "src"), {
+      instance = { expanded = { "ignored" } },
+    }))
+    assert.are.same({ "x", "x/x" }, child.config.expanded)
+    wait_for(function()
+      local first = child.nodes_by_path[path.absolute(fixture:path("src/x"))]
+      local second = child.nodes_by_path[path.absolute(fixture:path("src/x/x"))]
+      return first and first.expanded and second and second.expanded and second.loaded
+    end)
+    assert.are.equal(path.absolute(fixture:path("src")), child.root)
   end)
 
   it("creates directory children in the exact target and a new tab with explicit effective overrides", function()

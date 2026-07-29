@@ -38,18 +38,30 @@ local function lines(instance)
 end
 
 local function set_lines(instance, replacement)
+  local navigation = lines(instance)[1]
+  assert.are.equal("navigation", assert(buffer.decode(instance, 1)).row_kind)
+  local next_lines = {}
+  if replacement[1] ~= navigation then next_lines[1] = navigation end
+  vim.list_extend(next_lines, replacement)
   local modifiable = vim.bo[instance.bufnr].modifiable
   vim.bo[instance.bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, replacement)
+  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, next_lines)
   vim.bo[instance.bufnr].modifiable = modifiable
 end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
     local decoded = buffer.decode(instance, row)
-    if decoded and decoded.marked and decoded.entry.relative_path == relative then return row end
+    if decoded and decoded.row_kind == "entry"
+        and decoded.entry.relative_path == relative then
+      return row
+    end
   end
   error("missing row " .. relative)
+end
+
+local function physical_line(instance, relative)
+  return lines(instance)[row_for(instance, relative)]
 end
 
 local function edited_line(instance, relative, target)
@@ -62,8 +74,9 @@ end
 
 local function projected_paths(instance)
   local result = {}
-  for row = 1, #(instance.view.visible_nodes or {}) do
-    result[#result + 1] = assert(buffer.decode(instance, row)).path
+  for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
+    local decoded = assert(buffer.decode(instance, row))
+    if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
 end
@@ -258,8 +271,9 @@ describe("fre ticket 11 write workflow", function()
     local ui = scripted_ui()
     local pending = {}
     fre._set_mutation_adapter(pending_adapter(pending))
-    local retained = lines(instance)
-    set_lines(instance, { retained[1], retained[2], "held.txt" })
+    set_lines(instance, {
+      physical_line(instance, "a.txt"), physical_line(instance, "dir"), "held.txt",
+    })
     assert.is_true(write_command(instance))
     ui.decide(true)
 
@@ -302,11 +316,13 @@ describe("fre ticket 11 write workflow", function()
   it("releases exactly after a prepare error while preserving the exact modified draft", function()
     local instance = ready({ ["a.txt"] = "a" })
     local ui = scripted_ui()
-    local draft = { string.char(31) .. "fre:malformed", " exact second line " }
+    local draft = {
+      lines(instance)[1], string.char(31) .. "fre:malformed", " exact second line ",
+    }
     set_lines(instance, draft)
     local ok, err = write_command(instance)
     assert.is_false(ok)
-    assert.is_truthy(tostring(err):find("row 1", 1, true), tostring(err))
+    assert.is_truthy(tostring(err):find("row 2", 1, true), tostring(err))
     assert.are.same(draft, lines(instance))
     assert.is_true(vim.bo[instance.bufnr].modified)
     assert.is_true(vim.bo[instance.bufnr].modifiable)
@@ -320,7 +336,9 @@ describe("fre ticket 11 write workflow", function()
     local instance = ready({ ["a.txt"] = "a" })
     local ui = scripted_ui()
     fre._set_mutation_adapter(complete_adapter())
-    local draft = { lines(instance)[1], "new name  with spaces.txt" }
+    local draft = {
+      lines(instance)[1], physical_line(instance, "a.txt"), "new name  with spaces.txt",
+    }
     set_lines(instance, draft)
     assert.is_true(write_command(instance))
     assert.are.same({ "CREATE FILE  new name  with spaces.txt" }, ui.confirmations[1])
@@ -370,7 +388,9 @@ describe("fre ticket 11 write workflow", function()
   it("rolls back partial scratch floats when window creation or float autocmd initialization throws", function()
     local function expect_construction_failure(label, api_name, replacement)
       local instance = ready({ ["a.txt"] = "a" })
-      local draft = { lines(instance)[1], label .. ".txt" }
+      local draft = {
+        lines(instance)[1], physical_line(instance, "a.txt"), label .. ".txt",
+      }
       set_lines(instance, draft)
       local original_modifiable = vim.bo[instance.bufnr].modifiable
       local before = resource_snapshot()
@@ -404,7 +424,9 @@ describe("fre ticket 11 write workflow", function()
 
   it("closes a live confirmation float when post-return keymap initialization throws", function()
     local instance = ready({ ["a.txt"] = "a" })
-    local draft = { lines(instance)[1], "confirm-keymap.txt" }
+    local draft = {
+      lines(instance)[1], physical_line(instance, "a.txt"), "confirm-keymap.txt",
+    }
     set_lines(instance, draft)
     local original_modifiable = vim.bo[instance.bufnr].modifiable
     local before = resource_snapshot()
@@ -462,7 +484,7 @@ describe("fre ticket 11 write workflow", function()
     for _, case in ipairs(cases) do
       local instance = ready({ ["a.txt"] = "a" })
       local baseline = lines(instance)
-      set_lines(instance, { baseline[1], case.name .. ".txt" })
+      set_lines(instance, { physical_line(instance, "a.txt"), case.name .. ".txt" })
       local original_modifiable = vim.bo[instance.bufnr].modifiable
       local before = resource_snapshot()
       local execution = with_override(case.owner, case.key, case.replacement, function()
@@ -504,7 +526,7 @@ describe("fre ticket 11 write workflow", function()
       move = adapter.move,
       delete = adapter.delete,
     })
-    set_lines(instance, { lines(instance)[1], "first.txt", "second.txt" })
+    set_lines(instance, { physical_line(instance, "keep.txt"), "first.txt", "second.txt" })
     assert.is_true(write_command(instance))
     ui.decide(true)
     wait_unlocked(instance)
@@ -558,7 +580,9 @@ describe("fre ticket 11 write workflow", function()
   it("preserves execution and refresh errors, unlocks, and supports forced truth recovery", function()
     local instance = ready({ ["keep.txt"] = "keep" })
     local ui = scripted_ui()
-    local draft = { lines(instance)[1], "actual.txt" }
+    local draft = {
+      lines(instance)[1], physical_line(instance, "keep.txt"), "actual.txt",
+    }
     set_lines(instance, draft)
     assert.is_true(write_command(instance))
     fre._set_fs_adapter({ load = function(_, done) done("forced reconciliation failure") end })
@@ -593,8 +617,10 @@ describe("fre ticket 11 write workflow", function()
   it("normalizes an empty Plan through private reconciliation without UI or Execution", function()
     local instance = ready({ ["a.txt"] = "a" })
     local ui = scripted_ui()
-    local physical = lines(instance)[1]
-    local decoded = buffer.decode(instance, 1)
+    local baseline = lines(instance)
+    local row = row_for(instance, "a.txt")
+    local physical = baseline[row]
+    local decoded = buffer.decode(instance, row)
     local padded = physical:sub(1, decoded.path_range.start_byte) .. "  a.txt  "
     set_lines(instance, { "", padded, "" })
     assert.are.same({ operations = {}, display = {} }, instance:prepare())
@@ -602,7 +628,7 @@ describe("fre ticket 11 write workflow", function()
     assert.is_nil(instance._execution)
     wait_unlocked(instance)
 
-    assert.are.same({ physical }, lines(instance))
+    assert.are.same(baseline, lines(instance))
     assert.are.equal(0, #ui.confirmations)
     assert.are.equal(0, #ui.progress_statuses)
     assert.is_false(vim.bo[instance.bufnr].modified)
@@ -613,7 +639,7 @@ describe("fre ticket 11 write workflow", function()
   it("cleans lock and UI references when confirmation, progress, update, close, or report throws", function()
     local confirm_instance = ready({ ["a.txt"] = "a" })
     scripted_ui({ confirm_error = "confirmation exploded" })
-    set_lines(confirm_instance, { lines(confirm_instance)[1], "new.txt" })
+    set_lines(confirm_instance, { physical_line(confirm_instance, "a.txt"), "new.txt" })
     local ok, err = write_command(confirm_instance)
     assert.is_false(ok)
     assert.is_truthy(tostring(err):find("confirmation exploded", 1, true))
@@ -628,7 +654,7 @@ describe("fre ticket 11 write workflow", function()
       report_error = "report exploded",
     })
     fre._set_mutation_adapter(complete_adapter())
-    set_lines(progress_instance, { lines(progress_instance)[1], "other.txt" })
+    set_lines(progress_instance, { physical_line(progress_instance, "a.txt"), "other.txt" })
     assert.is_true(write_command(progress_instance))
     wait_unlocked(progress_instance)
     assert.is_nil(progress_instance.actions)

@@ -118,7 +118,7 @@ function Manager:create_instance(opts)
   end
 
   local root = require("fre.path").absolute(opts.root)
-  local effective = self:resolve_instance_config(opts)
+  local effective = self:resolve_instance_config(opts, root)
   return require("fre.instance").new(self, root, effective)
 end
 
@@ -233,8 +233,8 @@ function Manager:setup(opts)
   return self:get_setup_defaults()
 end
 
-function Manager:resolve_instance_config(opts)
-  return config.resolve_instance(self._setup_defaults, opts)
+function Manager:resolve_instance_config(opts, normalized_root)
+  return config.resolve_instance(self._setup_defaults, opts, normalized_root)
 end
 
 function Manager:register(instance)

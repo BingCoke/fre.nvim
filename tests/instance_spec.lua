@@ -35,8 +35,9 @@ end
 
 local function projected_paths(instance)
   local result = {}
-  for row in ipairs(lines(instance.bufnr)) do
-    result[#result + 1] = assert(buffer.decode(instance, row)).path
+  for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
+    local decoded = assert(buffer.decode(instance, row))
+    if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
 end
@@ -86,6 +87,28 @@ describe("fre async hidden instances", function()
 
     pending(nil, {})
     wait_for(function() return instance.state == "ready-hidden" end)
+  end)
+
+  it("sets a window cursor to a snapshot path after readiness", function()
+    local pending
+    fre._set_fs_adapter({
+      load = function(_, done) pending = done end,
+    })
+    local instance = keep(fre.new({ root = fixture.root, columns = {} }))
+    local opened, winid = instance:open({ position = "current" })
+    assert.are.equal(instance, opened)
+    assert.are.equal("number", type(winid))
+    assert.are.equal(instance, instance:set_cursor_to_path("b.txt", winid))
+
+    pending(nil, {
+      { name = "a.txt", kind = "file" },
+      { name = "b.txt", kind = "file" },
+    })
+    wait_for(function()
+      return instance.state == "ready-visible"
+        and vim.deep_equal(instance:get_pos("b.txt"), vim.api.nvim_win_get_cursor(winid))
+    end)
+    assert.has_error(function() instance:set_cursor_to_path("missing.txt", winid) end)
   end)
 
   it("keeps instances and buffers separate, including current-buffer lookup", function()

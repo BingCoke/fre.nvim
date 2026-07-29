@@ -34,8 +34,9 @@ end
 
 local function projected_paths(instance)
   local result = {}
-  for row = 1, #(instance.view.visible_nodes or {}) do
-    result[#result + 1] = assert(buffer.decode(instance, row)).path
+  for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
+    local decoded = assert(buffer.decode(instance, row))
+    if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
 end

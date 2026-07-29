@@ -238,70 +238,109 @@ function Instance:_cancel_pending_callbacks()
 end
 
 
-function Instance:_finish_initial(token, generation, err, children, real_root)
+function Instance:_apply_configured_expansions(on_complete)
+  local completed = false
+  local function finish(err)
+    if completed then return end
+    completed = true
+    on_complete(err)
+  end
+  local function apply(index)
+    local relative = self.config.expanded[index]
+    if relative == nil then
+      finish(nil)
+      return
+    end
+    local ok, err = pcall(self._expand, self, relative, function(expand_err)
+      if expand_err ~= nil then
+        finish("initial expansion failed for " .. relative .. ": " .. tostring(expand_err))
+      else
+        apply(index + 1)
+      end
+    end, true)
+    if not ok then
+      finish("initial expansion failed for " .. relative .. ": " .. tostring(err))
+    end
+  end
+  apply(1)
+end
+
+function Instance:_finish_initial(token, generation, err, children, real_root, on_complete)
   if self._destroyed or self._attempt ~= token or self._attempt_done[token]
       or self.root_node.load_generation ~= generation then
-    return nil
+    return
   end
-  self._attempt_done[token] = true
-  local callbacks = self._ready_callbacks
-  self._ready_callbacks = {}
-  if not err then
-    local ok, value = pcall(function()
-      local ordered = self.tree:reconcile(self.root_node, children or {}, function(a, b)
-        return self.current_sort(
-          self:_entry(self.root_node), self:_entry(a), self:_entry(b)
-        )
-      end)
-      local snapshot = {}
-      for _, node in ipairs(ordered) do
-        snapshot[#snapshot + 1] = {
-          id = node.id, name = node.name, path = node.path, kind = node.kind,
-        }
-      end
-      return { children = snapshot, root = self.root }
-    end)
-    if ok then
-      self.result = value
-    else
-      err = value
+  local completed = false
+  local function complete(completion_err)
+    if completed or self._destroyed or self._attempt ~= token or self._attempt_done[token]
+        or self.root_node.load_generation ~= generation then
+      return
     end
-  end
-  if err then
-    self.root_node.load_state = "unloaded"
-    self.root_node.loaded = false
-    self.root_node.children_cached = false
-    self.state = "load-failed"
-    self.error = err
-    self.result = nil
-    self.needs_refresh = true
-    self:_set_lines({ self:_error_line(err) })
-  else
-    self.real_root = real_root
-    self.error = nil
-    self.state = #vim.fn.win_findbuf(self.bufnr) > 0 and "ready-visible" or "ready-hidden"
-    local render_ok, render_err = pcall(self._render_success, self)
-    if not render_ok then
-      err = render_err
+    completed = true
+    self._attempt_done[token] = true
+    local callbacks = self._ready_callbacks
+    self._ready_callbacks = {}
+    if completion_err ~= nil then
+      self.root_node.load_state = "unloaded"
+      self.root_node.loaded = false
+      self.root_node.children_cached = false
       self.state = "load-failed"
-      self.error = err
+      self.error = completion_err
       self.result = nil
+      self.real_root = nil
       self.needs_refresh = true
-      self:_set_lines({ self:_error_line(err) })
+      self:_set_lines({ self:_error_line(completion_err) })
     else
+      self.state = #vim.fn.win_findbuf(self.bufnr) > 0 and "ready-visible" or "ready-hidden"
+      self.error = nil
       self.needs_refresh = false
-      self._tree_generation = self._tree_generation + 1
       self:_sync_watchers()
     end
+    self.manager:gc_visibility_changed(self)
+    -- This function already runs on the main loop. Existing observers complete
+    -- before FreReady so reentrant event handlers cannot suppress them.
+    for _, callback in ipairs(callbacks) do
+      self:_call_callback(callback, completion_err)
+    end
+    self:_emit_ready(completion_err, self.result)
+    if on_complete then
+      local ok, callback_err = pcall(on_complete, completion_err)
+      if not ok then vim.schedule(function() error(callback_err) end) end
+    end
   end
-  self.manager:gc_visibility_changed(self)
-  -- This function already runs on the main loop. Existing observers complete
-  -- before FreReady so reentrant event handlers cannot suppress them.
-  for _, callback in ipairs(callbacks) do
-    self:_call_callback(callback, err)
+
+  if err ~= nil then
+    complete(err)
+    return
   end
-  self:_emit_ready(err, self.result)
-  return err
+  local ok, value = pcall(function()
+    local ordered = self.tree:reconcile(self.root_node, children or {}, function(a, b)
+      return self.current_sort(
+        self:_entry(self.root_node), self:_entry(a), self:_entry(b)
+      )
+    end)
+    local snapshot = {}
+    for _, node in ipairs(ordered) do
+      snapshot[#snapshot + 1] = {
+        id = node.id, name = node.name, path = node.path, kind = node.kind,
+      }
+    end
+    return { children = snapshot, root = self.root }
+  end)
+  if not ok then
+    complete(value)
+    return
+  end
+  self.result = value
+  self.real_root = real_root
+  self.error = nil
+  local render_ok, render_err = pcall(self._render_success, self)
+  if not render_ok then
+    complete(render_err)
+    return
+  end
+  self._tree_generation = self._tree_generation + 1
+  self:_apply_configured_expansions(complete)
 end
 
 function Instance:_start_load(initial, on_complete)
@@ -318,9 +357,8 @@ function Instance:_start_load(initial, on_complete)
     self.result = nil
     self:_set_lines({ self:_loading_line() })
   end
-
   local finished = false
-  local function done(err, children, real_root)
+  local function done(load_err, loaded_children, loaded_real_root)
     if finished then return end
     finished = true
     vim.schedule(function()
@@ -328,17 +366,11 @@ function Instance:_start_load(initial, on_complete)
           or generation ~= self.root_node.load_generation then
         return
       end
-      local completion_err = self:_finish_initial(token, generation, err, children, real_root)
-      if completion_err ~= nil then err = completion_err end
-      if on_complete then
-        local ok, callback_err = pcall(on_complete, err)
-        if not ok then
-          vim.schedule(function() error(callback_err) end)
-        end
-      end
+      self:_finish_initial(
+        token, generation, load_err, loaded_children, loaded_real_root, on_complete
+      )
     end)
   end
-
   local ok, adapter_err = pcall(self.manager:get_fs_adapter().load, self.root, done)
   if not ok then done(adapter_err) end
 end
@@ -776,30 +808,44 @@ function Instance:toggle_hidden_file()
   return self:set_hidden_file(not self.current_hidden_file)
 end
 
-function Instance:expand(snapshot_path)
-  self:_require_projection_change()
+function Instance:_expand(snapshot_path, on_complete, initializing)
+  if not initializing then self:_require_projection_change() end
   local relative = self:_normalize_snapshot_path(snapshot_path)
-  if relative == "" then return nil end
+  if relative == "" then
+    if on_complete then on_complete(nil) end
+    return nil
+  end
   local segments = split_relative(relative)
   local request = { active = true, synchronous = true }
-  local function stop(err)
+  local function stop(expand_err)
     if not request.active then return end
     request.active = false
-    if err then
-      if request.synchronous then fail(err, 4) end
-      self:_report_async_error(err)
+    if on_complete then
+      on_complete(expand_err)
+    elseif expand_err then
+      if request.synchronous then fail(expand_err, 4) end
+      self:_report_async_error(expand_err)
     end
   end
-  local function walk(parent, index)
+  local walk
+  local function resume(parent, index)
+    if request.synchronous then
+      walk(parent, index)
+      return
+    end
+    local ok, walk_err = pcall(walk, parent, index)
+    if not ok then stop(walk_err) end
+  end
+  walk = function(parent, index)
     if not request.active then return end
     local child = self.tree:find_child(parent, segments[index])
+    local prefix = table.concat(vim.list_slice(segments, 1, index), "/")
     if not child then
-      stop("snapshot path does not exist: " .. table.concat(vim.list_slice(segments, 1, index), "/"))
+      stop("snapshot path does not exist: " .. prefix)
       return
     end
     if child.kind ~= "directory" then
-      stop(table.concat(vim.list_slice(segments, 1, index), "/") .. " is a "
-        .. tostring(child.kind) .. " and cannot be expanded")
+      stop(prefix .. " is a " .. tostring(child.kind) .. " and cannot be expanded")
       return
     end
     local became_expanded = not child.expanded
@@ -810,23 +856,27 @@ function Instance:expand(snapshot_path)
     end
     if child.loaded then
       if became_expanded then self:_rescan_directory(child) end
-      if index == #segments then stop(nil) else walk(child, index + 1) end
+      if index == #segments then stop(nil) else resume(child, index + 1) end
     else
-      self:_ensure_directory_loaded(child, function(err)
-        if err then stop(err); return end
-        if index == #segments then stop(nil) else walk(child, index + 1) end
+      self:_ensure_directory_loaded(child, function(load_err)
+        if load_err then
+          stop(load_err)
+        elseif index == #segments then
+          stop(nil)
+        else
+          resume(child, index + 1)
+        end
       end)
     end
   end
 
-  local first = self.tree:find_child(self.root_node, segments[1])
-  if not first then fail("snapshot path does not exist: " .. segments[1], 2) end
-  if first.kind ~= "directory" then
-    fail(segments[1] .. " is a " .. tostring(first.kind) .. " and cannot be expanded", 2)
-  end
-  walk(self.root_node, 1)
+  resume(self.root_node, 1)
   request.synchronous = false
   return nil
+end
+
+function Instance:expand(snapshot_path)
+  return self:_expand(snapshot_path, nil, false)
 end
 
 function Instance:collapse(snapshot_path)
@@ -883,6 +933,32 @@ function Instance:get_pos(snapshot_path)
   buffer.rebind(self, node, row)
   local decoded = buffer.decode(self, row)
   return { row, decoded.path_range.start_byte }
+end
+
+function Instance:set_cursor_to_path(snapshot_path, winid)
+  if type(snapshot_path) ~= "string" then fail("snapshot path must be a string", 2) end
+  if type(winid) ~= "number" or winid % 1 ~= 0 then
+    fail("target window must be a window ID", 2)
+  end
+  local function place()
+    if not vim.api.nvim_win_is_valid(winid) then fail("target window is not valid", 3) end
+    if vim.api.nvim_win_get_buf(winid) ~= self.bufnr then
+      fail("target window does not display this instance", 3)
+    end
+    local position = self:get_pos(snapshot_path)
+    if not position then fail("snapshot path is not visible: " .. snapshot_path, 3) end
+    vim.api.nvim_win_set_cursor(winid, position)
+  end
+  if self.state == "ready-hidden" or self.state == "ready-visible" then
+    place()
+  elseif self.state == "creating" then
+    self:when_ready(function(ready_err)
+      if ready_err == nil then place() end
+    end)
+  else
+    require_ready(self)
+  end
+  return self
 end
 
 function Instance:_apply_pending_reveal(winid)
@@ -1492,7 +1568,7 @@ function Instance:open(layout)
   local winid = window.open(self, layout)
   if self._pending_reveal then self:_apply_pending_reveal(winid) end
   self:_on_visibility_enter()
-  return self
+  return self, winid
 end
 
 function Instance:hidden()

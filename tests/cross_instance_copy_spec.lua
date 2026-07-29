@@ -45,16 +45,24 @@ local function lines(instance)
 end
 
 local function set_lines(instance, replacement)
+  local navigation = lines(instance)[1]
+  assert.are.equal("navigation", assert(buffer.decode(instance, 1)).row_kind)
+  local next_lines = {}
+  if replacement[1] ~= navigation then next_lines[1] = navigation end
+  vim.list_extend(next_lines, replacement)
   local modifiable = vim.bo[instance.bufnr].modifiable
   vim.bo[instance.bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, replacement)
+  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, next_lines)
   vim.bo[instance.bufnr].modifiable = modifiable
 end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
     local decoded = buffer.decode(instance, row)
-    if decoded and decoded.marked and decoded.entry.relative_path == relative then return row end
+    if decoded and decoded.row_kind == "entry"
+        and decoded.entry.relative_path == relative then
+      return row
+    end
   end
   error("missing row " .. relative)
 end
@@ -140,8 +148,9 @@ end
 
 local function projected_paths(instance)
   local result = {}
-  for row = 1, #(instance.view.visible_nodes or {}) do
-    result[#result + 1] = assert(buffer.decode(instance, row)).path
+  for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
+    local decoded = assert(buffer.decode(instance, row))
+    if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
 end
@@ -176,7 +185,7 @@ describe("fre ticket 13 cross-instance copy", function()
     assert.are.equal(source_entry.node_id, target_entry.node_id)
 
     set_lines(target, { edited_line(source, "source.txt", "copied.txt") })
-    local decoded = buffer.decode(target, 1)
+    local decoded = buffer.decode(target, 2)
     assert.are.equal(source.id, decoded.source_instance.id)
     assert.are.equal(source_entry.absolute_path, decoded.entry.absolute_path)
     assert.are.same({
@@ -205,7 +214,7 @@ describe("fre ticket 13 cross-instance copy", function()
 
     local foreign = edited_line(source, "a.txt", "imported.txt")
     set_lines(target, { physical_line(target, "keep.txt"), foreign })
-    local decoded = buffer.decode(target, 2)
+    local decoded = buffer.decode(target, 3)
     assert.are.same({ "source_kind", "source_again" }, {
       decoded.fields[1].id, decoded.fields[2].id,
     })
@@ -215,7 +224,7 @@ describe("fre ticket 13 cross-instance copy", function()
       for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
         target.bufnr, -1, 0, -1, { details = true }
       )) do
-        if mark[2] == 1 and mark[4].hl_group == "FreSourceKind" then
+        if mark[2] == 2 and mark[4].hl_group == "FreSourceKind" then
           highlighted = mark
           return true
         end
@@ -235,11 +244,13 @@ describe("fre ticket 13 cross-instance copy", function()
 
     local edited = foreign:gsub("SRC%-" .. source.id .. "%-file", "BAD-" .. source.id .. "-file", 1)
     set_lines(target, { physical_line(target, "keep.txt"), edited })
-    assert_error(2, "column source_kind metadata changed", function() target:prepare() end)
+    assert_error(3, "column source_kind metadata changed", function() target:prepare() end)
 
     local malformed = foreign:sub(1, decoded.fields[1].separator_range.start_byte)
     set_lines(target, { physical_line(target, "keep.txt"), malformed })
-    assert_error(2, "column source_kind", function() target:prepare() end)
+    assert_error(3, "column source_again parser returned no value", function()
+      target:prepare()
+    end)
   end)
 
   it("rejects destroyed, unregistered, and removed foreign sources with target rows", function()
@@ -249,13 +260,13 @@ describe("fre ticket 13 cross-instance copy", function()
     local destroyed_line = edited_line(destroyed, "a.txt", "destroyed-copy.txt")
     destroyed:destroy()
     set_lines(target, { "", destroyed_line })
-    assert_error(2, "unknown instance", function() target:prepare() end)
+    assert_error(3, "unknown instance", function() target:prepare() end)
 
     local unregistered = ready(make_root("unregistered", { ["b.txt"] = "b" }))
     local unregistered_line = edited_line(unregistered, "b.txt", "unregistered-copy.txt")
     unregistered.manager:remove(unregistered)
     set_lines(target, { unregistered_line })
-    assert_error(1, "unknown instance", function() target:prepare() end)
+    assert_error(2, "unknown instance", function() target:prepare() end)
 
     local removed = ready(make_root("removed", { ["c.txt"] = "c" }))
     local removed_row = row_for(removed, "c.txt")
@@ -263,7 +274,7 @@ describe("fre ticket 13 cross-instance copy", function()
     local removed_line = edited_line(removed, "c.txt", "removed-copy.txt")
     removed.nodes_by_id[removed_entry.node_id] = nil
     set_lines(target, { "", "", removed_line })
-    assert_error(3, "unknown node", function() target:prepare() end)
+    assert_error(4, "unknown node", function() target:prepare() end)
   end)
 
   it("returns a caller-owned absolute Plan that survives source destruction", function()
@@ -290,13 +301,13 @@ describe("fre ticket 13 cross-instance copy", function()
       edited_line(source, "a.txt", "dir/../same.txt"),
       edited_line(source, "a.txt", "same.txt"),
     })
-    assert_error(2, "duplicate target same.txt", function() target:prepare() end)
+    assert_error(3, "duplicate target same.txt", function() target:prepare() end)
 
     local shared_root = make_root("shared", { ["same.txt"] = "same" })
     local shared_source = ready(shared_root)
     local shared_target = ready(shared_root)
     set_lines(shared_target, { physical_line(shared_source, "same.txt") })
-    assert_error(1, "copy source must differ from target", function()
+    assert_error(2, "copy source must differ from target", function()
       shared_target:prepare()
     end)
   end)
@@ -328,7 +339,7 @@ describe("fre ticket 13 cross-instance copy", function()
       edited_line(target, "dir", "copied/"),
       edited_line(source, "foreign.txt", "copied/child.txt"),
     })
-    assert_error(3, "target collision at copied/child.txt", function() target:prepare() end)
+    assert_error(4, "target collision at copied/child.txt", function() target:prepare() end)
 
     set_lines(target, {
       edited_line(target, "dir", "moved/"),
@@ -374,7 +385,7 @@ describe("fre ticket 13 cross-instance copy", function()
 
     local malformed_directory = edited_line(source, "folder", "copied-folder/"):sub(1, -2)
     set_lines(target, { malformed_directory })
-    assert_error(1, "directory path must end in /", function() target:prepare() end)
+    assert_error(2, "directory path must end in /", function() target:prepare() end)
     set_lines(target, replacement)
 
     local plan = target:prepare()
@@ -411,11 +422,13 @@ describe("fre ticket 13 cross-instance copy", function()
     local target_paths = projected_paths(target)
     assert.is_truthy(vim.tbl_contains(target_paths, "copied-file.txt"))
     assert.is_truthy(vim.tbl_contains(target_paths, "copied-folder/"))
-    for row = 1, #target_paths do
+    for row = 1, vim.api.nvim_buf_line_count(target.bufnr) do
       local decoded = buffer.decode(target, row)
-      assert.are.equal(target.id, decoded.instance_id)
-      assert.are.equal(target.id, decoded.entry.instance_id)
-      assert.are.equal("target", decoded.fields[1].id)
+      if decoded.row_kind == "entry" then
+        assert.are.equal(target.id, decoded.instance_id)
+        assert.are.equal(target.id, decoded.entry.instance_id)
+        assert.are.equal("target", decoded.fields[1].id)
+      end
     end
     for row = 1, #lines(source) do
       assert.are.equal(source.id, buffer.decode(source, row).instance_id)

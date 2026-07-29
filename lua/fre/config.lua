@@ -1,4 +1,5 @@
 local columns = require("fre.columns")
+local fs_path = require("fre.path")
 local window = require("fre.window")
 
 local M = {}
@@ -140,6 +141,23 @@ local function sequence_length(value, path)
     fail(path .. " must not contain nil holes")
   end
   return maximum
+end
+
+local function normalize_expanded(value, field, root)
+  local length = sequence_length(value, field)
+  local windows = root ~= nil and fs_path.is_windows(root) or false
+  local result = {}
+  for index = 1, length do
+    local item_path = field .. "[" .. index .. "]"
+    expect_type(value[index], "string", item_path)
+    local ok, relative = pcall(fs_path.normalize_relative, value[index], { windows = windows })
+    if not ok or relative == "" or relative == ".."
+        or relative:sub(1, 3) == "../" then
+      fail(item_path .. " must be a non-empty root-relative local path")
+    end
+    result[index] = relative
+  end
+  return result
 end
 
 local function validate_named_map(value, path, validate_value)
@@ -296,6 +314,7 @@ local new_fields = {
   root = true,
   hidden_file = true,
   sort = true,
+  expanded = true,
   columns = true,
   gc = true,
   layout = true,
@@ -443,7 +462,7 @@ function M.resolve_setup(opts, ignore_default_file_explorer)
   return copy(result)
 end
 
-function M.resolve_instance(setup_defaults, opts)
+function M.resolve_instance(setup_defaults, opts, normalized_root)
   expect_table(setup_defaults, "setup defaults")
   opts = opts or {}
   expect_table(opts, "new options")
@@ -469,9 +488,11 @@ function M.resolve_instance(setup_defaults, opts)
   if opts.window ~= nil then
     validate_window(opts.window, "window")
   end
+  local expanded = normalize_expanded(opts.expanded or {}, "expanded", normalized_root)
   local result = {
     hidden_file = copy(setup_defaults.hidden_file),
     sort = setup_defaults.sort,
+    expanded = expanded,
     columns = copy(setup_defaults.columns),
     gc = {
       ttl_ms = copy(setup_defaults.gc.ttl_ms),

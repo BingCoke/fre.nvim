@@ -3,6 +3,7 @@ local columns = require("fre.columns")
 local fre = require("fre")
 local mutation_prepare = require("fre.mutation.prepare")
 local path = require("fre.path")
+local row = require("fre.row")
 local real_fs = require("fre.fs").default
 local fs = require("tests.helpers.fs")
 
@@ -39,18 +40,30 @@ local function lines(instance)
 end
 
 local function set_lines(instance, replacement)
+  local navigation = lines(instance)[1]
+  assert.are.equal("navigation", assert(buffer.decode(instance, 1)).row_kind)
+  local next_lines = {}
+  if replacement[1] ~= navigation then next_lines[1] = navigation end
+  vim.list_extend(next_lines, replacement)
   local modifiable = vim.bo[instance.bufnr].modifiable
   vim.bo[instance.bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, replacement)
+  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, next_lines)
   vim.bo[instance.bufnr].modifiable = modifiable
 end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
     local decoded = buffer.decode(instance, row)
-    if decoded and decoded.marked and decoded.entry.relative_path == relative then return row end
+    if decoded and decoded.row_kind == "entry"
+        and decoded.entry.relative_path == relative then
+      return row
+    end
   end
   error("missing row " .. relative)
+end
+
+local function physical_line(instance, relative)
+  return lines(instance)[row_for(instance, relative)]
 end
 
 local function edited_line(instance, relative, target)
@@ -238,9 +251,8 @@ describe("fre ticket 10 prepare basic mutations", function()
 
   it("creates path-only files and directories while trimming only boundary whitespace", function()
     local instance = ready({ ["keep.txt"] = "k" })
-    local physical = lines(instance)
     set_lines(instance, {
-      physical[1],
+      physical_line(instance, "keep.txt"),
       "  new inner  name.txt  ",
       "  folder  name/  ",
     })
@@ -257,8 +269,7 @@ describe("fre ticket 10 prepare basic mutations", function()
 
   it("ignores structural blank rows and returns no operation for retained canonical rows", function()
     local instance = ready({ ["keep.txt"] = "k" })
-    local physical = lines(instance)
-    set_lines(instance, { "", physical[1], "" })
+    set_lines(instance, { "", physical_line(instance, "keep.txt"), "" })
     assert.are.same({ operations = {}, display = {} }, instance:prepare())
   end)
 
@@ -268,9 +279,9 @@ describe("fre ticket 10 prepare basic mutations", function()
     local replacement = {}
     for row, physical in ipairs(current) do
       local decoded = buffer.decode(instance, row)
-      if decoded.entry.relative_path == "a.txt" then
+      if decoded.row_kind == "entry" and decoded.entry.relative_path == "a.txt" then
         replacement[#replacement + 1] = edited_line(instance, "a.txt", "renamed.txt")
-      elseif decoded.entry.relative_path == "keep.txt" then
+      elseif decoded.row_kind == "entry" and decoded.entry.relative_path == "keep.txt" then
         replacement[#replacement + 1] = physical
       end
     end
@@ -322,31 +333,32 @@ describe("fre ticket 10 prepare basic mutations", function()
       { ".", "must not name the root" },
       { "file\rname", "must not contain CR or LF" },
     }
-    for row, case in ipairs(cases) do
+    for _, case in ipairs(cases) do
       set_lines(instance, { case[1] })
       local err = assert_error(case[2], function() instance:prepare() end)
-      assert.is_truthy(err:find("row 1", 1, true), err)
+      assert.is_truthy(err:find("row 2", 1, true), err)
     end
   end)
 
   it("retains shared malformed marker metadata parser and kind errors with row numbers", function()
     local instance = ready({ ["a.txt"] = "a" }, { columns = { value_column() } })
-    local original = lines(instance)[1]
+    local original = physical_line(instance, "a.txt")
     set_lines(instance, { unit_separator .. "fre:" .. instance.id .. ":" })
-    assert_error("row 1: malformed reserved row marker", function() instance:prepare() end)
+    assert_error("row 2: malformed reserved row marker", function() instance:prepare() end)
 
     set_lines(instance, { (original:gsub("ok", "changed", 1)) })
-    assert_error("row 1: column value metadata changed", function() instance:prepare() end)
+    assert_error("row 2: column value metadata changed", function() instance:prepare() end)
 
     set_lines(instance, { (original:gsub("ok ", "ok", 1)) })
-    assert_error("row 1: column value", function() instance:prepare() end)
+    assert_error("row 2: column value", function() instance:prepare() end)
 
     set_lines(instance, { original .. "/" })
-    assert_error("row 1: file path must not end in /", function() instance:prepare() end)
+    assert_error("row 2: file path must not end in /", function() instance:prepare() end)
 
     set_lines(instance, { original })
-    instance.nodes_by_id[buffer.decode(instance, 1).node_id].kind = "other"
-    assert_error("row 1: unsupported snapshot kind other for a.txt", function() instance:prepare() end)
+    local row = row_for(instance, "a.txt")
+    instance.nodes_by_id[buffer.decode(instance, row).node_id].kind = "other"
+    assert_error("row 2: unsupported snapshot kind other for a.txt", function() instance:prepare() end)
   end)
 
   it("plans a foreign marker as a copy from its source snapshot", function()
@@ -355,7 +367,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     fixture:write("source/from.txt", "x")
     local source = wait_ready(keep(fre.new({ root = source_root })))
     local destination = wait_ready(keep(fre.new({ root = destination_root })))
-    set_lines(destination, { lines(source)[1] })
+    set_lines(destination, { physical_line(source, "from.txt") })
     assert.are.same({
       {
         type = "copy", from = fixture:path("source", "from.txt"),
@@ -477,9 +489,13 @@ describe("fre ticket 10 prepare basic mutations", function()
         kind = node.kind,
       }
     end
-    fake.manager = { find_by_id = function(_, id) return id == fake.id and fake or nil end }
+    local marker_widths = { instance = 3, node = 3 }
+    fake.manager = {
+      find_by_id = function(_, id) return id == fake.id and fake or nil end,
+      get_marker_widths = function() return marker_widths end,
+    }
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
-      buffer.marker(fake.id, a.id) .. "b.txt",
+      row.marker(fake.manager, fake.id, a.id) .. "b.txt",
     })
     local plan = mutation_prepare.prepare(fake)
     assert.are.same({
@@ -494,7 +510,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     fake.view.baseline[3] = nil
     fake.view.visible_nodes = { a }
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
-      buffer.marker(fake.id, a.id) .. "a.txt",
+      row.marker(fake.manager, fake.id, a.id) .. "a.txt",
     })
     plan = mutation_prepare.prepare(fake)
     assert.are.same({
