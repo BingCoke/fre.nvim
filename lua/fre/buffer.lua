@@ -466,6 +466,46 @@ local function attach_highlight_updates(instance)
   instance._highlight_attached = true
 end
 
+local function externally_deleted(instance)
+  if instance.state == "destroyed" or instance._external_delete_cleanup_scheduled then return end
+  instance._external_delete_cleanup_scheduled = true
+  local ok, err = pcall(vim.schedule, function()
+    if instance.state == "destroyed" then
+      instance._external_delete_cleanup_scheduled = nil
+      return
+    end
+
+    if instance.state ~= "destroying" then
+      local start_ok, start_err = pcall(instance._start_destroy, instance)
+      if not start_ok then
+        if type(instance._report_async_error) == "function" then
+          instance:_report_async_error(
+            "external buffer deletion cleanup start failed: " .. tostring(start_err)
+          )
+        end
+        if instance.state ~= "destroying" then
+          instance._external_delete_cleanup_scheduled = nil
+          return
+        end
+      end
+    end
+
+    local finish_ok, finish_err = pcall(instance._finish_destroy, instance)
+    if not finish_ok and type(instance._report_async_error) == "function" then
+      instance:_report_async_error(
+        "external buffer deletion cleanup finish failed: " .. tostring(finish_err)
+      )
+    end
+    instance._external_delete_cleanup_scheduled = nil
+  end)
+  if not ok then
+    instance._external_delete_cleanup_scheduled = nil
+    instance:_report_async_error(
+      "external buffer deletion cleanup scheduling failed: " .. tostring(err)
+    )
+  end
+end
+
 function M.setup(instance)
   vim.api.nvim_set_hl(0, "FreStableMarker", { default = true, link = "Conceal" })
   vim.api.nvim_set_hl(0, "FreDirectoryIcon", { default = true, link = "Directory" })
@@ -479,6 +519,11 @@ function M.setup(instance)
 
   local group_name = "FreBuffer" .. tostring(instance.bufnr)
   instance._buffer_augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
+  vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
+    group = instance._buffer_augroup, buffer = instance.bufnr,
+    callback = function() externally_deleted(instance) end,
+  })
+
   vim.api.nvim_create_autocmd("BufWriteCmd", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function(args)

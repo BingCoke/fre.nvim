@@ -400,6 +400,159 @@ describe("fre ticket 19 destroy and GC", function()
     for _, call in ipairs(calls) do assert_error_contains(call, "destroyed") end
   end)
 
+  it("defers idempotent terminal cleanup after external buffer deletion", function()
+    local watcher = fake_watcher()
+    fre._set_watch_adapter(watcher)
+    local manager = manager_module.default
+
+    for _, case in ipairs({
+      { command = "bdelete!", valid_after_command = true },
+      { command = "bwipeout!", valid_after_command = false },
+    }) do
+      local instance = ready({ gc = { ttl_ms = 100 } })
+      local id, bufnr = instance.id, instance.bufnr
+      local group_name = instance.config.gc.group
+      local watchers = instance._watchers
+      local gc_timer = assert(instance._gc_timer).handle
+      local scheduled = {}
+      local original_schedule = vim.schedule
+      vim.schedule = function(callback) scheduled[#scheduled + 1] = callback end
+      local ok, err = pcall(vim.cmd, case.command .. " " .. tostring(bufnr))
+      vim.schedule = original_schedule
+      assert.is_true(ok, tostring(err))
+
+      assert.are.equal(case.valid_after_command, vim.api.nvim_buf_is_valid(bufnr))
+      assert.is_false(vim.api.nvim_buf_is_loaded(bufnr))
+      assert.are.equal("ready-hidden", instance.state)
+      assert.is_false(instance._destroyed)
+      assert.are.equal(instance, fre.get_instance(bufnr))
+      assert.are.equal(instance, fre.get_instance_by_id(id))
+      assert.are.equal(instance, manager:find_by_buf(bufnr))
+      assert.are.equal(instance, manager:find_by_group(group_name)[id])
+      assert.is_false(watchers.destroyed)
+      assert.are.equal(0, gc_timer.stop_count)
+      assert.are.equal(0, gc_timer.close_count)
+      assert.are.equal(1, #scheduled)
+
+      local cleanup = table.remove(scheduled, 1)
+      cleanup()
+
+      assert.are.same({}, scheduled)
+      assert.are.equal("destroyed", instance.state)
+      assert.is_true(instance._destroyed)
+      assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
+      assert.is_nil(fre.get_instance(bufnr))
+      assert.is_nil(fre.get_instance_by_id(id))
+      assert.is_nil(manager:find_by_buf(bufnr))
+      assert.is_nil(manager:find_by_group(group_name)[id])
+      assert.is_true(watchers.destroyed)
+      assert.are.equal(1, gc_timer.stop_count)
+      assert.are.equal(1, gc_timer.close_count)
+      assert.is_true(#watcher.handles > 0)
+      assert.is_true(#watcher.timers > 0)
+      for _, handle in ipairs(watcher.handles) do
+        assert.are.equal(1, handle.close_count)
+      end
+      for _, timer in ipairs(watcher.timers) do
+        assert.are.equal(1, timer.stop_count)
+        assert.are.equal(1, timer.close_count)
+      end
+    end
+  end)
+
+  it("finishes external cleanup when destroy start raises after transitioning", function()
+    local instance = ready({ gc = { ttl_ms = 100 } })
+    local manager = manager_module.default
+    local id, bufnr = instance.id, instance.bufnr
+    local group_name = instance.config.gc.group
+    local reported = {}
+    local original_start = instance._start_destroy
+    instance._start_destroy = function(self)
+      original_start(self)
+      error("start failed after transition")
+    end
+    instance._report_async_error = function(_, err) reported[#reported + 1] = tostring(err) end
+
+    local scheduled = {}
+    local original_schedule = vim.schedule
+    vim.schedule = function(callback) scheduled[#scheduled + 1] = callback end
+    local ok, err = pcall(vim.cmd, "bwipeout! " .. tostring(bufnr))
+    vim.schedule = original_schedule
+    assert.is_true(ok, tostring(err))
+    assert.are.equal("ready-hidden", instance.state)
+    assert.are.equal(1, #scheduled)
+
+    table.remove(scheduled, 1)()
+
+    assert.are.same({}, scheduled)
+    assert.are.equal("destroyed", instance.state)
+    assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
+    assert.is_nil(fre.get_instance(bufnr))
+    assert.is_nil(fre.get_instance_by_id(id))
+    assert.is_nil(manager:find_by_buf(bufnr))
+    assert.is_nil(manager:find_by_group(group_name)[id])
+    assert.are.equal(1, #reported)
+    assert.is_truthy(reported[1]:find("start failed after transition", 1, true))
+  end)
+
+  it("finalizes a retained destroying instance after external buffer wipeout", function()
+    local watcher = fake_watcher()
+    fre._set_watch_adapter(watcher)
+    local instance = ready({ gc = { ttl_ms = 100 } })
+    local manager = manager_module.default
+    local id, bufnr = instance.id, instance.bufnr
+    local group_name = instance.config.gc.group
+    local watchers = instance._watchers
+    local gc_timer = assert(instance._gc_timer).handle
+    local original_delete = vim.api.nvim_buf_delete
+    local original_call = vim.api.nvim_buf_call
+    vim.api.nvim_buf_delete = function() error("API delete failed") end
+    vim.api.nvim_buf_call = function() error("fallback delete failed") end
+    local destroy_ok, destroy_err = pcall(instance.destroy, instance)
+    vim.api.nvim_buf_delete = original_delete
+    vim.api.nvim_buf_call = original_call
+
+    assert.is_false(destroy_ok)
+    assert.is_truthy(tostring(destroy_err):find("fallback delete failed", 1, true))
+    assert.are.equal("destroying", instance.state)
+    assert.is_true(instance._destroyed)
+    assert.are.equal(instance, manager.instances_by_id[id])
+    assert.are.equal(instance, manager.instances_by_buf[bufnr])
+    assert.are.equal(instance, manager.groups[group_name].instances[id])
+
+    local scheduled = {}
+    local original_schedule = vim.schedule
+    vim.schedule = function(callback) scheduled[#scheduled + 1] = callback end
+    local wipe_ok, wipe_err = pcall(vim.cmd, "bwipeout! " .. tostring(bufnr))
+    vim.schedule = original_schedule
+    assert.is_true(wipe_ok, tostring(wipe_err))
+
+    assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
+    assert.are.equal("destroying", instance.state)
+    assert.are.equal(instance, fre.get_instance(bufnr))
+    assert.are.equal(instance, fre.get_instance_by_id(id))
+    assert.are.equal(instance, manager:find_by_buf(bufnr))
+    assert.are.equal(instance, manager:find_by_group(group_name)[id])
+    assert.are.equal(1, #scheduled)
+
+    table.remove(scheduled, 1)()
+
+    assert.are.same({}, scheduled)
+    assert.are.equal("destroyed", instance.state)
+    assert.is_nil(fre.get_instance(bufnr))
+    assert.is_nil(fre.get_instance_by_id(id))
+    assert.is_nil(manager:find_by_buf(bufnr))
+    assert.is_nil(manager:find_by_group(group_name)[id])
+    assert.is_true(watchers.destroyed)
+    assert.are.equal(1, gc_timer.stop_count)
+    assert.are.equal(1, gc_timer.close_count)
+    for _, handle in ipairs(watcher.handles) do assert.are.equal(1, handle.close_count) end
+    for _, timer in ipairs(watcher.timers) do
+      assert.are.equal(1, timer.stop_count)
+      assert.are.equal(1, timer.close_count)
+    end
+  end)
+
   it("keeps failed buffer deletion indexed and retries finalization exactly once", function()
     local watcher = fake_watcher()
     fre._set_watch_adapter(watcher)
