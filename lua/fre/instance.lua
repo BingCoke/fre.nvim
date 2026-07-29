@@ -778,6 +778,16 @@ function Instance:_invalidate_subtree_loads(node)
   end
 end
 
+function Instance:setGroup(group)
+  if type(group) ~= "string" or group == "" then
+    fail("group must be a non-empty string", 2)
+  end
+  if self._destroyed or self.state == "destroying" or self.state == "destroyed" then
+    fail("instance is destroyed", 2)
+  end
+  return self.manager:move_to_group(self, group)
+end
+
 function Instance:set_sort(sort_fn)
   if type(sort_fn) ~= "function" then fail("sort must be a function", 2) end
   self:_require_projection_change()

@@ -130,4 +130,72 @@ describe("fre manager", function()
     manager:setup()
     assert.is_nil(manager.groups.temporary)
   end)
+
+  it("moves registered GC membership without changing other indexes", function()
+    local manager = manager_module.new()
+    manager:setup({ gc = { ttl_ms = 0, groups = { default = 0, project = 0 } } })
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    local registered = instance(manager, bufnr)
+    vim.b[bufnr].fre = { gc_group = "default" }
+    manager:register(registered)
+
+    assert.are.equal(registered, manager:move_to_group(registered, "project"))
+    assert.is_nil(manager.groups.default.instances[registered.id])
+    assert.are.equal(registered, manager.groups.project.instances[registered.id])
+    assert.are.equal(registered, manager:find_by_id(registered.id))
+    assert.are.equal(registered, manager:find_by_buf(bufnr))
+    assert.are.equal("project", registered.config.gc.group)
+    assert.are.equal("project", vim.b[bufnr].fre.gc_group)
+
+    local project_members = manager.groups.project.instances
+    assert.are.equal(registered, manager:move_to_group(registered, "project"))
+    assert.are.equal(project_members, manager.groups.project.instances)
+    assert.are.equal(registered, project_members[registered.id])
+
+    local before_metadata = vim.b[bufnr].fre
+    assert.has_error(function() manager:move_to_group(registered, "missing") end)
+    assert.are.equal("project", registered.config.gc.group)
+    assert.are.same(before_metadata, vim.b[bufnr].fre)
+    assert.are.equal(registered, manager.groups.project.instances[registered.id])
+
+    manager:remove(registered)
+    assert.has_error(function() manager:move_to_group(registered, "default") end)
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end)
+
+  it("rolls back group migration when metadata assignment fails", function()
+    local manager = manager_module.new()
+    manager:setup({ gc = { ttl_ms = 0, groups = { default = 0, project = 0 } } })
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    local registered = instance(manager, bufnr)
+    vim.b[bufnr].fre = { gc_group = "default" }
+    manager:register(registered)
+
+    local real_b = vim.b
+    vim.b = setmetatable({}, {
+      __index = function(_, buffer)
+        local variables = real_b[buffer]
+        return setmetatable({}, {
+          __index = function(_, name) return variables[name] end,
+          __newindex = function(_, name, value)
+            if name == "fre" then error("injected metadata setter failure") end
+            variables[name] = value
+          end,
+        })
+      end,
+    })
+    local ok, err = pcall(manager.move_to_group, manager, registered, "project")
+    vim.b = real_b
+
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):find("injected metadata setter failure", 1, true))
+    assert.are.equal(registered, manager.groups.default.instances[registered.id])
+    assert.is_nil(manager.groups.project.instances[registered.id])
+    assert.are.equal("default", registered.config.gc.group)
+    assert.are.equal("default", vim.b[bufnr].fre.gc_group)
+
+    manager:remove(registered)
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end)
+
 end)

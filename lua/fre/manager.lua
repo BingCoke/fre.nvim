@@ -282,6 +282,46 @@ function Manager:register(instance)
   return instance
 end
 
+function Manager:move_to_group(instance, group_name)
+  if type(instance) ~= "table"
+      or self.instances_by_id[instance.id] ~= instance
+      or self.instances_by_buf[instance.bufnr] ~= instance then
+    fail("instance is not registered")
+  end
+  local current_name = instance.config and instance.config.gc and instance.config.gc.group
+  local current = current_name and self.groups[current_name]
+  if not current or current.instances[instance.id] ~= instance then
+    fail("instance GC group membership is not registered")
+  end
+  local target = self.groups[group_name]
+  if not target then fail("unknown GC group: " .. tostring(group_name)) end
+  if current == target then return instance end
+
+  if not vim.api.nvim_buf_is_valid(instance.bufnr) then
+    fail("instance buffer is not valid")
+  end
+  local metadata = vim.b[instance.bufnr].fre
+  if type(metadata) ~= "table" then fail("instance GC metadata is missing") end
+  metadata.gc_group = group_name
+
+  current.instances[instance.id] = nil
+  target.instances[instance.id] = instance
+  instance.config.gc.group = group_name
+  local ok, err = pcall(function()
+    vim.b[instance.bufnr].fre = metadata
+    self._gc:enforce_group(group_name, instance)
+  end)
+  if not ok then
+    instance.config.gc.group = current_name
+    target.instances[instance.id] = nil
+    current.instances[instance.id] = instance
+    metadata.gc_group = current_name
+    pcall(function() vim.b[instance.bufnr].fre = metadata end)
+    error(err, 0)
+  end
+  return instance
+end
+
 function Manager:find_by_id(id)
   return self.instances_by_id[id]
 end

@@ -454,6 +454,7 @@ instance:reveal(path)
 instance:set_sort(compare)
 instance:set_hidden_file(boolean)
 instance:toggle_hidden_file()
+instance:setGroup(group)
 
 instance:get_entry(row)
 instance:get_pos(snapshot_path) -- { row, byte_col } 或 nil
@@ -478,6 +479,8 @@ instance:destroy()
 ```
 
 `expand`、`collapse`、`toggle_expand` 和 `reveal` 接受 root 内的 snapshot 相对路径，也可接受 root 内绝对路径；`get_pos` 和 `set_cursor_to_path` 接受 snapshot 相对路径。`set_cursor_to_path` 可以在创建期间调用：它等待实例 ready 后，把指定窗口的 cursor 放到目标条目的 path 起点，不展开目录或保存 cursor 状态。会改变投影的操作在 buffer 已修改时会直接报错，以避免覆盖草稿；窗口操作和 lookup 仍可使用。
+
+`setGroup(group)` 将实例迁移到 `setup()` 中已存在的 GC 组，并立即按目标组容量执行回收；迁移实例在本次容量约束中受保护。该操作不会重置当前隐藏区间或 TTL timer，并同步更新 `instance.config.gc.group` 与保留 buffer metadata `vim.b.fre.gc_group`。
 
 ### 异步就绪
 
