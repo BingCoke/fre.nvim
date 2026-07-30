@@ -756,6 +756,92 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_truthy(line:find("[fre] Error loading injected child load failure", 1, true))
   end)
 
+  it("rejects file selection when preparation invalidates the exact source", function()
+    local instance = ready({ ["file.txt"] = "x" })
+    local ctx = context_for(instance, "file.txt")
+    vim.cmd("vsplit")
+    local target_win = vim.api.nvim_get_current_win()
+    local target_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(target_buf, 0, -1, false, { "ordinary target" })
+    vim.api.nvim_win_set_buf(target_win, target_buf)
+    vim.api.nvim_set_current_win(ctx.winid)
+    local external_source_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(external_source_buf, 0, -1, false, { "external source" })
+    local selected_path = path.absolute(fixture:path("file.txt"))
+    local before_count = instance_count()
+    local raised = false
+    local group = vim.api.nvim_create_augroup(
+      "FreActionSourceBufReadPost" .. tostring(instance.id), { clear = true })
+    vim.api.nvim_create_autocmd("BufReadPost", {
+      group = group,
+      once = true,
+      callback = function(args)
+        if path.equal(vim.api.nvim_buf_get_name(args.buf), selected_path) then
+          raised = true
+          vim.api.nvim_win_set_buf(ctx.winid, external_source_buf)
+        end
+      end,
+    })
+
+    local err = error_text(function()
+      actions.select(ctx, { target_winid = target_win })
+    end)
+    vim.api.nvim_del_augroup_by_id(group)
+
+    assert.is_truthy(err:find("source is no longer valid", 1, true))
+    assert.is_true(raised)
+    assert.are.equal(target_buf, vim.api.nvim_win_get_buf(target_win))
+    assert.are.equal(external_source_buf, vim.api.nvim_win_get_buf(ctx.winid))
+    assert.is_true(vim.api.nvim_buf_is_valid(external_source_buf))
+    assert.are.equal(-1, vim.fn.bufnr(selected_path))
+    assert.are.equal(before_count, instance_count())
+  end)
+
+  it("rejects directory selection when child loading invalidates the exact source", function()
+    local instance = ready({ ["dir/child.txt"] = "x" })
+    local ctx = context_for(instance, "dir")
+    vim.cmd("vsplit")
+    local target_win = vim.api.nvim_get_current_win()
+    local target_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(target_buf, 0, -1, false, { "ordinary target" })
+    vim.api.nvim_win_set_buf(target_win, target_buf)
+    vim.api.nvim_set_current_win(ctx.winid)
+    local external_source_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(external_source_buf, 0, -1, false, { "external source" })
+    local before_count = instance_count()
+    local child
+    local child_id
+    local child_bufnr
+    fre._set_fs_adapter({
+      load = function(scan_path, _)
+        for _, candidate in ipairs(manager_instances()) do
+          if candidate ~= instance and path.equal(candidate.root, scan_path) then
+            child = candidate
+          end
+        end
+        assert.is_not_nil(child)
+        child_id = child.id
+        child_bufnr = child.bufnr
+        vim.api.nvim_win_set_buf(ctx.winid, external_source_buf)
+      end,
+    })
+
+    local err = error_text(function()
+      actions.select(ctx, { target_winid = target_win })
+    end)
+
+    assert.is_truthy(err:find("source is no longer valid", 1, true))
+    assert.is_not_nil(child)
+    assert.are.equal("destroyed", child.state)
+    assert.is_nil(manager_module.default:find_by_id(child_id))
+    assert.is_nil(manager_module.default:find_by_buf(child_bufnr))
+    assert.is_false(vim.api.nvim_buf_is_valid(child_bufnr))
+    assert.are.equal(before_count, instance_count())
+    assert.are.equal(target_buf, vim.api.nvim_win_get_buf(target_win))
+    assert.are.equal(external_source_buf, vim.api.nvim_win_get_buf(ctx.winid))
+    assert.is_true(vim.api.nvim_buf_is_valid(external_source_buf))
+  end)
+
   it("cleans a directory child after an exact-target pre-commit install failure", function()
     local instance = ready({ ["dir/child.txt"] = "x" })
     local ctx = context_for(instance, "dir")
@@ -1522,71 +1608,166 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal(existing_buf, vim.fn.bufnr(existing_path))
   end)
 
-  it("removes tabs created before real TabNewEntered failures without leaks", function()
-    local instance = ready({ ["file.txt"] = "file", ["dir/child.txt"] = "child" })
+  it("uses selected-buffer BufWinEnter as the tab and split precommit boundary", function()
+    local cases = {
+      { destination = "tab", entry = "file.txt", kind = "file" },
+      { destination = "tab", entry = "dir", kind = "directory" },
+      { destination = "split", entry = "file.txt", kind = "file" },
+      { destination = "split", entry = "dir", kind = "directory" },
+    }
+    for index, case in ipairs(cases) do
+      pcall(vim.cmd, "silent! tabonly")
+      pcall(vim.cmd, "silent! only")
+      vim.cmd("enew")
+      fre._reset_fs_adapter()
+      local instance = ready({ ["file.txt"] = "file", ["dir/child.txt"] = "child" })
+      local source_win = open_current(instance)
+      local source_tab = vim.api.nvim_get_current_tabpage()
+      local source_view = assert(fre.view.inspect(instance, source_tab))
+      local source_state = instance.state
+      vim.cmd("tabnew")
+      local unrelated_tab = vim.api.nvim_get_current_tabpage()
+      local unrelated_win = vim.api.nvim_get_current_win()
+      local unrelated_buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_lines(unrelated_buf, 0, -1, false, { "unrelated" })
+      vim.api.nvim_win_set_buf(unrelated_win, unrelated_buf)
+      vim.api.nvim_set_current_tabpage(source_tab)
+      vim.api.nvim_set_current_win(source_win)
+      local ctx = context_for(instance, case.entry)
+      local source_cursor = vim.api.nvim_win_get_cursor(source_win)
+      local source_saved_view = vim.api.nvim_win_call(source_win, vim.fn.winsaveview)
+      local selected_path = path.absolute(fixture:path(case.entry))
+      local before_count = instance_count()
+      local before_tabs = #vim.api.nvim_list_tabpages()
+      local child
+      local child_id
+      local child_bufnr
+      if case.kind == "directory" then
+        fre._set_fs_adapter({
+          load = function(scan_path, _)
+            for _, candidate in ipairs(manager_instances()) do
+              if candidate ~= instance and path.equal(candidate.root, scan_path) then
+                child = candidate
+              end
+            end
+            assert.is_not_nil(child)
+            child_id = child.id
+            child_bufnr = child.bufnr
+          end,
+        })
+      else
+        assert.are.equal(-1, vim.fn.bufnr(selected_path))
+      end
+
+      local raised = false
+      local destination_win
+      local group = vim.api.nvim_create_augroup(
+        "FreActionCreatedBufWinEnter" .. tostring(instance.id) .. tostring(index), { clear = true })
+      vim.api.nvim_create_autocmd("BufWinEnter", {
+        group = group,
+        callback = function(args)
+          local selected = case.kind == "file"
+            and path.equal(vim.api.nvim_buf_get_name(args.buf), selected_path)
+            or (child ~= nil and args.buf == child.bufnr)
+          if not raised and selected then
+            raised = true
+            destination_win = vim.api.nvim_get_current_win()
+            error("injected created destination BufWinEnter failure")
+          end
+        end,
+      })
+      local ok, err
+      if case.destination == "tab" then
+        ok, err = pcall(actions.tab_select, ctx)
+      else
+        ok, err = pcall(actions.split_select, ctx, {
+          layout = { position = "right", size = 20 },
+        })
+      end
+      vim.api.nvim_del_augroup_by_id(group)
+
+      assert.is_false(ok)
+      assert.is_truthy(tostring(err):find(
+        "injected created destination BufWinEnter failure", 1, true))
+      assert.is_true(raised)
+      assert.is_not_nil(destination_win)
+      assert.is_false(vim.api.nvim_win_is_valid(destination_win))
+      assert.are.equal(before_tabs, #vim.api.nvim_list_tabpages())
+      assert.are.equal(source_tab, vim.api.nvim_get_current_tabpage())
+      assert.are.equal(source_win, vim.api.nvim_get_current_win())
+      assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(source_win))
+      assert.are.same(source_cursor, vim.api.nvim_win_get_cursor(source_win))
+      assert.are.same(source_saved_view, vim.api.nvim_win_call(source_win, vim.fn.winsaveview))
+      assert.are.same(source_view, fre.view.inspect(instance, source_tab))
+      assert.are.equal(source_state, instance.state)
+      assert.is_true(vim.api.nvim_tabpage_is_valid(unrelated_tab))
+      assert.is_true(vim.api.nvim_win_is_valid(unrelated_win))
+      assert.are.equal(unrelated_buf, vim.api.nvim_win_get_buf(unrelated_win))
+      assert.are.equal(before_count, instance_count())
+      if case.kind == "file" then
+        assert.are.equal(-1, vim.fn.bufnr(selected_path))
+      else
+        assert.are.equal("destroyed", child.state)
+        assert.is_nil(manager_module.default:find_by_id(child_id))
+        assert.is_nil(manager_module.default:find_by_buf(child_bufnr))
+        assert.is_false(vim.api.nvim_buf_is_valid(child_bufnr))
+      end
+      instance:destroy()
+    end
+  end)
+
+  it("suppresses destination placeholder tab events and selects into the exact new tab", function()
+    local instance = ready({ ["file.txt"] = "file" })
     local caller_win = open_current(instance)
     local caller_tab = vim.api.nvim_get_current_tabpage()
+    local ctx = context_for(instance, "file.txt")
+    local source_view = assert(fre.view.inspect(instance, caller_tab))
+    local source_cursor = vim.api.nvim_win_get_cursor(caller_win)
+    local source_saved_view = vim.api.nvim_win_call(caller_win, vim.fn.winsaveview)
+    local source_state = instance.state
     vim.cmd("tabnew")
     local unrelated_tab = vim.api.nvim_get_current_tabpage()
     local unrelated_win = vim.api.nvim_get_current_win()
     local unrelated_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(unrelated_buf, 0, -1, false, { "unrelated" })
     vim.api.nvim_win_set_buf(unrelated_win, unrelated_buf)
     vim.api.nvim_set_current_tabpage(caller_tab)
     vim.api.nvim_set_current_win(caller_win)
-
-    local function snapshot()
-      return {
-        tabs = vim.api.nvim_list_tabpages(),
-        windows = window_buffers(),
-        buffers = vim.api.nvim_list_bufs(),
-        view = vim.api.nvim_win_call(caller_win, vim.fn.winsaveview),
-        cursor = vim.api.nvim_win_get_cursor(caller_win),
-        state = instance.state,
-        instances = instance_count(),
-      }
-    end
-    local cases = {
-      { name = "file.txt", kind = "file" },
-      { name = "dir", kind = "directory" },
-    }
-    for index, case in ipairs(cases) do
-      local ctx = context_for(instance, case.name)
-      local selected_path = path.absolute(fixture:path(case.name))
-      local before = snapshot()
-      local transient
-      local group = vim.api.nvim_create_augroup(
-        "FreActionTabNewInjected" .. tostring(instance.id) .. tostring(index), { clear = true })
-      vim.api.nvim_create_autocmd("TabNewEntered", {
+    local before_tabs = #vim.api.nvim_list_tabpages()
+    local events = { TabNew = 0, TabNewEntered = 0 }
+    local group = vim.api.nvim_create_augroup(
+      "FreActionSuppressedTabEvents" .. tostring(instance.id), { clear = true })
+    for _, event in ipairs({ "TabNew", "TabNewEntered" }) do
+      vim.api.nvim_create_autocmd(event, {
         group = group,
-        once = true,
         callback = function()
-          transient = vim.api.nvim_get_current_tabpage()
-          vim.api.nvim_set_current_tabpage(unrelated_tab)
-          error("injected action TabNewEntered failure")
+          events[event] = events[event] + 1
+          error("injected placeholder " .. event .. " failure")
         end,
       })
-      local ok, err = pcall(actions.tab_select, ctx)
-      vim.api.nvim_del_augroup_by_id(group)
-      assert.is_false(ok)
-      assert.is_truthy(tostring(err):find("injected action TabNewEntered failure", 1, true))
-      assert.is_truthy(transient)
-      assert.is_false(vim.api.nvim_tabpage_is_valid(transient))
-      assert.are.same(before.tabs, vim.api.nvim_list_tabpages())
-      assert.are.same(before.windows, window_buffers())
-      assert.are.same(before.buffers, vim.api.nvim_list_bufs())
-      assert.are.equal(before.instances, instance_count())
-      assert.are.equal(before.state, instance.state)
-      assert.are.equal(caller_tab, vim.api.nvim_get_current_tabpage())
-      assert.are.equal(caller_win, vim.api.nvim_get_current_win())
-      assert.are.equal(instance.bufnr, vim.api.nvim_get_current_buf())
-      assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(caller_win))
-      assert.are.same(before.view, vim.api.nvim_win_call(caller_win, vim.fn.winsaveview))
-      assert.are.same(before.cursor, vim.api.nvim_win_get_cursor(caller_win))
-      assert.is_true(vim.api.nvim_tabpage_is_valid(unrelated_tab))
-      assert.is_true(vim.api.nvim_win_is_valid(unrelated_win))
-      assert.are.equal(unrelated_buf, vim.api.nvim_win_get_buf(unrelated_win))
-      if case.kind == "file" then assert.are.equal(-1, vim.fn.bufnr(selected_path)) end
     end
+
+    local ok, selected = pcall(actions.tab_select, ctx)
+    vim.api.nvim_del_augroup_by_id(group)
+
+    assert.is_true(ok, tostring(selected))
+    local destination_tab = vim.api.nvim_get_current_tabpage()
+    local destination_win = vim.api.nvim_get_current_win()
+    assert.are.equal(before_tabs + 1, #vim.api.nvim_list_tabpages())
+    assert.are_not.equal(caller_tab, destination_tab)
+    assert.are_not.equal(unrelated_tab, destination_tab)
+    assert.are.equal(selected, vim.api.nvim_win_get_buf(destination_win))
+    assert.are.equal(path.absolute(fixture:path("file.txt")), vim.api.nvim_buf_get_name(selected))
+    assert.are.same({ TabNew = 0, TabNewEntered = 0 }, events)
+    assert.is_true(vim.api.nvim_win_is_valid(caller_win))
+    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(caller_win))
+    assert.are.same(source_cursor, vim.api.nvim_win_get_cursor(caller_win))
+    assert.are.same(source_saved_view, vim.api.nvim_win_call(caller_win, vim.fn.winsaveview))
+    assert.are.same(source_view, fre.view.inspect(instance, caller_tab))
+    assert.are.equal(source_state, instance.state)
+    assert.is_true(vim.api.nvim_tabpage_is_valid(unrelated_tab))
+    assert.is_true(vim.api.nvim_win_is_valid(unrelated_win))
+    assert.are.equal(unrelated_buf, vim.api.nvim_win_get_buf(unrelated_win))
   end)
 
   it("rejects action-owned, unknown, invalid instance, and non-split inputs before side effects", function()

@@ -448,6 +448,68 @@ describe("fre tab-local active Views", function()
     assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(managed))
   end)
 
+  it("rolls back only the exact destination when BufWinEnter creates an unrelated window", function()
+    local owner = ready({ ["owner.txt"] = "owner" })
+    local anchor = open_view(owner, { position = "current" })
+    local tabpage = vim.api.nvim_get_current_tabpage()
+    local owner_view = assert(fre.view.inspect(owner, tabpage))
+    local anchor_cursor = vim.api.nvim_win_get_cursor(anchor)
+    local anchor_view = saved_view(anchor)
+    local layouts = {
+      { position = "current" },
+      { position = "right", size = 20 },
+      { position = "float", width = 30, height = 8, row = 2, col = 4 },
+    }
+
+    for index, requested in ipairs(layouts) do
+      local instance = ready({ ["target.txt"] = "target" })
+      vim.api.nvim_set_current_win(anchor)
+      local unrelated_buf = scratch()
+      vim.api.nvim_buf_set_lines(unrelated_buf, 0, -1, false, { "callback window" })
+      local before_buffers = vim.api.nvim_list_bufs()
+      local before_windows = #vim.api.nvim_tabpage_list_wins(tabpage)
+      local unrelated_win
+      local raised = false
+      local group = vim.api.nvim_create_augroup(
+        "FreWindowExactRollback" .. tostring(instance.id) .. tostring(index), { clear = true })
+      vim.api.nvim_create_autocmd("BufWinEnter", {
+        group = group,
+        once = true,
+        callback = function(args)
+          assert.are.equal(instance.bufnr, args.buf)
+          raised = true
+          unrelated_win = vim.api.nvim_open_win(unrelated_buf, false, {
+            relative = "editor", width = 18, height = 3, row = 1, col = 1,
+            noautocmd = true,
+          })
+          error("injected exact rollback BufWinEnter failure")
+        end,
+      })
+
+      local ok, err = pcall(instance.open, instance, requested)
+      vim.api.nvim_del_augroup_by_id(group)
+
+      assert.is_false(ok)
+      assert.is_truthy(tostring(err):find(
+        "injected exact rollback BufWinEnter failure", 1, true))
+      assert.is_true(raised)
+      assert.is_not_nil(unrelated_win)
+      assert.is_true(vim.api.nvim_win_is_valid(unrelated_win))
+      assert.are.equal(unrelated_buf, vim.api.nvim_win_get_buf(unrelated_win))
+      assert.are.equal(before_windows + 1, #vim.api.nvim_tabpage_list_wins(tabpage))
+      assert.are.same(before_buffers, vim.api.nvim_list_bufs())
+      assert.are.equal(tabpage, vim.api.nvim_get_current_tabpage())
+      assert.are.equal(anchor, vim.api.nvim_get_current_win())
+      assert.are.equal(owner.bufnr, vim.api.nvim_win_get_buf(anchor))
+      assert.are.same(anchor_cursor, vim.api.nvim_win_get_cursor(anchor))
+      assert.are.same(anchor_view, saved_view(anchor))
+      assert.are.same(owner_view, fre.view.inspect(owner, tabpage))
+      assert.is_nil(fre.view.inspect(instance, tabpage))
+      vim.api.nvim_win_close(unrelated_win, true)
+      instance:destroy()
+    end
+  end)
+
   it("captures a fresh origin after hide and reopen", function()
     local instance = ready()
     local first_origin = vim.api.nvim_get_current_win()

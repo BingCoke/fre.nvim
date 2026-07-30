@@ -383,7 +383,10 @@ function M.select(ctx, opts)
   if target.kind == "noop" then return nil end
 
   local prepared = prepare_selection(instance, target, opts.instance)
-  local installed, previous = pcall(install_selection, instance, prepared, captured)
+  local installed, previous = pcall(function()
+    validate_source(ctx, instance)
+    return install_selection(instance, prepared, captured)
+  end)
   if not installed then precommit_error(prepared, previous) end
   local result = commit_ownership(target, prepared, captured, previous)
   finish_select(ctx, instance, captured.winid, hide_source)

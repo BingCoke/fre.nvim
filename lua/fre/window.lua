@@ -210,13 +210,25 @@ function M.set_split_fixed(winid, normalized, value)
   return option, previous
 end
 
+function M.safe_buffer()
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = bufnr })
+  return bufnr
+end
+
+local function cleanup_safe_buffer(bufnr)
+  if bufnr and vim.api.nvim_buf_is_valid(bufnr) and #vim.fn.win_findbuf(bufnr) == 0 then
+    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+  end
+end
+
 function M.create(instance, normalized, effective, anchor)
   local tabpage = vim.api.nvim_get_current_tabpage()
   local caller = vim.api.nvim_get_current_win()
   local winid
-  local before = {}
-  for _, existing in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do before[existing] = true end
-  local ok, err = pcall(function()
+  local created_win
+  local scratch
+  local ok, previous = pcall(function()
     if normalized.position == "current" then
       assert_window(anchor, "destination window is not valid in the current tab")
       if vim.api.nvim_win_get_tabpage(anchor) ~= tabpage then
@@ -228,6 +240,7 @@ function M.create(instance, normalized, effective, anchor)
       return before
     end
     if normalized.position == "float" then
+      scratch = M.safe_buffer()
       local config = {
         relative = "editor",
         style = "minimal",
@@ -235,9 +248,13 @@ function M.create(instance, normalized, effective, anchor)
         height = effective.height,
         row = effective.row,
         col = effective.col,
+        noautocmd = true,
       }
       if effective.border ~= nil then config.border = copy(effective.border) end
-      winid = vim.api.nvim_open_win(instance.bufnr, true, config)
+      created_win = vim.api.nvim_open_win(scratch, true, config)
+      winid = created_win
+      assert_installed(winid, scratch)
+      vim.api.nvim_win_set_buf(winid, instance.bufnr)
       assert_installed(winid, instance.bufnr)
       if not M.apply(instance, winid) then
         fail("target window was invalidated during option application", 4)
@@ -257,7 +274,11 @@ function M.create(instance, normalized, effective, anchor)
       bottom = "botright split",
     }
     vim.cmd("noautocmd " .. commands[normalized.position])
-    winid = vim.api.nvim_get_current_win()
+    created_win = vim.api.nvim_get_current_win()
+    winid = created_win
+    if winid == anchor or vim.api.nvim_win_get_tabpage(winid) ~= tabpage then
+      fail("created split destination is not exact", 4)
+    end
     resize_split(winid, effective)
     vim.api.nvim_win_set_buf(winid, instance.bufnr)
     assert_installed(winid, instance.bufnr)
@@ -269,26 +290,14 @@ function M.create(instance, normalized, effective, anchor)
     end
     return nil
   end)
-  if ok then return winid, err end
-  for _, created in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
-    if not before[created] and vim.api.nvim_win_is_valid(created) then
-      pcall(vim.api.nvim_win_close, created, true)
-    end
+  if ok then
+    cleanup_safe_buffer(scratch)
+    return winid, previous
   end
+  if created_win then M.close_window(created_win) end
+  cleanup_safe_buffer(scratch)
   if vim.api.nvim_win_is_valid(caller) then pcall(vim.api.nvim_set_current_win, caller) end
-  error(err, 0)
-end
-
-function M.safe_buffer()
-  local bufnr = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = bufnr })
-  return bufnr
-end
-
-local function cleanup_safe_buffer(bufnr)
-  if bufnr and vim.api.nvim_buf_is_valid(bufnr) and #vim.fn.win_findbuf(bufnr) == 0 then
-    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
-  end
+  error(previous, 0)
 end
 
 function M.discard_buffer(bufnr)
@@ -358,33 +367,36 @@ function M.create_tab()
   local caller_tab = vim.api.nvim_get_current_tabpage()
   local caller_win = vim.api.nvim_get_current_win()
   local scratch = M.safe_buffer()
-  local created_tab
-  local created_win
-  local autocmd = vim.api.nvim_create_autocmd("TabNew", {
-    once = true,
-    callback = function()
-      created_tab = vim.api.nvim_get_current_tabpage()
-      created_win = vim.api.nvim_get_current_win()
-    end,
-  })
-  local ok, err = pcall(vim.cmd, "tab sbuffer " .. tostring(scratch))
-  pcall(vim.api.nvim_del_autocmd, autocmd)
-  if ok and created_tab and vim.api.nvim_tabpage_is_valid(created_tab)
-      and created_win and vim.api.nvim_win_is_valid(created_win)
+  local ok, err = pcall(vim.cmd, "noautocmd tab sbuffer " .. tostring(scratch))
+  if not ok then
+    cleanup_safe_buffer(scratch)
+    if vim.api.nvim_tabpage_is_valid(caller_tab) then
+      pcall(vim.api.nvim_set_current_tabpage, caller_tab)
+    end
+    if vim.api.nvim_win_is_valid(caller_win) then
+      pcall(vim.api.nvim_set_current_win, caller_win)
+    end
+    error(err, 0)
+  end
+
+  local created_tab = vim.api.nvim_get_current_tabpage()
+  local created_win = vim.api.nvim_get_current_win()
+  if vim.api.nvim_tabpage_is_valid(created_tab)
+      and vim.api.nvim_win_is_valid(created_win)
       and vim.api.nvim_win_get_tabpage(created_win) == created_tab
       and vim.api.nvim_win_get_buf(created_win) == scratch then
-    vim.api.nvim_set_current_tabpage(created_tab)
-    vim.api.nvim_set_current_win(created_win)
     return created_tab, created_win, scratch
   end
-  if ok then err = "fre.window: created tab destination is not exact" end
-  if created_tab then M.close_tab(created_tab) end
+
+  M.close_tab(created_tab)
   cleanup_safe_buffer(scratch)
   if vim.api.nvim_tabpage_is_valid(caller_tab) then
     pcall(vim.api.nvim_set_current_tabpage, caller_tab)
   end
-  if vim.api.nvim_win_is_valid(caller_win) then pcall(vim.api.nvim_set_current_win, caller_win) end
-  error(err, 0)
+  if vim.api.nvim_win_is_valid(caller_win) then
+    pcall(vim.api.nvim_set_current_win, caller_win)
+  end
+  error("fre.window: created tab destination is not exact", 0)
 end
 
 function M.remove(instance, winid, mode, previous_bufnr)
