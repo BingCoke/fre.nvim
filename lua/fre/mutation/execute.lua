@@ -1,11 +1,11 @@
 local copy = require("fre.config").copy
+local kind_support = require("fre.mutation.kind")
 
 local M = {}
 
 local states = setmetatable({}, { __mode = "k" })
 local methods = {}
 local terminal_states = { succeeded = true, failed = true, canceled = true }
-local kinds = { file = true, directory = true, symlink = true }
 
 local function fail(message, level)
   error("fre: " .. message, level or 3)
@@ -96,8 +96,9 @@ local function validate_operation(operation, index)
     if type(operation.path) ~= "string" then
       return nil, "operation " .. index .. ".path must be a string"
     end
-    if not kinds[operation.kind] then
-      return nil, "operation " .. index .. ".kind must be file, directory, or symlink"
+    if not kind_support.supports("delete", operation.kind) then
+      return nil, "operation " .. index .. ".kind " .. tostring(operation.kind)
+        .. " does not support delete"
     end
   else
     if type(operation.from) ~= "string" then
@@ -106,8 +107,9 @@ local function validate_operation(operation, index)
     if type(operation.to) ~= "string" then
       return nil, "operation " .. index .. ".to must be a string"
     end
-    if not kinds[operation.kind] then
-      return nil, "operation " .. index .. ".kind must be file, directory, or symlink"
+    if not kind_support.supports(operation.type, operation.kind) then
+      return nil, "operation " .. index .. ".kind " .. tostring(operation.kind)
+        .. " does not support " .. operation.type
     end
   end
   return operation

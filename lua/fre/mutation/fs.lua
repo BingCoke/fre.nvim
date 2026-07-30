@@ -1,3 +1,5 @@
+local kind_support = require("fre.mutation.kind")
+
 local uv = vim.uv
 
 local M = {}
@@ -80,14 +82,17 @@ local function new_controller(uv_api, done, report)
   return state, request, start_request, stop_for_cancel, finish, publish
 end
 
-local function simple_request(uv_api, action, subject, start, done, report, error_partial)
+local function simple_request(
+  uv_api, action, subject, start, done, report, error_partial, transform_error
+)
   local state, request, start_request, stop_for_cancel, finish, publish =
     new_controller(uv_api, done, report)
   publish({ action = action, path = subject })
   start_request(start, function(err)
     if stop_for_cancel(err, err == nil and false or error_partial) then return end
     if err ~= nil then
-      finish(error_message(action, subject, err), error_partial, false)
+      local detail = transform_error and transform_error(err) or err
+      finish(error_message(action, subject, detail), error_partial, false)
       return
     end
     state.effect = true
@@ -147,7 +152,13 @@ local function adapter_for(uv_api)
     local subject = from .. " -> " .. to
     return simple_request(uv_api, "cannot move", subject, function(callback)
       return uv_api.fs_rename(from, to, callback)
-    end, done, report, false)
+    end, done, report, false, function(err)
+      local text = tostring(err)
+      if text:upper():find("EXDEV", 1, true) then
+        return "unsupported cross-device move (" .. text .. ")"
+      end
+      return text
+    end)
   end
 
   function adapter.copy(from, to, kind, done, report)
@@ -211,7 +222,7 @@ local function adapter_for(uv_api)
         return
       end
 
-      if entry_kind ~= "directory" then
+      if not kind_support.supports("copy", entry_kind) then
         callback("unsupported entry kind " .. tostring(entry_kind), false)
         return
       end
@@ -275,7 +286,7 @@ local function adapter_for(uv_api)
       if state.cancel_requested then finish(nil, state.effect, true); return end
       publish({ action = "delete", path = target, kind = entry_kind })
 
-      if entry_kind == "file" or entry_kind == "symlink" then
+      if entry_kind ~= "directory" and kind_support.supports("delete", entry_kind) then
         start_request(function(done_unlink)
           return uv_api.fs_unlink(target, done_unlink)
         end, function(err)

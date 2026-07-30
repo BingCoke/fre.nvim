@@ -303,24 +303,30 @@ describe("fre ticket 10 prepare basic mutations", function()
     }, instance:prepare().operations)
   end)
 
-  it("rejects direct mutation of unsupported snapshot kinds", function()
-    local instance = ready_from_adapter({ { name = "device", kind = "char" } })
-    local original = physical_line(instance, "device")
-    local renamed = edited_line(instance, "device", "renamed-device")
-    local copied = edited_line(instance, "device", "copied-device")
+  it("moves and deletes native special kinds but rejects their copies", function()
+    for _, kind in ipairs({ "char", "block", "fifo", "socket" }) do
+      local instance = ready_from_adapter({ { name = "special", kind = kind } })
+      local original = physical_line(instance, "special")
+      local renamed = edited_line(instance, "special", "renamed-special")
+      local copied = edited_line(instance, "special", "copied-special")
 
-    set_lines(instance, { renamed })
-    assert_error("row 2: unsupported snapshot kind char for device", function()
-      instance:prepare()
-    end)
+      set_lines(instance, { renamed })
+      assert.are.same({ {
+        type = "move", from = fixture:path("special"),
+        to = fixture:path("renamed-special"), kind = kind,
+      } }, instance:prepare().operations)
 
-    set_lines(instance, { original, copied })
-    assert_error("row 3: unsupported snapshot kind char for device", function()
-      instance:prepare()
-    end)
+      set_lines(instance, { original, copied })
+      assert_error("row 3: unsupported snapshot kind " .. kind .. " for special", function()
+        instance:prepare()
+      end)
 
-    set_lines(instance, {})
-    assert_error("unsupported snapshot kind char for device", function() instance:prepare() end)
+      set_lines(instance, {})
+      assert.are.same({ {
+        type = "delete", path = fixture:path("special"), kind = kind,
+      } }, instance:prepare().operations)
+      instance:destroy()
+    end
   end)
 
   it("keeps hidden unsupported snapshot kinds as target occupants", function()

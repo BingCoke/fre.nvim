@@ -153,6 +153,48 @@ describe("fre plan execution", function()
     assert.are.same({ "create_file" }, vim.tbl_map(function(call) return call.name end, calls))
   end)
 
+  it("dispatches native special moves and deletes but rejects their copies", function()
+    local calls = {}
+    fre._set_mutation_adapter(complete_adapter(calls))
+    local instance = keep(fre.new({ root = fixture.root }))
+    local special_kinds = { "char", "block", "fifo", "socket" }
+
+    for _, kind in ipairs(special_kinds) do
+      local status = wait_terminal(instance:execute({ operations = {
+        { type = "move", from = "from-" .. kind, to = "to-" .. kind, kind = kind },
+        { type = "delete", path = "to-" .. kind, kind = kind },
+      } }))
+      assert.are.equal("succeeded", status.state)
+    end
+    assert.are.equal(#special_kinds * 2, #calls)
+    for index, kind in ipairs(special_kinds) do
+      assert.are.same({
+        name = "move", values = { "from-" .. kind, "to-" .. kind },
+      }, calls[index * 2 - 1])
+      assert.are.same({
+        name = "delete", values = { "to-" .. kind, kind },
+      }, calls[index * 2])
+    end
+
+    local function reject(operation, fragment)
+      local call_count = #calls
+      local status = wait_terminal(instance:execute({ operations = { operation } }))
+      assert.are.equal("failed", status.state)
+      assert.is_truthy(tostring(status.error):find(fragment, 1, true), tostring(status.error))
+      assert.are.equal(call_count, #calls)
+    end
+    for _, kind in ipairs(special_kinds) do
+      reject({ type = "copy", from = "from", to = "to", kind = kind },
+        ".kind " .. kind .. " does not support copy")
+    end
+    reject({ type = "move", from = "from", to = "to", kind = "other" },
+      ".kind other does not support move")
+    reject({ type = "delete", path = "path", kind = "other" },
+      ".kind other does not support delete")
+    reject({ type = "copy", from = "from", to = "to", kind = "other" },
+      ".kind other does not support copy")
+  end)
+
   it("rejects a second execution and destroy while the first is nonterminal", function()
     local calls, pending = {}, {}
     fre._set_mutation_adapter(pending_adapter(calls, pending))
@@ -528,6 +570,65 @@ describe("fre plan execution", function()
     assert.are.equal("target", read_file(target))
   end)
 
+  it("unlinks native special kinds directly and during recursive deletion", function()
+    local special_kinds = { "char", "block", "fifo", "socket" }
+    local unlinked, rmdir_count = {}, 0
+    local fake_uv = {
+      cancel = function() return false end,
+      fs_unlink = function(target, done)
+        unlinked[#unlinked + 1] = target
+        done(nil)
+        return { request = "unlink" }
+      end,
+      fs_scandir = function(target, done)
+        assert.are.equal("root", target)
+        done(nil, { index = 0 })
+        return { request = "scandir" }
+      end,
+      fs_scandir_next = function(handle)
+        handle.index = handle.index + 1
+        return special_kinds[handle.index]
+      end,
+      fs_lstat = function(target, done)
+        done(nil, { type = vim.fs.basename(target) })
+        return { request = "lstat" }
+      end,
+      fs_rmdir = function(target, done)
+        assert.are.equal("root", target)
+        rmdir_count = rmdir_count + 1
+        done(nil)
+        return { request = "rmdir" }
+      end,
+    }
+    local adapter = mutation_fs.new(fake_uv)
+
+    for _, kind in ipairs(special_kinds) do
+      local callback_error
+      adapter.delete("direct-" .. kind, kind, function(err) callback_error = err end)
+      assert.is_nil(callback_error)
+    end
+    local recursive_error
+    adapter.delete("root", "directory", function(err) recursive_error = err end)
+    assert.is_nil(recursive_error)
+    assert.are.equal(1, rmdir_count)
+
+    local unsupported_error, unsupported_partial
+    adapter.delete("custom", "other", function(err, _, partial)
+      unsupported_error, unsupported_partial = err, partial
+    end)
+    assert.is_truthy(unsupported_error:find("unsupported entry kind other", 1, true))
+    assert.is_false(unsupported_partial)
+
+    local expected = {}
+    for _, kind in ipairs(special_kinds) do
+      expected[#expected + 1] = "direct-" .. kind
+      expected[#expected + 1] = vim.fs.joinpath("root", kind)
+    end
+    table.sort(expected)
+    table.sort(unlinked)
+    assert.are.same(expected, unlinked)
+  end)
+
   it("closes a created file even when cancellation races a successful open", function()
     local open_done, close_done
     local cancel_count, close_count, completion_count = 0, 0, 0
@@ -582,6 +683,7 @@ describe("fre plan execution", function()
     end)
     assert.are.equal(1, rename_count)
     assert.are.equal(1, callback_count)
+    assert.is_truthy(callback_error:find("unsupported cross-device move", 1, true))
     assert.is_truthy(callback_error:find("EXDEV", 1, true))
     assert.is_nil(fake_uv.fs_copyfile)
     assert.is_nil(fake_uv.fs_unlink)
