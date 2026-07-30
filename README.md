@@ -524,7 +524,7 @@ local inspected = require("fre").view.inspect(instance, tabpage)
   absolute_path = "/project/src/main.lua",
   relative_path = "src/main.lua",
   name = "main.lua",
-  kind = "file", -- file | directory | symlink
+  kind = "file", -- 非空 adapter kind；file | directory | symlink 支持直接 mutation
 }
 ```
 
@@ -630,7 +630,9 @@ Marker 是隐藏的内部结构文本，不是可配置列。每个 Manager 生�
 
 正常值是 `conceallevel=3`、`concealcursor=nvic`，并存在带 `conceal` 的 `FreStableMarker` syntax match。可先执行 `:setlocal conceallevel=3 concealcursor=nvic`；如果仍可见，提交上述三项输出和 `:version`。
 
-`row N: unsupported snapshot kind char for <path>` 中的 `char` 是 libuv 文件类型 `character device`，不是图标字符。Fre 的 mutation planner 只支持 `file`、`directory` 和 `symlink`，因此会在执行任何磁盘操作前拒绝特殊设备、socket、FIFO 或 block device。把光标移到该行后可检查：
+默认 filesystem adapter 还可能返回 `char`、`block`、`fifo` 或 `socket`，自定义 adapter 也可以返回其他非空 kind。Fre 会加载并显示这些条目，但把它们作为 opaque occupant：原 marker 保持在原 snapshot 路径时不生成 mutation，也不会阻止空计划或其他受支持条目的写入；它们仍参与目标路径占用检查。
+
+`row N: unsupported snapshot kind char for <path>` 中的 `char` 是 libuv 文件类型 `character device`，不是图标字符。该错误表示草稿正在直接移动、复制或删除特殊条目，或者目录 copy/delete 会递归经过已缓存的特殊后代。目录 move 使用单次 filesystem rename，可以整体携带这些后代。把光标移到相关行后可检查：
 
 ```vim
 :lua print(vim.inspect(require("fre").get_instance():get_entry(vim.fn.line("."))))
@@ -651,7 +653,8 @@ $p = '\\?\C:\absolute\path\to\nul'
 
 - 仅支持本地文件系统，不支持 SSH、S3、archive、trash 等后端。
 - 不支持文件名中的换行字节。
-- 不支持 character/block device、socket 或 FIFO 等特殊文件类型的 mutation。
+- character/block device、socket、FIFO 及其他 adapter-defined kind 可以加载、显示并原样保留，但不支持直接 mutation；目录 rename 可以整体携带它们。
+- `prepare()` 只能检查已缓存的特殊后代；copy/delete 未展开目录时，默认 mutation adapter 仍可能在执行中发现不支持的特殊类型并失败。
 - 不会自动执行 `:cd`、`:lcd` 或 `:tcd`。
 - 不会对部分执行的计划做事务回滚。
 - 外部文件变化不会与未保存草稿做三方合并。
