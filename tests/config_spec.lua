@@ -244,41 +244,59 @@ describe("fre configuration", function()
 
   it("keeps setup inputs, returned defaults, mappings, and effective snapshots independent", function()
     local manager = new_manager()
+    local setup_border = {
+      { "+", "FreBorder" }, "-", "+", "|", "+", "-", "+", "|",
+    }
     local setup_opts = {
       columns = { custom_column("custom", { value = 1 }) },
       mapping = { n = { x = noop } },
+      layout = {
+        position = "float", width = 40, height = 12, border = setup_border,
+      },
       buffer = { variables = { record = { value = 1 } } },
     }
     manager:setup(setup_opts)
     setup_opts.columns[1].data.value = 9
     setup_opts.mapping.n.y = noop
+    setup_opts.layout.border[1][1] = "mutated"
     setup_opts.buffer.variables.record.value = 9
 
     local returned = manager:get_setup_defaults()
     returned.columns[1].data.value = 8
     returned.mapping.n.y = noop
+    returned.layout.border[1][1] = "returned"
     returned.buffer.variables.record.value = 8
 
+    local instance_border = {
+      { "#", "InstanceBorder" }, "=", "#", "!", "#", "=", "#", "!",
+    }
     local new_opts = {
       columns = { custom_column("new", { value = 2 }) },
       mapping = { n = { z = noop } },
+      layout = { width = 50, border = instance_border },
       buffer = { variables = { extra = { value = 2 } } },
     }
     local first = manager:resolve_instance_config(new_opts)
     new_opts.columns[1].data.value = 9
     new_opts.mapping.n.z = function() end
+    new_opts.layout.border[1][1] = "mutated"
     new_opts.buffer.variables.extra.value = 9
     assert.are.equal(2, first.columns[1].data.value)
     assert.are.equal(noop, first.mapping.n.z)
+    assert.are.equal(50, first.layout.width)
+    assert.are.equal("#", first.layout.border[1][1])
     assert.are.equal(2, first.buffer.variables.extra.value)
 
     local second = manager:resolve_instance_config()
     first.columns[1].data.value = 7
     first.mapping.n.y = noop
+    first.layout.border[1][1] = "first"
     first.buffer.variables.record.value = 7
 
     assert.are.equal(1, second.columns[1].data.value)
     assert.is_nil(second.mapping.n.y)
+    assert.are.equal(40, second.layout.width)
+    assert.are.equal("+", second.layout.border[1][1])
     assert.are.equal(1, second.buffer.variables.record.value)
   end)
 

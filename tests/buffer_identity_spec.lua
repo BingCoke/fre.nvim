@@ -23,7 +23,7 @@ local function ready(entries, root)
   end
   local instance = keep(fre.new({ root = root or fixture.root }))
   wait_for(function()
-    return instance.state == "ready-hidden" or instance.state == "ready-visible"
+    return instance.state == "ready"
   end)
   return instance
 end

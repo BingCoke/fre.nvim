@@ -3,8 +3,13 @@ local gc = require("fre.gc")
 local mutation_fs = require("fre.mutation.fs")
 local manager_module = require("fre.manager")
 local watch = require("fre.watch")
+local view = require("fre.view")
 
 local M = {}
+
+M.view = {
+  inspect = view.inspect,
+}
 
 function M.setup(opts)
   manager_module.default:setup(opts)

@@ -25,7 +25,7 @@ local function ready(entries)
   fixture:tree(entries or {})
   local instance = keep(fre.new({ root = fixture.root, columns = {} }))
   wait_for(function()
-    return instance.state == "ready-hidden" or instance.state == "ready-visible"
+    return instance.state == "ready"
       or instance.state == "load-failed"
   end)
   assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
@@ -155,7 +155,7 @@ local function fake_plan(root_path, definitions)
     bufnr = bufnr,
     root = root_path,
     root_node = root,
-    state = "ready-hidden",
+    state = "ready",
     config = { columns = {} },
     nodes_by_id = nodes_by_id,
     view = { baseline = baseline, visible_nodes = visible },

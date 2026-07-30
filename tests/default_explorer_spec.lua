@@ -2,7 +2,6 @@ local fre = require("fre")
 local manager_module = require("fre.manager")
 local path = require("fre.path")
 local takeover_module = require("fre.takeover")
-local window = require("fre.window")
 local fs = require("tests.helpers.fs")
 
 local fixture
@@ -184,9 +183,9 @@ describe("fre ticket 20 default directory explorer", function()
     assert.is_true(vim.wo.cursorline)
     assert.is_false(vim.api.nvim_buf_is_valid(source))
     wait_for(function()
-      return child.state == "ready-visible" or child.state == "load-failed"
+      return child.state == "ready" or child.state == "load-failed"
     end)
-    assert.are.equal("ready-visible", child.state, tostring(child.error))
+    assert.are.equal("ready", child.state, tostring(child.error))
 
     local later_source = source_buffer(fixture:path("one"))
     fre.setup({ default_file_explorer = false, columns = {} })
@@ -404,104 +403,24 @@ describe("fre ticket 20 default directory explorer", function()
     end
   end)
 
-  it("rolls back a real post-sync replacement fault before destroying the hidden child", function()
+  it("registers a successful takeover as the active managed current View", function()
     reset_editor()
-    local gc_adapter, gc_state = gc_timer_adapter()
-    fre._set_gc_adapter(gc_adapter)
-    fre.setup({
-      columns = {},
-      gc = { ttl_ms = 1000 },
-      window = { options = { number = true, cursorline = true } },
-    })
-
+    fre.setup({ columns = {}, window = { options = { cursorline = true } } })
     local source, winid = source_buffer(fixture:path("two"))
-    vim.api.nvim_buf_set_lines(source, 0, -1, false, { "first", "second", "third" })
-    vim.bo[source].modified = false
-    vim.wo[winid].number = false
-    vim.wo[winid].cursorline = false
-    vim.api.nvim_win_set_cursor(winid, { 3, 2 })
-    local source_view = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
-    local source_name = vim.api.nvim_buf_get_name(source)
-    local source_lines = vim.api.nvim_buf_get_lines(source, 0, -1, false)
-    local source_bufhidden = vim.bo[source].bufhidden
 
-    vim.cmd("noautocmd vsplit")
-    local unrelated_win = vim.api.nvim_get_current_win()
-    local unrelated = vim.api.nvim_create_buf(true, false)
-    vim.api.nvim_buf_set_lines(unrelated, 0, -1, false, { "unrelated", "window" })
-    show(unrelated, unrelated_win)
-    vim.wo[unrelated_win].number = true
-    vim.wo[unrelated_win].cursorline = false
-    vim.api.nvim_win_set_cursor(unrelated_win, { 2, 1 })
-    local unrelated_view = vim.api.nvim_win_call(unrelated_win, vim.fn.winsaveview)
-    goto_window(winid)
+    local child = assert(controller:check(source, winid))
+    local inspected = assert(fre.view.inspect(child))
+    assert.are.equal(winid, inspected.winid)
+    assert.are.equal(winid, inspected.origin_winid)
+    assert.are.same({ position = "current" }, inspected.layout)
+    assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(winid))
+    assert.is_true(vim.wo[winid].cursorline)
+    assert.is_false(vim.api.nvim_buf_is_valid(source))
 
-    local before_buffers = vim.api.nvim_list_bufs()
-    local before_instances = instance_count(manager)
-    local before_id = manager._next_id
-    local before_destroy
-    local child
-    controller._create_instance = function(target, root)
-      child = original_controller.create_instance(target, root)
-      local destroy = child.destroy
-      child.destroy = function(self)
-        before_destroy = {
-          history = vim.deepcopy(self._last_layout_by_tab),
-          state = self.state,
-          hidden_since = self.hidden_since,
-          timer = self._gc_timer,
-          timer_closed = self._gc_timer and self._gc_timer.closed,
-        }
-        return destroy(self)
-      end
-      return child
-    end
-
-    local original_sync = window.sync_visibility
-    window.sync_visibility = function(instance)
-      local visible = original_sync(instance)
-      error("injected post-sync replacement fault: " .. tostring(visible))
-    end
-    local ok, err = pcall(controller.check, controller, source, winid)
-    window.sync_visibility = original_sync
-
-    assert.is_false(ok)
-    assert.is_truthy(tostring(err):find("injected post-sync replacement fault", 1, true))
-    assert.is_not_nil(child)
-    assert.are.equal("destroyed", child.state)
-    assert.is_false(vim.api.nvim_buf_is_valid(child.bufnr))
-    assert.are.same(before_buffers, vim.api.nvim_list_bufs())
-    assert.are.equal(before_instances, instance_count(manager))
-    assert.is_nil(manager:find_by_id(before_id))
-    assert.is_nil(manager:find_by_buf(child.bufnr))
-    for _, group in pairs(manager.groups) do assert.is_nil(group.instances[before_id]) end
-    assert.are.equal(source, vim.api.nvim_win_get_buf(winid))
-    assert.are.same(source_view, vim.api.nvim_win_call(winid, vim.fn.winsaveview))
-    assert.are.equal(source_name, vim.api.nvim_buf_get_name(source))
-    assert.are.same(source_lines, vim.api.nvim_buf_get_lines(source, 0, -1, false))
-    assert.are.equal(source_bufhidden, vim.bo[source].bufhidden)
-    assert.is_false(vim.bo[source].modified)
-    assert.is_false(pcall(vim.api.nvim_buf_get_var, source, "fre"))
-    assert.is_false(vim.wo[winid].number)
-    assert.is_false(vim.wo[winid].cursorline)
-    assert.is_false(pcall(vim.api.nvim_win_get_var, winid, "fre_layout_" .. before_id))
-    assert.are.equal(winid, vim.api.nvim_get_current_win())
-    assert.are.equal(unrelated, vim.api.nvim_win_get_buf(unrelated_win))
-    assert.are.same(unrelated_view, vim.api.nvim_win_call(unrelated_win, vim.fn.winsaveview))
-    assert.is_true(vim.wo[unrelated_win].number)
-    assert.is_false(vim.wo[unrelated_win].cursorline)
-    assert.are.same({ "unrelated", "window" },
-      vim.api.nvim_buf_get_lines(unrelated, 0, -1, false))
-    assert.is_false(pcall(vim.api.nvim_win_get_var, unrelated_win, "fre_layout_" .. before_id))
-    assert.are.same({}, before_destroy.history)
-    assert.are.equal("creating", before_destroy.state)
-    assert.is_not_nil(before_destroy.hidden_since)
-    assert.is_not_nil(before_destroy.timer)
-    assert.is_false(before_destroy.timer_closed)
-    assert.are.equal(2, #gc_state.handles)
-    assert.are.equal(2, gc_state.stopped)
-    assert.are.equal(2, gc_state.closed)
-    assert.is_nil(controller._checking[source])
+    assert.is_true(child:hidden())
+    assert.is_nil(fre.view.inspect(child))
+    assert.is_true(vim.api.nvim_win_is_valid(winid))
+    assert.are_not.equal(child.bufnr, vim.api.nvim_win_get_buf(winid))
   end)
 
   it("surfaces source deletion errors without rolling back the displayed child", function()

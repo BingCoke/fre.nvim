@@ -12,7 +12,7 @@ local function create_instance(manager, root)
 end
 
 local function replace_window(instance, winid)
-  return require("fre.window").replace(instance, winid)
+  return require("fre.view").takeover(instance, winid)
 end
 
 local function valid_views(bufnr)

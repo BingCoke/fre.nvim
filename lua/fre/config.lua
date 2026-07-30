@@ -1,6 +1,6 @@
 local columns = require("fre.columns")
 local fs_path = require("fre.path")
-local window = require("fre.window")
+local layout = require("fre.layout")
 
 local M = {}
 
@@ -259,8 +259,8 @@ end
 
 local function validate_layout(value, path, effective)
   local opts = { path = path, partial = not effective }
-  local ok, err = pcall(window.normalize, value, opts)
-  if not ok then fail(tostring(err):gsub("^fre%.window:%s*", ""), 4) end
+  local ok, err = pcall(layout.normalize, value, opts)
+  if not ok then fail(tostring(err):gsub("^fre%.layout:%s*", ""), 4) end
 end
 
 local function validate_columns(value, path)
@@ -437,8 +437,10 @@ function M.resolve_setup(opts, ignore_default_file_explorer)
     result.use_mapping_default = copy(opts.use_mapping_default)
   end
   result.mapping = merge_mapping(result.mapping, opts.mapping)
-  local layout_ok, layout_result = pcall(window.merge_layout, result.layout, opts.layout, { path = "layout" })
-  if not layout_ok then fail(tostring(layout_result):gsub("^fre%.window:%s*", ""), 3) end
+  local layout_ok, layout_result = pcall(
+    layout.merge, result.layout, opts.layout, { path = "layout" }
+  )
+  if not layout_ok then fail(tostring(layout_result):gsub("^fre%.layout:%s*", ""), 3) end
   result.layout = layout_result
 
   if opts.gc ~= nil then
@@ -540,8 +542,10 @@ function M.resolve_instance(setup_defaults, opts, normalized_root)
     result.use_mapping_default = copy(opts.use_mapping_default)
   end
   result.mapping = merge_mapping(result.mapping, opts.mapping)
-  local layout_ok, layout_result = pcall(window.merge_layout, result.layout, opts.layout, { path = "layout" })
-  if not layout_ok then fail(tostring(layout_result):gsub("^fre%.window:%s*", ""), 3) end
+  local layout_ok, layout_result = pcall(
+    layout.merge, result.layout, opts.layout, { path = "layout" }
+  )
+  if not layout_ok then fail(tostring(layout_result):gsub("^fre%.layout:%s*", ""), 3) end
   result.layout = layout_result
 
   if opts.gc ~= nil then

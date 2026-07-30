@@ -1,7 +1,6 @@
 local fre = require("fre")
 local manager_module = require("fre.manager")
 local fs = require("tests.helpers.fs")
-local window = require("fre.window")
 
 local fixture
 local instances = {}
@@ -24,7 +23,7 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready-hidden" or instance.state == "ready-visible"
+    return instance.state == "ready"
       or instance.state == "load-failed"
   end)
   assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
@@ -114,12 +113,7 @@ local function scratch()
 end
 
 local function hide_all(instance)
-  for _, winid in ipairs(vim.fn.win_findbuf(instance.bufnr)) do
-    if vim.api.nvim_win_is_valid(winid) then
-      vim.api.nvim_win_set_buf(winid, scratch())
-    end
-  end
-  window.sync_visibility(instance)
+  instance:hide_all()
 end
 
 local function sorted_windows(bufnr)
@@ -345,9 +339,9 @@ describe("fre ticket 19 destroy and GC", function()
     vim.cmd("vsplit")
     vim.api.nvim_win_set_buf(0, instance.bufnr)
     vim.cmd("tabnew")
-    vim.api.nvim_win_set_buf(0, instance.bufnr)
-    window.sync_visibility(instance)
+    instance:open({ position = "current" })
     assert.are.equal(3, #sorted_windows(instance.bufnr))
+    assert.are.equal(2, vim.tbl_count(instance._views))
     vim.bo[instance.bufnr].modifiable = true
     vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, { "unsaved draft" })
     vim.bo[instance.bufnr].modified = true
@@ -372,7 +366,8 @@ describe("fre ticket 19 destroy and GC", function()
     for _, field in ipairs({
       "manager", "config", "tree", "root_node", "nodes_by_id", "nodes_by_path", "view",
       "actions", "_execution", "_watchers", "_buffer_augroup", "_mapping_installed",
-      "_installed_mappings", "_pending_reveal", "_last_layout_by_tab",
+      "_installed_mappings", "_views", "_last_layout_by_tab",
+      "_pending_initial_cursor", "_pending_reveal", "_pending_presentation_refresh",
       "hidden_since", "_gc_timer", "_gc_expired_reconsider", "needs_refresh",
       "result", "error", "real_root",
     }) do
@@ -423,7 +418,7 @@ describe("fre ticket 19 destroy and GC", function()
 
       assert.are.equal(case.valid_after_command, vim.api.nvim_buf_is_valid(bufnr))
       assert.is_false(vim.api.nvim_buf_is_loaded(bufnr))
-      assert.are.equal("ready-hidden", instance.state)
+      assert.are.equal("ready", instance.state)
       assert.is_false(instance._destroyed)
       assert.are.equal(instance, fre.get_instance(bufnr))
       assert.are.equal(instance, fre.get_instance_by_id(id))
@@ -479,7 +474,7 @@ describe("fre ticket 19 destroy and GC", function()
     local ok, err = pcall(vim.cmd, "bwipeout! " .. tostring(bufnr))
     vim.schedule = original_schedule
     assert.is_true(ok, tostring(err))
-    assert.are.equal("ready-hidden", instance.state)
+    assert.are.equal("ready", instance.state)
     assert.are.equal(1, #scheduled)
 
     table.remove(scheduled, 1)()
@@ -608,7 +603,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert_error_contains(function() post_effect:destroy() end, "destroyed")
   end)
 
-  it("makes late load, refresh, watch, visibility, and timer callbacks inert", function()
+  it("makes late load, refresh, watch, presentation, and timer callbacks inert", function()
     local initial_done
     fre._set_fs_adapter({ load = function(_, done) initial_done = done end })
     local loading = keep(fre.new({
@@ -700,48 +695,269 @@ describe("fre ticket 19 destroy and GC", function()
     assert.is_nil(ready_error)
   end)
 
-  it("tracks actual multi-view continuous hidden intervals and rejects stale timer generations", function()
+  it("completes loading as ready with zero, one, or multiple managed Views", function()
+    local callbacks = {}
+    fre._set_fs_adapter({
+      load = function(_, done) callbacks[#callbacks + 1] = done end,
+    })
+
+    local hidden = keep(fre.new({ root = fixture.root, columns = {} }))
+    local one = keep(fre.new({ root = fixture.root, columns = {} }))
+    one:open({ position = "current" })
+
+    vim.cmd("tabnew")
+    local many = keep(fre.new({ root = fixture.root, columns = {} }))
+    many:open({ position = "current" })
+    vim.cmd("tabnew")
+    many:open({ position = "current" })
+
+    assert.are.equal(0, vim.tbl_count(hidden._views))
+    assert.are.equal(1, vim.tbl_count(one._views))
+    assert.are.equal(2, vim.tbl_count(many._views))
+    for _, done in ipairs(callbacks) do done(nil, {}, fixture.root) end
+    wait_for(function()
+      return hidden.state == "ready" and one.state == "ready" and many.state == "ready"
+    end)
+    assert.are.equal(0, vim.tbl_count(hidden._views))
+    assert.are.equal(1, vim.tbl_count(one._views))
+    assert.are.equal(2, vim.tbl_count(many._views))
+    fre._reset_fs_adapter()
+  end)
+
+  it("keeps one ready lifecycle across managed Views and rejects stale hidden intervals", function()
     fre.setup({ columns = {}, gc = {
       ttl_ms = 100, groups = { default = 0, project = 0 },
     } })
     local instance = ready()
+    assert.are.equal("ready", instance.state)
     local registration_timer = assert(instance._gc_timer).handle
     clock:advance(40)
+
+    local first_tab = vim.api.nvim_get_current_tabpage()
     instance:open({ position = "current" })
+    assert.are.equal("ready", instance.state)
     assert.is_nil(instance.hidden_since)
     assert.are.equal(1, registration_timer.close_count)
 
-    vim.cmd("vsplit")
-    vim.api.nvim_win_set_buf(0, instance.bufnr)
     vim.cmd("tabnew")
-    vim.api.nvim_win_set_buf(0, instance.bufnr)
-    window.sync_visibility(instance)
-    local views = sorted_windows(instance.bufnr)
-    vim.api.nvim_win_set_buf(views[1], scratch())
-    window.sync_visibility(instance)
+    local second_tab = vim.api.nvim_get_current_tabpage()
+    instance:open({ position = "current" })
+    assert.are.equal("ready", instance.state)
+    assert.are.equal(2, vim.tbl_count(instance._views))
     assert.is_nil(instance.hidden_since)
-    vim.api.nvim_win_set_buf(views[2], scratch())
-    window.sync_visibility(instance)
+
+    instance:hidden(second_tab)
+    assert.are.equal("ready", instance.state)
+    assert.are.equal(1, vim.tbl_count(instance._views))
     assert.is_nil(instance.hidden_since)
-    vim.api.nvim_win_set_buf(views[3], scratch())
-    window.sync_visibility(instance)
+
+    vim.api.nvim_set_current_tabpage(first_tab)
+    instance:hidden(first_tab)
+    assert.are.equal("ready", instance.state)
     assert.are.equal(40, instance.hidden_since)
     local final_timer = assert(instance._gc_timer).handle
 
     clock:fire_stale(registration_timer)
-    assert.are.equal("ready-hidden", instance.state)
+    assert.are.equal("ready", instance.state)
+    assert.are.equal(40, instance.hidden_since)
     clock:advance(99)
-    assert.are.equal("ready-hidden", instance.state)
+    assert.are.equal("ready", instance.state)
+
     instance:open({ position = "current" })
     assert.is_nil(instance.hidden_since)
     hide_all(instance)
     assert.are.equal(139, instance.hidden_since)
     local reset_timer = assert(instance._gc_timer).handle
     clock:fire_stale(final_timer)
-    assert.are.equal("ready-hidden", instance.state)
+    assert.are.equal("ready", instance.state)
     clock:advance(100)
     assert.are.equal("destroyed", instance.state)
     assert.are.equal(1, reset_timer.close_count)
+  end)
+
+  it("prunes stale managed Views locally and starts only the final hidden interval", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 100, groups = { default = 0, project = 0 },
+    } })
+    local instance = ready()
+    local first_tab = vim.api.nvim_get_current_tabpage()
+    local _, replaced_win = instance:open({ position = "current" })
+    vim.api.nvim_win_set_buf(replaced_win, scratch())
+    assert.is_not_nil(instance._views[first_tab])
+    wait_for(function() return instance._views[first_tab] == nil end)
+    assert.are.equal(0, instance.hidden_since)
+
+    local _, closed_win = instance:open({ position = "right", size = 20 })
+    assert.is_nil(instance.hidden_since)
+    vim.api.nvim_win_close(closed_win, true)
+    wait_for(function() return instance._views[first_tab] == nil end)
+    assert.are.equal(0, instance.hidden_since)
+
+    vim.cmd("tabnew")
+    local removed_tab = vim.api.nvim_get_current_tabpage()
+    instance:open({ position = "current" })
+    assert.is_nil(instance.hidden_since)
+    vim.cmd("tabclose")
+    wait_for(function() return instance._views[removed_tab] == nil end)
+    assert.are.equal(0, instance.hidden_since)
+
+    instance:open({ position = "current" })
+    local first_win = assert(fre.view.inspect(instance, first_tab)).winid
+    vim.cmd("tabnew")
+    local second_tab = vim.api.nvim_get_current_tabpage()
+    instance:open({ position = "current" })
+    local second_win = assert(fre.view.inspect(instance, second_tab)).winid
+    vim.api.nvim_win_set_buf(second_win, scratch())
+    wait_for(function() return instance._views[second_tab] == nil end)
+    assert.is_nil(instance.hidden_since)
+
+    vim.api.nvim_set_current_tabpage(first_tab)
+    vim.api.nvim_win_set_buf(first_win, scratch())
+    wait_for(function() return instance._views[first_tab] == nil end)
+    assert.are.equal(0, instance.hidden_since)
+    assert.are.equal("ready", instance.state)
+  end)
+
+  it("surfaces final explicit-hide GC failures after committing View removal", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 100, groups = { default = 0, project = 0 },
+    } })
+    for _, method in ipairs({ "hidden", "hide_all" }) do
+      local instance = ready()
+      local tabpage = vim.api.nvim_get_current_tabpage()
+      local previous_bufnr = vim.api.nvim_get_current_buf()
+      local _, winid = instance:open({ position = "current" })
+      local timer_start = clock.adapter.timer_start
+      local injected = false
+      clock.adapter.timer_start = function()
+        injected = true
+        return false
+      end
+
+      local ok, err = pcall(function()
+        if method == "hidden" then instance:hidden(tabpage) else instance:hide_all() end
+      end)
+      clock.adapter.timer_start = timer_start
+
+      assert.is_false(ok)
+      assert.is_truthy(tostring(err):find("adapter.timer_start() failed", 1, true))
+      assert.is_true(injected)
+      assert.is_nil(fre.view.inspect(instance, tabpage))
+      assert.are.equal(previous_bufnr, vim.api.nvim_win_get_buf(winid))
+      assert.is_not_nil(instance.hidden_since)
+      assert.is_nil(instance._gc_timer)
+    end
+  end)
+
+  it("contains and reports persistent stale-prune GC retry failures", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 100, groups = { default = 0, project = 0 },
+    } })
+    local instance = ready()
+    local tabpage = vim.api.nvim_get_current_tabpage()
+    local _, winid = instance:open({ position = "current" })
+    local replacement = scratch()
+    local reported = {}
+    instance._report_async_error = function(_, err)
+      reported[#reported + 1] = tostring(err)
+    end
+    local starts = 0
+    clock.adapter.timer_start = function()
+      starts = starts + 1
+      return false
+    end
+
+    local replaced, replace_err = pcall(vim.api.nvim_win_set_buf, winid, replacement)
+    assert.is_true(replaced, tostring(replace_err))
+    wait_for(function()
+      return instance._views[tabpage] == nil and #reported == 1
+    end)
+
+    assert.are.equal(replacement, vim.api.nvim_win_get_buf(winid))
+    assert.are.equal(1, starts)
+    assert.is_truthy(reported[1]:find("presentation leave failed", 1, true))
+    assert.is_truthy(reported[1]:find("adapter.timer_start() failed", 1, true))
+    assert.is_nil(instance._gc_timer)
+    assert.are.equal("ready", instance.state)
+    assert.are.equal(0, vim.tbl_count(instance._views))
+
+    local drained, drain_err = pcall(clock.drain, clock)
+
+    assert.is_true(drained, tostring(drain_err))
+    assert.are.equal(2, starts)
+    assert.are.equal(2, #reported)
+    assert.is_truthy(reported[2]:find("GC reconsideration failed", 1, true))
+    assert.is_truthy(reported[2]:find("adapter.timer_start() failed", 1, true))
+    assert.is_nil(instance._gc_timer)
+    assert.are.equal("ready", instance.state)
+    assert.are.equal(0, vim.tbl_count(instance._views))
+    assert.are.equal(replacement, vim.api.nvim_win_get_buf(winid))
+    assert.are.same({}, clock.scheduled)
+
+    drained, drain_err = pcall(clock.drain, clock)
+    assert.is_true(drained, tostring(drain_err))
+    assert.are.equal(2, starts)
+    assert.are.equal(2, #reported)
+  end)
+
+  it("defers TTL and capacity destruction for actual native duplicate windows", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 20, groups = { default = 0, project = 0 },
+    } })
+    local ttl = ready()
+    vim.api.nvim_win_set_buf(0, ttl.bufnr)
+    assert.are.equal(0, ttl.hidden_since)
+    assert.are.equal("ready", ttl.state)
+    clock:advance(20)
+    assert.are.equal("ready", ttl.state)
+    assert.are.equal(0, ttl.hidden_since)
+    assert.is_nil(ttl._gc_timer)
+    assert.is_false(manager_module.default:is_gc_eligible(ttl))
+
+    vim.api.nvim_win_set_buf(0, scratch())
+    wait_for(function()
+      clock:drain()
+      return ttl.state == "destroyed"
+    end)
+    assert.are.equal("destroyed", ttl.state)
+
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 0, groups = { default = 1, project = 0 },
+    } })
+    local protected = ready()
+    protected:open({ position = "current" })
+
+    vim.cmd("tabnew")
+    local victim_tab = vim.api.nvim_get_current_tabpage()
+    local victim = ready()
+    local _, managed_win = victim:open({ position = "current" })
+    vim.cmd("vsplit")
+    local native_win = vim.api.nvim_get_current_win()
+    assert.are_not.equal(managed_win, native_win)
+    assert.are.equal(2, #sorted_windows(victim.bufnr))
+    assert.are.equal(1, vim.tbl_count(victim._views))
+
+    victim:hidden(victim_tab)
+    assert.are.equal(0, vim.tbl_count(victim._views))
+    assert.are.same({ native_win }, sorted_windows(victim.bufnr))
+    clock:drain()
+    drain_editor()
+    clock:drain()
+    assert.are.equal("ready", protected.state)
+    assert.are.equal("ready", victim.state)
+    assert.is_false(manager_module.default:is_gc_eligible(victim))
+
+    vim.api.nvim_win_close(native_win, true)
+    wait_for(function()
+      clock:drain()
+      return victim.state == "destroyed"
+    end)
+
+    assert.are.equal("ready", protected.state)
+    assert.are.equal("destroyed", victim.state)
+    assert.is_true(#sorted_windows(protected.bufnr) > 0)
+    assert.are.equal(protected,
+      manager_module.default.groups.default.instances[protected.id])
   end)
 
   it("defers expired registration and final-hide arms and invalidates stale intervals", function()
@@ -755,9 +971,9 @@ describe("fre ticket 19 destroy and GC", function()
       return registration_now_calls == 1 and 0 or 2
     end
     local expired_registration = ready()
-    assert.are.equal("ready-hidden", expired_registration.state)
+    assert.are.equal("ready", expired_registration.state)
     assert.are.equal(0, #clock.timers)
-    assert.are.equal(1, #clock.scheduled)
+    assert.are.equal(2, #clock.scheduled)
     clock:drain()
     assert.are.equal("destroyed", expired_registration.state)
 
@@ -773,9 +989,9 @@ describe("fre ticket 19 destroy and GC", function()
       return hide_now_calls == 1 and 20 or 22
     end
     hide_all(final_hide)
-    assert.are.equal("ready-hidden", final_hide.state)
+    assert.are.equal("ready", final_hide.state)
     assert.are.equal(1, #clock.timers)
-    assert.are.equal(1, #clock.scheduled)
+    assert.are.equal(2, #clock.scheduled)
 
     final_hide:open({ position = "current" })
     clock.adapter.now = ordinary_now
@@ -784,7 +1000,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert.are.equal(30, final_hide.hidden_since)
     local current_timer = assert(final_hide._gc_timer).handle
     clock:drain()
-    assert.are.equal("ready-hidden", final_hide.state)
+    assert.are.equal("ready", final_hide.state)
     assert.are.equal(30, final_hide.hidden_since)
     clock:advance(1)
     assert.are.equal("destroyed", final_hide.state)
@@ -853,6 +1069,132 @@ describe("fre ticket 19 destroy and GC", function()
     assert.is_false(manager:is_gc_eligible(included))
     assert.is_true(vim.api.nvim_buf_is_valid(included.bufnr))
     included:destroy()
+  end)
+
+  it("counts visible members while selecting only eligible capacity victims", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 0, groups = { default = 1, project = 0 },
+    } })
+    local visible = ready()
+    visible:open({ position = "current" })
+    clock:advance(1)
+    local hidden = ready()
+
+    manager_module.default:get_gc_controller():enforce_group("default")
+
+    assert.are.equal("ready", visible.state)
+    assert.are.equal("destroyed", hidden.state)
+    assert.are.equal(visible,
+      manager_module.default.groups.default.instances[visible.id])
+  end)
+
+  it("counts creating members without selecting them for capacity destruction", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 0, groups = { default = 1, project = 0 },
+    } })
+    local pending
+    fre._set_fs_adapter({ load = function(_, done) pending = done end })
+    local creating = keep(fre.new({ root = fixture.root, columns = {} }))
+    assert.are.equal("creating", creating.state)
+    assert.is_function(pending)
+    fre._reset_fs_adapter()
+
+    local protected = ready()
+    protected:open({ position = "current" })
+    manager_module.default:get_gc_controller():enforce_group("default")
+
+    assert.are.equal("creating", creating.state)
+    assert.are.equal("ready", protected.state)
+    assert.is_false(manager_module.default:is_gc_eligible(creating))
+    assert.are.equal(2, vim.tbl_count(
+      manager_module.default:find_by_group("default")
+    ))
+  end)
+
+  it("counts load-failed members without selecting them for capacity destruction", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 0, groups = { default = 1, project = 0 },
+    } })
+    local pending
+    fre._set_fs_adapter({ load = function(_, done) pending = done end })
+    local failed = keep(fre.new({ root = fixture.root, columns = {} }))
+    fre._reset_fs_adapter()
+    pending("initial load failed")
+    wait_for(function() return failed.state == "load-failed" end)
+
+    local protected = ready()
+    protected:open({ position = "current" })
+    manager_module.default:get_gc_controller():enforce_group("default")
+
+    assert.are.equal("load-failed", failed.state)
+    assert.are.equal("ready", protected.state)
+    assert.is_false(manager_module.default:is_gc_eligible(failed))
+    assert.are.equal(2, vim.tbl_count(
+      manager_module.default:find_by_group("default")
+    ))
+  end)
+
+  it("reconsiders a hidden creating member after it becomes ready", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 0, groups = { default = 1, project = 0 },
+    } })
+    local pending
+    fre._set_fs_adapter({ load = function(_, done) pending = done end })
+    local creating = keep(fre.new({ root = fixture.root, columns = {} }))
+    fre._reset_fs_adapter()
+
+    local protected = ready()
+    protected:open({ position = "current" })
+    manager_module.default:get_gc_controller():enforce_group("default")
+    assert.are.equal("creating", creating.state)
+    assert.are.equal("ready", protected.state)
+
+    pending(nil, {}, fixture.root)
+    wait_for(function() return creating.state == "ready" end)
+    assert.are.equal("ready", creating.state)
+    assert.are.equal(2, vim.tbl_count(
+      manager_module.default:find_by_group("default")
+    ))
+
+    clock:drain()
+    assert.are.equal("destroyed", creating.state)
+    assert.are.equal("ready", protected.state)
+    assert.are.equal(1, vim.tbl_count(
+      manager_module.default:find_by_group("default")
+    ))
+    assert.are.equal(protected,
+      manager_module.default.groups.default.instances[protected.id])
+  end)
+
+  it("keeps a protected over-capacity group until an eligible victim appears", function()
+    fre.setup({ columns = {}, gc = {
+      ttl_ms = 0, include_modified = false,
+      groups = { default = 1, project = 0 },
+    } })
+    local first = ready()
+    set_modified(first, true)
+    clock:drain()
+    clock:advance(1)
+    local second = ready()
+    set_modified(second, true)
+    clock:drain()
+
+    manager_module.default:get_gc_controller():enforce_group("default")
+    assert.are.equal(2, vim.tbl_count(
+      manager_module.default:find_by_group("default")
+    ))
+    assert.are.equal("ready", first.state)
+    assert.are.equal("ready", second.state)
+
+    set_modified(second, false)
+    wait_for(function()
+      clock:drain()
+      return second.state == "destroyed"
+    end)
+    assert.are.equal("ready", first.state)
+    assert.are.equal(1, vim.tbl_count(
+      manager_module.default:find_by_group("default")
+    ))
   end)
 
   it("filters modified TTL by the snapshotted include_modified policy", function()

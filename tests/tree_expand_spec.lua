@@ -19,7 +19,7 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready-hidden" or instance.state == "ready-visible"
+    return instance.state == "ready"
       or instance.state == "load-failed"
   end)
   assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
@@ -751,6 +751,24 @@ describe("fre directory tree expansion", function()
     wait_for(function() return instance:get_pos("dir/child.txt") ~= nil end)
     assert.are.equal(2, counts[dir_path])
     assert.are.equal("loaded", dir.load_state)
+  end)
+
+  it("starts a fresh undo history after expand and collapse projections", function()
+    fixture:tree({ ["dir/file.txt"] = "x" })
+    local instance = wait_ready(keep(fre.new({ root = fixture.root })))
+
+    instance:expand("dir")
+    wait_for(function() return instance:get_pos("dir/file.txt") ~= nil end)
+    local expanded = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false)
+    vim.api.nvim_buf_call(instance.bufnr, function() vim.cmd("silent! undo") end)
+    assert.are.same(expanded, vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false))
+    assert.is_false(vim.bo[instance.bufnr].modified)
+
+    instance:collapse("dir")
+    local collapsed = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false)
+    vim.api.nvim_buf_call(instance.bufnr, function() vim.cmd("silent! undo") end)
+    assert.are.same(collapsed, vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false))
+    assert.is_false(vim.bo[instance.bufnr].modified)
   end)
 
   it("rejects expand collapse and toggle synchronously while modified without state changes", function()

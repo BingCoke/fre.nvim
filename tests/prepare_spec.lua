@@ -22,7 +22,7 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready-hidden" or instance.state == "ready-visible"
+    return instance.state == "ready"
       or instance.state == "load-failed"
   end)
   assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
@@ -471,7 +471,7 @@ describe("fre ticket 10 prepare basic mutations", function()
       bufnr = bufnr,
       root = root.path,
       root_node = root,
-      state = "ready-hidden",
+      state = "ready",
       config = { columns = {} },
       nodes_by_id = { [1] = root, [2] = a, [3] = b },
       view = {

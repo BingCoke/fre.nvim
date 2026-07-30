@@ -17,7 +17,7 @@ end
 
 local function wait_ready(instance)
   wait_for(function() return instance.state ~= "creating" end)
-  assert.are.equal("ready-hidden", instance.state)
+  assert.are.equal("ready", instance.state)
 end
 
 local function wait_terminal(execution)

@@ -187,8 +187,12 @@ function Manager:is_gc_eligible(instance)
   return self._gc:is_eligible(instance)
 end
 
-function Manager:gc_visibility_changed(instance)
-  return self._gc:visibility_changed(instance)
+function Manager:gc_presentation_enter(instance)
+  return self._gc:presentation_enter(instance)
+end
+
+function Manager:gc_presentation_leave(instance)
+  return self._gc:presentation_leave(instance)
 end
 
 function Manager:gc_reconsider(instance, deferred)

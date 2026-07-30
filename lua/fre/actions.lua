@@ -1,7 +1,9 @@
+local buffer = require("fre.buffer")
 local config = require("fre.config")
 local default_ui = require("fre.write_ui")
 local mapping = require("fre.mapping")
 local path = require("fre.path")
+local view = require("fre.view")
 local window = require("fre.window")
 
 local M = {}
@@ -70,6 +72,60 @@ local function validate_target(winid)
   return winid
 end
 
+local function validate_source(ctx, instance)
+  if type(ctx.bufnr) ~= "number" or ctx.bufnr ~= instance.bufnr
+      or type(ctx.tabpage) ~= "number" or not vim.api.nvim_tabpage_is_valid(ctx.tabpage)
+      or type(ctx.winid) ~= "number" or not vim.api.nvim_win_is_valid(ctx.winid)
+      or vim.api.nvim_win_get_tabpage(ctx.winid) ~= ctx.tabpage
+      or vim.api.nvim_win_get_buf(ctx.winid) ~= instance.bufnr then
+    fail("action context source is no longer valid", 4)
+  end
+end
+
+local function capture_target(instance, winid)
+  validate_target(winid)
+  return {
+    winid = winid,
+    tabpage = vim.api.nvim_win_get_tabpage(winid),
+    bufnr = vim.api.nvim_win_get_buf(winid),
+    owner = view.owner(instance.manager, winid),
+  }
+end
+
+local function recheck_target(instance, captured)
+  validate_target(captured.winid)
+  if vim.api.nvim_win_get_tabpage(captured.winid) ~= captured.tabpage
+      or vim.api.nvim_win_get_buf(captured.winid) ~= captured.bufnr
+      or view.owner(instance.manager, captured.winid) ~= captured.owner then
+    fail("target window changed during selection preparation", 4)
+  end
+end
+
+local function split_anchor(ctx, explicit)
+  local anchor = explicit
+  if anchor == nil then
+    if vim.api.nvim_win_get_config(ctx.winid).relative ~= "" then
+      fail("split_select.anchor_winid is required for a float source", 4)
+    end
+    anchor = ctx.winid
+  end
+  if type(anchor) ~= "number" or anchor % 1 ~= 0
+      or not vim.api.nvim_win_is_valid(anchor)
+      or vim.api.nvim_win_get_tabpage(anchor) ~= ctx.tabpage
+      or vim.api.nvim_win_get_config(anchor).relative ~= "" then
+    fail("split anchor window must be an exact ordinary window in the source tab", 4)
+  end
+  return anchor
+end
+
+local function recheck_anchor(ctx, anchor)
+  if not vim.api.nvim_win_is_valid(anchor)
+      or vim.api.nvim_win_get_tabpage(anchor) ~= ctx.tabpage
+      or vim.api.nvim_win_get_config(anchor).relative ~= "" then
+    fail("split anchor window is no longer valid", 4)
+  end
+end
+
 local function expanded_under(instance, root)
   local result = {}
   for _, expanded_path in ipairs(instance:_active_expanded_paths()) do
@@ -103,11 +159,15 @@ local function selection_target(ctx, instance)
   return { kind = "file", path = entry.absolute_path, entry = entry }
 end
 
-local function child_options(instance, overrides, target)
-  if overrides == nil then overrides = {} end
+local function preflight_child_options(overrides)
+  if overrides == nil then return {} end
   if type(overrides) ~= "table" then fail("opts.instance must be a table", 4) end
   if overrides.root ~= nil then fail("opts.instance.root is action-owned", 4) end
-  local result = config.copy(overrides)
+  return overrides
+end
+
+local function child_options(instance, overrides, target)
+  local result = config.copy(preflight_child_options(overrides))
   if result.sort == nil then result.sort = instance.current_sort end
   if result.hidden_file == nil then result.hidden_file = instance.current_hidden_file end
   result.expanded = config.copy(target.expanded or {})
@@ -135,14 +195,81 @@ local function cleanup_file_buffer(bufnr, created)
   end
 end
 
-local function replace_with_file(source, target, filename)
-  local bufnr, created = file_buffer(filename)
-  local ok, err = pcall(window.replace_buffer, source, target, bufnr)
-  if not ok then
-    cleanup_file_buffer(bufnr, created)
-    error(err, 0)
+local function validate_selection_options(opts, target, name)
+  if opts.hide_source ~= nil and type(opts.hide_source) ~= "boolean" then
+    fail(name .. ".hide_source must be a boolean", 4)
   end
-  return bufnr
+  if target.kind == "file" and opts.instance ~= nil then
+    fail(name .. ".instance is only valid for directory selections", 4)
+  end
+  if opts.instance ~= nil then preflight_child_options(opts.instance) end
+  return opts.hide_source or false
+end
+
+local function prepare_selection(instance, target, overrides)
+  if target.kind == "file" then
+    local bufnr, created = file_buffer(target.path)
+    return { kind = "file", bufnr = bufnr, created = created }
+  end
+  local options = child_options(instance, overrides, target)
+  return {
+    kind = "child",
+    child = instance.manager:create_instance(options),
+  }
+end
+
+local function cleanup_prepared(prepared)
+  if not prepared then return nil end
+  if prepared.kind == "file" then
+    cleanup_file_buffer(prepared.bufnr, prepared.created)
+    return nil
+  end
+  local ok, err = pcall(prepared.child.destroy, prepared.child)
+  return ok and nil or err
+end
+
+local function precommit_error(prepared, err)
+  local cleanup_err = cleanup_prepared(prepared)
+  if cleanup_err then
+    err = tostring(err) .. "; selection cleanup failed: " .. tostring(cleanup_err)
+  end
+  error(err, 0)
+end
+
+local function install_selection(instance, prepared, captured)
+  recheck_target(instance, captured)
+  if prepared.kind == "file" then
+    window.replace_buffer(instance, captured.winid, prepared.bufnr)
+    return nil
+  end
+  return window.install(prepared.child, captured.winid)
+end
+
+local function commit_ownership(target, prepared, captured, previous, destination)
+  if prepared.kind == "file" then
+    if captured.owner then view.detach(captured.owner, captured.winid) end
+    return prepared.bufnr
+  end
+  local child = prepared.child
+  if captured.owner then
+    view.transfer(captured.owner, child, captured.winid)
+  elseif destination then
+    view.adopt_created(
+      child, captured.winid, destination.layout, destination.origin_winid
+    )
+  else
+    view.adopt(child, captured.winid, previous.bufnr)
+  end
+  buffer.place_initial_cursor(child, captured.winid)
+  if target.cursor then child:set_cursor_to_path(target.cursor, captured.winid) end
+  return child
+end
+
+local function finish_select(ctx, instance, target_winid, hide_source)
+  vim.api.nvim_set_current_win(target_winid)
+  if hide_source and view.select(instance, ctx.tabpage) == ctx.winid then
+    instance:hidden(ctx.tabpage)
+  end
 end
 
 local function restore_caller(tabpage, winid)
@@ -152,40 +279,6 @@ local function restore_caller(tabpage, winid)
   if vim.api.nvim_win_is_valid(winid) then pcall(vim.api.nvim_set_current_win, winid) end
 end
 
-local function snapshot_tabs()
-  local result = {}
-  for _, tabpage in ipairs(vim.api.nvim_list_tabpages()) do result[tabpage] = true end
-  return result
-end
-
-local function snapshot_buffers()
-  local result = {}
-  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do result[bufnr] = true end
-  return result
-end
-
-local function remove_created_tabs(before, buffers_before, caller_tab, caller_win)
-  local created = {}
-  for _, tabpage in ipairs(vim.api.nvim_list_tabpages()) do
-    if not before[tabpage] then created[#created + 1] = tabpage end
-  end
-  table.sort(created, function(left, right)
-    return vim.api.nvim_tabpage_get_number(left) > vim.api.nvim_tabpage_get_number(right)
-  end)
-  for _, tabpage in ipairs(created) do
-    if vim.api.nvim_tabpage_is_valid(tabpage) then
-      local number = vim.api.nvim_tabpage_get_number(tabpage)
-      pcall(vim.cmd, "noautocmd " .. tostring(number) .. "tabclose!")
-    end
-  end
-  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-    if not buffers_before[bufnr] and vim.api.nvim_buf_is_valid(bufnr)
-        and #vim.fn.win_findbuf(bufnr) == 0 then
-      pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
-    end
-  end
-  restore_caller(caller_tab, caller_win)
-end
 
 function M.context()
   return mapping.context()
@@ -272,104 +365,108 @@ end
 function M.refresh(ctx, opts)
   no_options(opts, "refresh")
   local instance = instance_from(ctx)
-  if not vim.bo[instance.bufnr].modified then return instance:refresh() end
-  local delivered = false
-  return M.confirm(ctx, { "Discard changes and refresh?" }, function(accepted)
-    if delivered then return end
-    delivered = true
-    if accepted == true then instance:refresh({ force = true }) end
-  end)
+  if vim.bo[instance.bufnr].modified then
+    return instance:refresh({ force = true })
+  end
+  return instance:refresh()
 end
 
 function M.select(ctx, opts)
   local instance = instance_from(ctx)
-  opts = exact_opts(opts, { target_winid = true, instance = true }, "select")
-  local target_winid = validate_target(opts.target_winid or ctx.winid)
+  opts = exact_opts(opts, {
+    target_winid = true, hide_source = true, instance = true,
+  }, "select")
   local target = selection_target(ctx, instance)
+  local hide_source = validate_selection_options(opts, target, "select")
+  validate_source(ctx, instance)
+  local captured = capture_target(instance, opts.target_winid or ctx.winid)
   if target.kind == "noop" then return nil end
-  if target.kind == "file" then
-    return replace_with_file(instance, target_winid, target.path)
-  end
 
-  local prepared = child_options(instance, opts.instance, target)
-  local child = instance.manager:create_instance(prepared)
-  local ok, err = pcall(window.replace, child, target_winid)
-  if not ok then
-    pcall(child.destroy, child)
-    error(err, 0)
-  end
-  window.sync_visibility(instance)
-  child:_on_visibility_enter()
-  if target.cursor then child:set_cursor_to_path(target.cursor, target_winid) end
-  return child
+  local prepared = prepare_selection(instance, target, opts.instance)
+  local installed, previous = pcall(install_selection, instance, prepared, captured)
+  if not installed then precommit_error(prepared, previous) end
+  local result = commit_ownership(target, prepared, captured, previous)
+  finish_select(ctx, instance, captured.winid, hide_source)
+  return result
 end
 
 function M.tab_select(ctx, opts)
   local instance = instance_from(ctx)
-  opts = exact_opts(opts, { instance = true }, "tab_select")
-  validate_target(ctx.winid)
+  opts = exact_opts(opts, { hide_source = true, instance = true }, "tab_select")
   local target = selection_target(ctx, instance)
+  local hide_source = validate_selection_options(opts, target, "tab_select")
+  validate_source(ctx, instance)
   if target.kind == "noop" then return nil end
-  local caller_tab = vim.api.nvim_get_current_tabpage()
-  local caller_win = vim.api.nvim_get_current_win()
-  local tabs_before = snapshot_tabs()
-  local buffers_before = snapshot_buffers()
-  local child
-  if target.kind == "directory" then
-    local prepared = child_options(instance, opts.instance, target)
-    child = instance.manager:create_instance(prepared)
-  end
-  local file_bufnr
-  local file_created
-  local ok, result = pcall(function()
-    vim.cmd("tabnew")
-    local target_winid = vim.api.nvim_get_current_win()
-    if child then
-      window.replace(child, target_winid)
-      child:_on_visibility_enter()
-      if target.cursor then child:set_cursor_to_path(target.cursor, target_winid) end
-      return child
-    end
-    file_bufnr, file_created = file_buffer(target.path)
-    vim.api.nvim_win_set_buf(target_winid, file_bufnr)
-    return file_bufnr
+
+  local prepared = prepare_selection(instance, target, opts.instance)
+  local created_tab
+  local target_winid
+  local destination_bufnr
+  local captured
+  local installed, previous = pcall(function()
+    validate_source(ctx, instance)
+    created_tab, target_winid, destination_bufnr = window.create_tab()
+    validate_source(ctx, instance)
+    captured = capture_target(instance, target_winid)
+    local snapshot = install_selection(instance, prepared, captured)
+    window.discard_buffer(destination_bufnr)
+    return snapshot
   end)
-  if not ok then
-    if child then pcall(child.destroy, child) end
-    remove_created_tabs(tabs_before, buffers_before, caller_tab, caller_win)
-    cleanup_file_buffer(file_bufnr, file_created)
-    error(result, 0)
+  if not installed then
+    if created_tab then window.close_tab(created_tab) end
+    restore_caller(ctx.tabpage, ctx.winid)
+    precommit_error(prepared, previous)
   end
+
+  local result = commit_ownership(target, prepared, captured, previous, {
+    layout = { position = "current" },
+    origin_winid = ctx.winid,
+  })
+  finish_select(ctx, instance, target_winid, hide_source)
   return result
 end
 
 function M.split_select(ctx, opts)
   local instance = instance_from(ctx)
-  opts = exact_opts(opts, { layout = true, instance = true }, "split_select")
-  validate_target(ctx.winid)
+  opts = exact_opts(opts, {
+    layout = true, anchor_winid = true, hide_source = true, instance = true,
+  }, "split_select")
   if opts.layout == nil then fail("split_select.layout is required", 3) end
   local target = selection_target(ctx, instance)
+  local hide_source = validate_selection_options(opts, target, "split_select")
+  validate_source(ctx, instance)
+  local anchor = split_anchor(ctx, opts.anchor_winid)
+  local normalized, effective = window.prepare_split(opts.layout, anchor)
   if target.kind == "noop" then return nil end
-  window.prepare_split(opts.layout)
-  if target.kind == "directory" then
-    local prepared = child_options(instance, opts.instance, target)
-    local child = instance.manager:create_instance(prepared)
-    local ok, result, winid = pcall(child.open, child, config.copy(opts.layout))
-    if not ok then
-      pcall(child.destroy, child)
-      error(result, 0)
-    end
-    if target.cursor then child:set_cursor_to_path(target.cursor, winid) end
-    return child
+
+  local prepared = prepare_selection(instance, target, opts.instance)
+  local target_winid
+  local destination_bufnr
+  local captured
+  local installed, previous = pcall(function()
+    validate_source(ctx, instance)
+    recheck_anchor(ctx, anchor)
+    normalized, effective = window.prepare_split(normalized, anchor)
+    target_winid, destination_bufnr = window.create_split(normalized, effective, anchor)
+    validate_source(ctx, instance)
+    recheck_anchor(ctx, anchor)
+    captured = capture_target(instance, target_winid)
+    local snapshot = install_selection(instance, prepared, captured)
+    window.discard_buffer(destination_bufnr)
+    return snapshot
+  end)
+  if not installed then
+    if target_winid then window.close_window(target_winid) end
+    restore_caller(ctx.tabpage, ctx.winid)
+    precommit_error(prepared, previous)
   end
 
-  local bufnr, created = file_buffer(target.path)
-  local ok, result = pcall(window.split_buffer, bufnr, config.copy(opts.layout))
-  if not ok then
-    cleanup_file_buffer(bufnr, created)
-    error(result, 0)
-  end
-  return bufnr
+  local result = commit_ownership(target, prepared, captured, previous, {
+    layout = normalized,
+    origin_winid = anchor,
+  })
+  finish_select(ctx, instance, target_winid, hide_source)
+  return result
 end
 
 function M.destroy(ctx, opts)

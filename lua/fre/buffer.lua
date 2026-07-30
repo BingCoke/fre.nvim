@@ -1,5 +1,7 @@
 local row = require("fre.row")
+local path = require("fre.path")
 local window = require("fre.window")
+local view = require("fre.view")
 
 local M = {}
 
@@ -119,58 +121,164 @@ local function set_lines_raw(instance, first, last, lines)
   return true
 end
 
-local function capture_windows(instance)
+local function clear_undo_history(instance)
+  local bufnr = instance.bufnr
+  local was_modifiable = vim.bo[bufnr].modifiable
+  local undolevels = vim.bo[bufnr].undolevels
+  local ok, err = pcall(function()
+    vim.bo[bufnr].modifiable = true
+    vim.bo[bufnr].undolevels = -1
+    local line_count = vim.api.nvim_buf_line_count(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, line_count, line_count, false, { "" })
+    vim.api.nvim_buf_set_lines(bufnr, line_count, line_count + 1, false, {})
+    vim.bo[bufnr].modified = false
+  end)
+  local undo_ok, undo_err = pcall(function()
+    vim.bo[bufnr].undolevels = undolevels
+  end)
+  local modifiable_ok, modifiable_err = pcall(function()
+    vim.bo[bufnr].modifiable = was_modifiable
+  end)
+  if not ok then error(err, 0) end
+  if not undo_ok then error(undo_err, 0) end
+  if not modifiable_ok then error(modifiable_err, 0) end
+end
+
+local function managed_windows(instance)
+  local tabpages = {}
+  for tabpage in pairs(instance._views or {}) do tabpages[#tabpages + 1] = tabpage end
   local windows = {}
-  for _, winid in ipairs(vim.fn.win_findbuf(instance.bufnr)) do
-    if vim.api.nvim_win_is_valid(winid)
-        and vim.api.nvim_win_get_buf(winid) == instance.bufnr then
-      local view = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
-      local cursor = vim.api.nvim_win_get_cursor(winid)
-      local line = get_line(instance, cursor[1]) or ""
-      local ok, decoded = pcall(
-        row.decode, instance, cursor[1], line,
-        { allow_empty_path = true, validate_metadata = false }
-      )
-      local node_id, anchor
-      if ok and decoded and decoded.marked then
-        anchor = row.cursor_anchor(decoded, cursor[2])
-        if not decoded.synthetic and decoded.instance_id == instance.id then
-          node_id = decoded.node_id
-        end
-      end
-      windows[winid] = {
-        view = view,
-        cursor = cursor,
-        node_id = node_id,
-        anchor = anchor,
-      }
-    end
+  for _, tabpage in ipairs(tabpages) do
+    local ok, winid = pcall(view.select, instance, tabpage)
+    if ok and winid then windows[winid] = tabpage end
   end
   return windows
 end
 
-local function restore_windows(instance, windows, rows_by_id, exact)
+local function capture_windows(instance)
+  local windows = {}
+  for winid in pairs(managed_windows(instance)) do
+    pcall(function()
+      local saved_view = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
+      local cursor = vim.api.nvim_win_get_cursor(winid)
+      windows[winid] = { view = saved_view, cursor = cursor }
+    end)
+  end
+  return windows
+end
+
+local function navigation_path(instance)
+  return path.parent(instance.root) or instance.root
+end
+
+local function ancestor_paths(instance, absolute_path)
+  local result = { absolute_path }
+  local current = absolute_path
+  while path.contains(instance.root, current) and not path.equal(current, instance.root) do
+    current = path.parent(current)
+    if not current then break end
+    result[#result + 1] = current
+  end
+  return result
+end
+
+local function capture_view_cursors(instance)
+  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return {} end
+  local baseline = instance.view and instance.view.baseline or {}
+  local snapshots = {}
+  for winid, tabpage in pairs(managed_windows(instance)) do
+    pcall(function()
+      local saved_view = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
+      local cursor = vim.api.nvim_win_get_cursor(winid)
+      local line = get_line(instance, cursor[1])
+      local decoded = row.decode_marker(instance.manager, cursor[1], line)
+      if decoded.instance_id ~= instance.id then return end
+      local semantic_ok, semantic = pcall(row.decode, instance, cursor[1], line, {
+        allow_empty_path = true,
+        validate_metadata = false,
+      })
+      local anchor
+      if semantic_ok and semantic and semantic.marked then
+        anchor = row.cursor_anchor(semantic, cursor[2])
+      end
+      local is_navigation = decoded.node_id == 0
+      local absolute_path = is_navigation
+        and navigation_path(instance) or baseline[decoded.node_id]
+      if type(absolute_path) ~= "string" or absolute_path == "" then return end
+      snapshots[#snapshots + 1] = {
+        winid = winid,
+        tabpage = tabpage,
+        navigation = is_navigation,
+        paths = ancestor_paths(instance, absolute_path),
+        old_row = cursor[1],
+        old_topline = saved_view.topline,
+        column = cursor[2],
+        anchor = anchor,
+        view = saved_view,
+      }
+    end)
+  end
+  return snapshots
+end
+
+local function restore_view_cursors(instance, snapshots, prepared)
   if not vim.api.nvim_buf_is_valid(instance.bufnr) then return end
   local count = vim.api.nvim_buf_line_count(instance.bufnr)
-  for winid, saved in pairs(windows or {}) do
-    if vim.api.nvim_win_is_valid(winid)
-        and vim.api.nvim_win_get_buf(winid) == instance.bufnr then
-      local row_number = saved.cursor[1]
-      if not exact and saved.node_id and rows_by_id[saved.node_id] then
-        row_number = rows_by_id[saved.node_id]
+  if count < 1 then return end
+  local rows_by_path = {}
+  local row_offset = prepared.row_offset or 0
+  local visible_nodes = prepared.visible_nodes or {}
+  for index, node in ipairs(visible_nodes) do
+    if type(node.path) == "string" and rows_by_path[node.path] == nil then
+      rows_by_path[node.path] = index + row_offset
+    end
+  end
+  local first_entry_row
+  if visible_nodes[1] then
+    local candidate = row_offset + 1
+    local decoded_ok, decoded = pcall(M.decode, instance, candidate)
+    if decoded_ok and decoded and decoded.row_kind == "entry"
+        and decoded.instance_id == instance.id then
+      first_entry_row = candidate
+    end
+  end
+  local navigation_row
+  if row_offset > 0 then
+    local decoded_ok, decoded = pcall(M.decode, instance, 1)
+    if decoded_ok and decoded and decoded.row_kind == "navigation"
+        and decoded.instance_id == instance.id then
+      navigation_row = 1
+    end
+  end
+  for _, saved in ipairs(snapshots or {}) do
+    local natural_view
+    local ok = pcall(function()
+      local selected = view.select(instance, saved.tabpage)
+      if selected ~= saved.winid or not vim.api.nvim_win_is_valid(saved.winid)
+          or vim.api.nvim_win_get_buf(saved.winid) ~= instance.bufnr then return end
+      local row_number
+      if saved.navigation then
+        row_number = navigation_row
+      else
+        for _, absolute_path in ipairs(saved.paths or {}) do
+          row_number = rows_by_path[absolute_path]
+          if row_number then break end
+        end
+        row_number = row_number or first_entry_row
       end
+      if not row_number then return end
       row_number = math.max(1, math.min(row_number, count))
       local line = vim.api.nvim_buf_get_lines(
         instance.bufnr, row_number - 1, row_number, false
       )[1] or ""
-      local col = math.max(0, math.min(saved.cursor[2], #line))
+      local col = math.max(0, math.min(saved.column or 0, #line))
       local semantic_mapped = false
       if saved.anchor then
-        local ok, decoded = pcall(row.decode, instance, row_number, line, {
+        local decoded_ok, decoded = pcall(row.decode, instance, row_number, line, {
           allow_empty_path = true,
           validate_metadata = false,
         })
-        if ok and decoded and decoded.marked then
+        if decoded_ok and decoded and decoded.marked then
           local mapped_col = row.cursor_column(decoded, saved.anchor)
           if mapped_col ~= nil then
             col = mapped_col
@@ -179,22 +287,50 @@ local function restore_windows(instance, windows, rows_by_id, exact)
         end
       end
       col = math.max(0, math.min(col, #line))
-      local view = vim.deepcopy(saved.view)
-      local delta = row_number - saved.cursor[1]
-      view.lnum = row_number
-      view.col = col
-      if not exact then view.topline = (view.topline or 1) + delta end
-      view.topline = math.max(1, math.min(view.topline or 1, count))
-      pcall(vim.api.nvim_win_call, winid, function()
+      vim.api.nvim_win_call(saved.winid, function()
+        natural_view = vim.fn.winsaveview()
+        vim.api.nvim_win_set_cursor(0, { row_number, col })
+        local restored = vim.deepcopy(saved.view)
+        restored.lnum = row_number
+        restored.col = col
+        restored.topline = math.max(1, math.min(
+          (saved.old_topline or 1) + row_number - saved.old_row, count
+        ))
         if semantic_mapped then
-          vim.api.nvim_win_set_cursor(0, { row_number, col })
-          view.coladd = 0
-          view.curswant = vim.fn.winsaveview().curswant
+          restored.coladd = 0
+          restored.curswant = vim.fn.winsaveview().curswant
         end
-        vim.fn.winrestview(view)
+        vim.fn.winrestview(restored)
+        M.constrain_cursor(instance, saved.winid)
       end)
-      M.constrain_cursor(instance, winid)
+    end)
+    if not ok and natural_view then
+      pcall(vim.api.nvim_win_call, saved.winid, function()
+        vim.fn.winrestview(natural_view)
+      end)
     end
+  end
+end
+
+local function restore_windows(instance, windows)
+  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return end
+  for winid, saved in pairs(windows or {}) do
+    pcall(function()
+      if not vim.api.nvim_win_is_valid(winid)
+          or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return end
+      local selected = view.select(instance, vim.api.nvim_win_get_tabpage(winid))
+      if selected ~= winid then return end
+      local count = vim.api.nvim_buf_line_count(instance.bufnr)
+      local row_number = math.max(1, math.min(saved.cursor[1], count))
+      local line = vim.api.nvim_buf_get_lines(
+        instance.bufnr, row_number - 1, row_number, false
+      )[1] or ""
+      local restored = vim.deepcopy(saved.view)
+      restored.lnum = row_number
+      restored.col = math.max(0, math.min(saved.cursor[2], #line))
+      restored.topline = math.max(1, math.min(restored.topline or 1, count))
+      vim.api.nvim_win_call(winid, function() vim.fn.winrestview(restored) end)
+    end)
   end
 end
 
@@ -246,12 +382,14 @@ function M.restore(instance, snapshot)
   for node, mark in pairs(snapshot.node_extmarks) do node.row_extmark = mark end
   vim.bo[instance.bufnr].modified = snapshot.modified
   vim.bo[instance.bufnr].modifiable = snapshot.modifiable
-  restore_windows(instance, snapshot.windows, nil, true)
+  restore_windows(instance, snapshot.windows)
   return true
 end
 
 function M.commit(instance, prepared)
   if not vim.api.nvim_buf_is_valid(instance.bufnr) then return false end
+  local captured, cursor_snapshots = pcall(capture_view_cursors, instance)
+  if not captured then cursor_snapshots = {} end
   local snapshot = M.snapshot(instance)
   local previous_view = instance.view or {}
   local old_nodes = {}
@@ -293,12 +431,10 @@ function M.commit(instance, prepared)
 
     vim.api.nvim_buf_clear_namespace(instance.bufnr, row_namespace, 0, -1)
     for _, node in ipairs(old_nodes) do node.row_extmark = nil end
-    local rows_by_id = {}
     local row_offset = prepared.row_offset or 0
     for row, node in ipairs(prepared.visible_nodes) do
       local buffer_row = row + row_offset
       set_node_extmark(instance, node, buffer_row)
-      rows_by_id[node.id] = buffer_row
     end
     vim.api.nvim_buf_clear_namespace(instance.bufnr, highlight_namespace, 0, -1)
     for _, highlight in ipairs(prepared.highlights or {}) do
@@ -324,7 +460,7 @@ function M.commit(instance, prepared)
       projection_generation = (previous_view.projection_generation or 0) + 1,
     }
     vim.bo[instance.bufnr].modified = false
-    restore_windows(instance, snapshot.windows, rows_by_id, false)
+    pcall(restore_view_cursors, instance, cursor_snapshots, prepared)
     local pending = {}
     for winid in pairs(instance._pending_initial_cursor or {}) do
       pending[#pending + 1] = winid
@@ -332,6 +468,7 @@ function M.commit(instance, prepared)
     for _, winid in ipairs(pending) do M.place_initial_cursor(instance, winid) end
     instance._marker_width_stale = prepared.marker_generation
       < instance.manager:get_marker_widths().generation
+    clear_undo_history(instance)
     return true
   end)
   if not ok or result == false then
@@ -545,31 +682,25 @@ function M.setup(instance)
     end,
   })
 
-  vim.api.nvim_create_autocmd("BufEnter", {
-    group = instance._buffer_augroup, buffer = instance.bufnr,
-    callback = function()
-      if not instance._window_transition then instance:_on_visibility_enter() end
-    end,
-  })
   vim.api.nvim_create_autocmd("BufWinEnter", {
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function()
-      if instance._window_transition then return end
       local winid = vim.api.nvim_get_current_win()
       window.apply(instance, winid)
       M.place_initial_cursor(instance, winid)
-      instance:_on_visibility_enter()
-      if instance._pending_reveal then instance:_apply_pending_reveal(winid) end
     end,
   })
-  vim.api.nvim_create_autocmd("BufWinLeave", {
+  vim.api.nvim_create_autocmd({ "WinLeave", "BufWinLeave", "BufHidden" }, {
     group = instance._buffer_augroup, buffer = instance.bufnr,
     callback = function()
       local winid = vim.api.nvim_get_current_win()
       if instance._pending_initial_cursor then
         instance._pending_initial_cursor[winid] = nil
       end
-      vim.schedule(function() window.sync_visibility(instance) end)
+      vim.schedule(function()
+        if instance._destroyed then return end
+        view.prune(instance)
+      end)
     end,
   })
   vim.api.nvim_create_autocmd("BufModifiedSet", {

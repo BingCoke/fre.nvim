@@ -20,7 +20,7 @@ local function ready(entries)
   fixture:tree(entries or {})
   local instance = keep(fre.new({ root = fixture.root, columns = {} }))
   wait_for(function()
-    return instance.state == "ready-hidden" or instance.state == "ready-visible"
+    return instance.state == "ready"
       or instance.state == "load-failed"
   end)
   assert.are_not.equal("load-failed", instance.state, tostring(instance.error))

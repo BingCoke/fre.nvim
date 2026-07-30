@@ -54,7 +54,7 @@ function Controller:_registered(instance)
   return group ~= nil and group.instances[instance.id] == instance
 end
 
-function Controller:is_visible(instance)
+function Controller:_buffer_is_visible(instance)
   if not self:_registered(instance) or type(instance.bufnr) ~= "number"
       or not vim.api.nvim_buf_is_valid(instance.bufnr) then
     return false
@@ -69,19 +69,11 @@ function Controller:is_visible(instance)
 end
 
 function Controller:is_eligible(instance)
-  if not self:_registered(instance) or not vim.api.nvim_buf_is_valid(instance.bufnr) then
+  if not self:_registered(instance) or instance.state ~= "ready"
+      or instance.hidden_since == nil
+      or not vim.api.nvim_buf_is_valid(instance.bufnr)
+      or self:_buffer_is_visible(instance) then
     return false
-  end
-  if self:is_visible(instance) then
-    if instance.hidden_since ~= nil or instance._gc_timer ~= nil then
-      instance.hidden_since = nil
-      self:_invalidate_timer(instance)
-    end
-    return false
-  end
-  if instance.hidden_since == nil then
-    instance.hidden_since = self:_now()
-    self:_arm(instance)
   end
   if instance.actions and instance.actions.write then return false end
   if instance._execution and not mutation_execute.is_terminal(instance._execution) then
@@ -195,34 +187,32 @@ function Controller:on_register(instance)
   self:enforce_group(instance.config.gc.group, instance)
 end
 
-function Controller:visibility_changed(instance)
+function Controller:presentation_enter(instance)
   if not self:_registered(instance) then return false end
-  local visible = self:is_visible(instance)
-  if visible then
-    if instance.hidden_since ~= nil or instance._gc_timer ~= nil then
-      instance.hidden_since = nil
-      self:_invalidate_timer(instance)
-    end
-    return true
+  if instance.hidden_since ~= nil or instance._gc_timer ~= nil then
+    instance.hidden_since = nil
+    self:_invalidate_timer(instance)
   end
-  if instance.hidden_since == nil then
-    instance.hidden_since = self:_now()
-    self:_arm(instance)
-    self:enforce_group(instance.config.gc.group)
-  end
-  return false
+  return true
+end
+
+function Controller:presentation_leave(instance)
+  if not self:_registered(instance) then return false end
+  if instance.hidden_since == nil then instance.hidden_since = self:_now() end
+  if instance._gc_timer == nil then self:_arm(instance) end
+  self:enforce_group(instance.config.gc.group)
+  return true
 end
 
 function Controller:reconsider(instance)
-  if not self:_registered(instance) then return false end
-  if self:visibility_changed(instance) then return false end
+  if not self:_registered(instance) or instance.hidden_since == nil then return false end
   local eligible = self:is_eligible(instance)
   local ttl = instance.config.gc.ttl_ms
-  if ttl > 0 and instance.hidden_since ~= nil then
+  if ttl > 0 then
     local remaining = instance.hidden_since + ttl - self:_now()
     if eligible and remaining <= 0 then
-      instance:destroy()
-      return true
+      if self:is_eligible(instance) then instance:destroy() end
+      return instance.state == "destroyed"
     end
     if remaining > 0 and instance._gc_timer == nil then self:_arm(instance) end
   end
@@ -237,7 +227,14 @@ function Controller:defer_reconsider(instance)
   local ok, err = pcall(self.adapter.schedule, function()
     if not self:_registered(instance)
         or instance._gc_reconsider_generation ~= generation then return end
-    self:reconsider(instance)
+    local reconsidered, reconsider_err = pcall(self.reconsider, self, instance)
+    if reconsidered then return end
+    local message = "GC reconsideration failed: " .. tostring(reconsider_err)
+    if type(instance._report_async_error) == "function" then
+      pcall(instance._report_async_error, instance, message)
+    else
+      pcall(vim.notify, "fre: " .. message, vim.log.levels.ERROR)
+    end
   end)
   if not ok then
     pcall(vim.notify, "fre: GC scheduling failed: " .. tostring(err), vim.log.levels.ERROR)
@@ -262,20 +259,29 @@ function Controller:_eligible_group(group_name)
   return result
 end
 
+local function group_size(group)
+  local count = 0
+  for _ in pairs(group.instances) do count = count + 1 end
+  return count
+end
+
 function Controller:enforce_group(group_name, protected)
   local group = self.manager.groups[group_name]
   if not group or group.capacity == 0 or self.enforcing[group_name] then return end
   self.enforcing[group_name] = true
   local ok, err = pcall(function()
-    while true do
+    while group_size(group) > group.capacity do
       local eligible = self:_eligible_group(group_name)
-      if #eligible <= group.capacity then break end
       local candidate
       for _, instance in ipairs(eligible) do
         if instance ~= protected then candidate = instance; break end
       end
       if not candidate then break end
-      candidate:destroy()
+      if self:is_eligible(candidate) then
+        candidate:destroy()
+      else
+        break
+      end
     end
   end)
   self.enforcing[group_name] = nil

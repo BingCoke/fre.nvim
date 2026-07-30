@@ -19,7 +19,7 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready-hidden" or instance.state == "ready-visible"
+    return instance.state == "ready"
       or instance.state == "load-failed"
   end)
   assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
@@ -268,7 +268,7 @@ describe("fre ticket 08 atomic refresh", function()
     creating.state = "destroying"
     assert.is_truthy(error_text(function() creating:refresh() end):find("destroyed", 1, true))
     assert.are.equal(2, calls)
-    creating.state = "ready-hidden"
+    creating.state = "ready"
 
     creating:destroy()
     assert.is_truthy(error_text(function() creating:refresh() end):find("destroyed", 1, true))
@@ -281,6 +281,7 @@ describe("fre ticket 08 atomic refresh", function()
       load = function(_, done) callbacks[#callbacks + 1] = done end,
     })
     local instance = keep(fre.new({ root = fixture.root }))
+    assert.are.same({ "" }, lines(instance))
     callbacks[1]("initial failed")
     wait_for(function() return instance.state == "load-failed" end)
     local callback_count, callback_error = 0
@@ -289,9 +290,9 @@ describe("fre ticket 08 atomic refresh", function()
       callback_error = err
     end })
     assert.are.equal("creating", instance.state)
-    assert.is_truthy(lines(instance)[1]:find("Loading", 1, true))
+    assert.are.same({ "" }, lines(instance))
     callbacks[2](nil, { { name = "ok.txt", kind = "file" } }, fixture.root)
-    wait_for(function() return callback_count == 1 and instance.state == "ready-hidden" end)
+    wait_for(function() return callback_count == 1 and instance.state == "ready" end)
     assert.is_nil(callback_error)
     assert.are.same({ "ok.txt" }, projected_paths(instance))
     assert.is_false(instance.needs_refresh)
@@ -339,6 +340,10 @@ describe("fre ticket 08 atomic refresh", function()
     assert.are.same({ "a.txt", "b.txt" }, projected_paths(instance))
     assert.is_false(vim.bo[instance.bufnr].modified)
     assert.is_false(instance.needs_refresh)
+    local committed = lines(instance)
+    vim.api.nvim_buf_call(instance.bufnr, function() vim.cmd("silent! undo") end)
+    assert.are.same(committed, lines(instance))
+    assert.is_false(vim.bo[instance.bufnr].modified)
   end)
 
   it("scans root and only the active expanded ancestor chains", function()
@@ -455,36 +460,36 @@ describe("fre ticket 08 atomic refresh", function()
     assert.are.same({ "cached/", "dir/", "dir/keep.txt", "dir/new.txt" }, projected_paths(instance))
   end)
 
-  it("preserves stable cursor targets in every valid window across tabs", function()
+  it("preserves stable cursor targets in managed active Views across tabs", function()
     local entries = {}
     for index = 1, 30 do entries[string.format("item-%02d.txt", index)] = tostring(index) end
     local instance = ready(entries)
     instance:open()
     local first = vim.api.nvim_get_current_win()
-    vim.cmd("vsplit")
-    local second = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_cursor(first, instance:get_pos("item-10.txt"))
-    vim.api.nvim_win_set_cursor(second, instance:get_pos("item-20.txt"))
     vim.api.nvim_win_call(first, function() vim.cmd("normal! zt") end)
-    vim.api.nvim_win_call(second, function() vim.cmd("normal! zz") end)
+
     vim.cmd("tabnew")
     instance:open()
-    local third = vim.api.nvim_get_current_win()
-    vim.api.nvim_win_set_cursor(third, instance:get_pos("item-30.txt"))
-    vim.api.nvim_win_call(third, function() vim.cmd("normal! zb") end)
+    local second = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_cursor(second, instance:get_pos("item-30.txt"))
+    vim.api.nvim_win_call(second, function() vim.cmd("normal! zb") end)
+    local focused_tab = vim.api.nvim_get_current_tabpage()
+    local focused_win = vim.api.nvim_get_current_win()
 
     fixture:write("item-00.txt", "zero")
     assert.is_nil(complete_refresh(instance))
-    local expected = {
-      [first] = "item-10.txt", [second] = "item-20.txt", [third] = "item-30.txt",
-    }
+    local expected = { [first] = "item-10.txt", [second] = "item-30.txt" }
     for winid, name in pairs(expected) do
       assert.is_true(vim.api.nvim_win_is_valid(winid))
       local cursor = vim.api.nvim_win_get_cursor(winid)
       assert.are.equal(name, assert(buffer.decode(instance, cursor[1])).entry.name)
-      local view = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
-      assert.is_true(view.topline >= 1 and view.topline <= vim.api.nvim_buf_line_count(instance.bufnr))
+      local saved = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
+      assert.is_true(saved.topline >= 1
+        and saved.topline <= vim.api.nvim_buf_line_count(instance.bufnr))
     end
+    assert.are.equal(focused_tab, vim.api.nvim_get_current_tabpage())
+    assert.are.equal(focused_win, vim.api.nvim_get_current_win())
   end)
 
   it("calls callbacks once on the main loop and suppresses duplicate adapter completion", function()

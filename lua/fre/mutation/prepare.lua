@@ -123,9 +123,7 @@ local function derived_target(root, source, target)
 end
 
 function M.prepare(instance)
-  if instance.state ~= "ready-hidden" and instance.state ~= "ready-visible" then
-    fail("instance is not ready", 3)
-  end
+  if instance.state ~= "ready" then fail("instance is not ready", 3) end
   if not vim.api.nvim_buf_is_valid(instance.bufnr) then
     fail("instance buffer is not valid", 3)
   end

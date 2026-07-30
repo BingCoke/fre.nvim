@@ -20,7 +20,7 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready-hidden" or instance.state == "ready-visible"
+    return instance.state == "ready"
       or instance.state == "load-failed"
   end)
   assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
@@ -463,7 +463,10 @@ describe("fre ticket 15 directory watchers", function()
       instance:destroy()
     end
 
-    exercise(function(instance) vim.cmd("enew"); assert.is_false(instance:_is_visible()) end)
+    exercise(function(instance)
+      vim.cmd("enew")
+      assert.is_nil(fre.view.inspect(instance))
+    end)
     exercise(function(instance)
       vim.bo[instance.bufnr].modifiable = true
       vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, { "draft" })
@@ -472,7 +475,7 @@ describe("fre ticket 15 directory watchers", function()
       function(instance) instance:_release_write_lock(instance.actions.write) end)
   end)
 
-  it("performs one pending full refresh on the first eligible visibility transition", function()
+  it("performs one pending full refresh on the first managed presentation enter", function()
     local counts = loader_counts()
     local instance = ready({ ["dir/old.txt"] = "old" })
     instance:expand("dir")
@@ -485,16 +488,16 @@ describe("fre ticket 15 directory watchers", function()
     watcher:fire(instance.root)
     wait_for(function() return instance.needs_refresh end)
     instance:open()
-    vim.api.nvim_exec_autocmds("BufEnter", { buffer = instance.bufnr, modeline = false })
-    vim.api.nvim_exec_autocmds("BufEnter", { buffer = instance.bufnr, modeline = false })
+    instance:open()
     wait_for(function()
       return not instance.needs_refresh and instance:get_pos("root-new.txt") ~= nil
         and instance:get_pos("dir/new.txt") ~= nil
     end)
 
+    assert.are.equal("ready", instance.state)
     assert.are.equal(1, counts[instance.root])
     assert.are.equal(1, counts[fixture:path("dir")])
-    assert.is_false(instance._pending_visibility_refresh)
+    assert.is_false(instance._pending_presentation_refresh)
   end)
 
   it("follows a public refresh when an event arrives after its boundary scan", function()
@@ -531,7 +534,7 @@ describe("fre ticket 15 directory watchers", function()
     assert.are.equal(1, callbacks)
     assert.are.equal(2, counts[instance.root])
     assert.are.equal(2, counts[directory])
-    assert.is_false(instance._pending_visibility_refresh)
+    assert.is_false(instance._pending_presentation_refresh)
   end)
 
   it("follows write reconciliation after a post-scan event and unlocks once", function()
@@ -571,7 +574,7 @@ describe("fre ticket 15 directory watchers", function()
     assert.are.equal(2, counts[instance.root])
     assert.are.equal(2, counts[directory])
     assert.is_nil(instance.actions)
-    assert.is_false(instance._pending_visibility_refresh)
+    assert.is_false(instance._pending_presentation_refresh)
   end)
 
   it("reports each failed handle once, stops it, and recreates after refresh", function()

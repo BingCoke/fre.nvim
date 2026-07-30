@@ -99,7 +99,7 @@ vim.keymap.set("n", "<leader>e", function()
 end, { desc = "Open Fre" })
 ```
 
-`fre.new()` 会立即返回实例和隐藏 buffer，目录扫描在后台完成。立即调用 `open()` 时，会先显示加载状态，再更新为目录内容。
+`fre.new()` 会立即返回实例和隐藏 buffer，目录扫描在后台完成。立即调用 `open()` 时，加载完成前 buffer 保持空白，完成后一次显示目录内容。
 
 ## 编辑文件系统
 
@@ -148,7 +148,7 @@ Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末�
 | `zM` | 折叠实例中全部目录；与光标所在行无关 |
 | `q` | 隐藏当前 tab 中的 Fre 视图，但保留实例和 buffer |
 | `g.` | 显示或隐藏点文件 |
-| `R` | 刷新；buffer 已修改时先确认是否丢弃草稿 |
+| `R` | 立即刷新；buffer 已修改时直接丢弃草稿 |
 
 Fre 不提供默认 `h`/`l` 映射，也没有默认插入模式或可视模式映射。
 
@@ -197,8 +197,18 @@ fre.setup({
     n = {
       ["<C-t>"] = actions.tab_select,
       ["<C-v>"] = function(ctx)
+        local inspected = fre.view.inspect(ctx.instance, ctx.tabpage)
+        if not inspected then error("fre: source View is no longer active") end
+        local anchor = ctx.winid
+        if inspected.layout.position == "float" then
+          anchor = inspected.origin_winid
+          if not anchor or not vim.api.nvim_win_is_valid(anchor) then
+            error("fre: float origin is no longer valid")
+          end
+        end
         actions.split_select(ctx, {
           layout = { position = "right", size = 0.5 },
+          anchor_winid = anchor,
         })
       end,
     },
@@ -245,7 +255,7 @@ fre.setup({
 - `mapping` 的值必须是函数，不能使用 action 名字符串或 `{ action = ... }` 描述符。
 - 不支持用 `false` 单独删除某个内置映射。若要完全控制按键，设置 `use_mapping_default = false`，再声明所有需要的映射。
 - `gc.include_modified = true` 允许 GC 强制丢弃隐藏 buffer 中未保存的文件系统草稿，请谨慎启用。
-- `skip_confirm_for_simple_edits = true` 时，无删除、创建不超过 5 个、move 不超过 1 个且 copy 不超过 1 个的 `:write` 会直接执行。删除、超过阈值和未知操作仍需确认；`R` 丢弃已修改草稿时也始终确认。
+- `skip_confirm_for_simple_edits = true` 时，无删除、创建不超过 5 个、move 不超过 1 个且 copy 不超过 1 个的 `:write` 会直接执行。删除、超过阈值和未知操作仍需确认。`R` 是显式丢弃动作，无论该选项为何值都不会确认。
 
 ## 实例配置
 
@@ -294,7 +304,11 @@ instance:open({
 
 分屏 `size`、浮窗 `width`/`height` 和 `row`/`col` 支持绝对 cell 数；小于 `1` 的正数表示比例。浮窗支持 `none`、`single`、`double`、`rounded`、`solid`、`shadow` 及 Neovim 八段 border 数组。
 
-同一实例可以在多个 tab/window 中显示，共享一个 buffer，但各窗口保留自己的 cursor 和 view。`instance:hidden()` 只关闭当前 tab 中的 Fre 视图；`instance:toggle(layout)` 根据当前 tab 的可见状态打开、隐藏或切换布局。
+每个 Instance 在每个 tab 中最多有一个 Fre-managed active View；同一 Instance 可以同时显示在多个 tab。它们共享 Instance 的 tree、buffer 和展开状态，但 Neovim 为各 tab 的 View 独立保留 cursor、scroll 和 viewport。共享投影发生展开、折叠或刷新时，Fre 会按 Entry path 为所有仍有效的 active Views 尽力恢复语义 cursor 和相对 viewport；Entry 消失时回退到最近的可见祖先，再回退到 root/首行。hidden tab 不保存待应用的 cursor 意图。
+
+当前 tab 已有 active View 时，`instance:open()` 不传 layout 只聚焦现有窗口；传入相同的 normalized layout 复用窗口和 view，传入不同 layout 才 relayout。`instance:hidden(tabpage?)` 只隐藏指定 tab（默认当前 tab）并删除 active View record；`instance:hide_all()` 才显式隐藏所有 tab。`instance:toggle(layout)` 是严格二元操作：active 时隐藏，inactive 时打开。隐藏后不保留 layout history，再次不带 explicit layout 打开时使用该 Instance 创建时复制的 immutable default layout。
+
+`position = "current"` 的 View 隐藏时恢复它替换前的 buffer；Fre 创建的 split、float 和 tab View 隐藏时关闭对应窗口（若是最后一个 ordinary window 且无法关闭，则换入安全空 buffer）。
 
 ## 自定义映射与 actions
 
@@ -317,6 +331,8 @@ instance:open({
   range = visual_range_or_nil,
 }
 ```
+
+ActionContext 是 mapping 当次同步调用的 source snapshot。它不包含 layout、origin、visibility、View generation/token 或 reconciliation 字段；缓存它并延迟执行不受支持。需要 presentation 信息时，应在 callback 内同步调用 `fre.view.inspect()`。更多完整示例见 [TIPS.md](TIPS.md)。
 
 可视范围形状为：
 
@@ -343,15 +359,28 @@ actions.toggle_hidden_file(ctx)
 actions.refresh(ctx)
 actions.jump_to_path(ctx) -- 当前 entry/navigation 行的 path 字段起点
 
-actions.select(ctx, { target_winid = ctx.winid })
-actions.tab_select(ctx)
+actions.select(ctx, {
+  target_winid = ctx.winid,
+  hide_source = false,
+  instance = { gc = { group = "project" } }, -- 仅 directory child
+})
+actions.tab_select(ctx, {
+  hide_source = false,
+  instance = { gc = { group = "project" } }, -- 仅 directory child
+})
 actions.split_select(ctx, {
-  layout = { position = "right", size = 0.5 },
-  instance = { gc = { group = "project" } },
+  layout = { position = "right", size = 0.5 }, -- 必填 split layout
+  anchor_winid = ctx.winid,
+  hide_source = false,
+  instance = { gc = { group = "project" } }, -- 仅 directory child
 })
 ```
 
 对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会使用当前实例所属的 Manager 创建一个独立实例，并把当前 sort 和点文件显示状态作为普通值选项传入。这里的 `opts.instance` 是新实例的普通值选项 table，不是 Instance 引用。进入目录时，目标目录下当前有效的展开路径会转换成新 root-relative 的 `expanded` 值；例如进入已展开的 `src` 时使用 `{ "x", "x/x" }`。选择 `../` 时固定使用空 `expanded`，因此刚离开的目录保持折叠，并在新实例 ready 后通过 `set_cursor_to_path()` 定位到它的条目。action 计算的 `expanded` 会覆盖 `opts.instance.expanded`，而 `opts.instance.root` 是参数错误。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`actions.jump_to_path()` 只把 entry 或 navigation 行的 cursor 移到 path 字段；new、缺少 path range 或不可解析的行会静默忽略。它没有默认映射。
+
+三种 selection action 共享相同的 source、Entry、option、resource preparation、buffer install commit、View ownership、cursor、focus 和 post-commit `hide_source` 语义，只是 destination shape 不同：`select` 使用 exact `target_winid`，省略时是 captured `ctx.winid`；`tab_select` 创建一个 exact 新 tab；`split_select` 要求 split `layout`，相对 exact ordinary anchor 创建目标。ordinary source 省略 `anchor_winid` 时只使用 captured source window；float source 必须显式提供同 tab 的 ordinary anchor，通常来自同步 `fre.view.inspect(...).origin_winid`。无效 option/source/target/anchor/layout 会在 destination、file buffer 或 child Instance 创建前报错，不会从当前焦点或其他窗口 fallback。
+
+`hide_source` 必须是 boolean，默认 `false`。它只在 selected buffer 成功安装后，作用于 captured source Instance/View/tab；不会隐藏同 Instance 在其他 tab 的 View。file/symlink 安装后 destination 是 ordinary file window，不保留 Fre View ownership。directory child 在 managed target 中 transfer ownership，在 ordinary target 中 adopt 并在隐藏时恢复旧 buffer，在 action-created tab/split 中 adopt 为 close-on-hide View。child 的异步 load failure 保留已提交 destination 和 ownership，不恢复 parent。`opts.instance` 只对 directory child 有效；file/symlink 在三种 action 中传入任何 non-nil `opts.instance` 都会 preflight 报错。
 
 ## 列
 
@@ -452,7 +481,8 @@ instance.config
 instance:when_ready(function(err) end)
 
 local opened, winid = instance:open(layout) -- opened == instance
-instance:hidden()
+instance:hidden(tabpage) -- 省略 tabpage 时使用当前 tab
+instance:hide_all()
 instance:toggle(layout)
 
 instance:expand(path)
@@ -475,6 +505,16 @@ instance:refresh({ force = true, on_complete = function(err) end })
 instance:destroy()
 ```
 
+只读 View 查询：
+
+```lua
+local inspected = require("fre").view.inspect(instance, tabpage)
+-- nil，或：
+-- { winid = winid, origin_winid = origin_winid, layout = normalized_layout }
+```
+
+`tabpage` 省略时使用当前 tab。无 active View 或 record 已 stale 时返回 `nil`；返回的 table 和 normalized `layout` 都是 copy，修改它们不会改变 ownership。`origin_winid` 只属于当前 active View：current View 通常是被替换窗口，split 是 exact anchor，float 是打开时的 ordinary origin，action-created tab child 是 captured source window。隐藏会删除该 View record，重开时重新捕获 origin。
+
 `get_entry(row)` 返回新的普通 Lua table：
 
 ```lua
@@ -488,7 +528,7 @@ instance:destroy()
 }
 ```
 
-`expand`、`collapse`、`toggle_expand` 和 `reveal` 接受 root 内的 snapshot 相对路径，也可接受 root 内绝对路径；`collapse_all` 与光标和路径无关，会清除缓存树中全部非 root 目录的展开状态，同时保留目录缓存与元数据。`get_pos` 和 `set_cursor_to_path` 接受 snapshot 相对路径。`set_cursor_to_path` 可以在创建期间调用：它等待实例 ready 后，把指定窗口的 cursor 放到目标条目的 path 起点，不展开目录或保存 cursor 状态。会改变投影的操作在 buffer 已修改时会直接报错，以避免覆盖草稿；窗口操作和 lookup 仍可使用。
+`expand`、`collapse`、`toggle_expand` 和 `reveal` 接受 root 内的 snapshot 相对路径，也可接受 root 内绝对路径；`collapse_all` 与光标和路径无关，会清除缓存树中全部非 root 目录的展开状态，同时保留目录缓存与元数据。`get_pos` 和 `set_cursor_to_path` 接受 snapshot 相对路径。`set_cursor_to_path` 可以在创建期间调用：它等待实例 ready 后，把指定窗口的 cursor 放到目标条目的 path 起点，不展开目录或保存 cursor 状态。会改变投影的操作在 buffer 已修改时会直接报错，以避免覆盖草稿；窗口操作和 lookup 仍可使用。每次成功投影以及成功 `:write` 后的真实状态同步都会建立新的 undo 起点，`u` 不会恢复旧树投影或已经提交的文件系统草稿。
 
 `setGroup(group)` 将实例迁移到 `setup()` 中已存在的 GC 组，并立即按目标组容量执行回收；迁移实例在本次容量约束中受保护。该操作不会重置当前隐藏区间或 TTL timer，并同步更新 `instance.config.gc.group` 与保留 buffer metadata `vim.b.fre.gc_group`。
 
@@ -569,7 +609,7 @@ execution:cancel()
 - 隐藏实例再次显示时，会在安全条件下执行一次完整刷新。
 - watcher 行为和可靠性仍受操作系统及 libuv 限制。
 
-GC 只考虑已隐藏且当前可安全销毁的实例。可见、写入锁定、正在执行 mutation 的实例不会被回收；默认也不会回收带修改的实例。
+GC group 的容量由组内全部存活实例占用，包括可见、写入锁定、正在执行 mutation 或带修改的实例。回收时只会选择已隐藏且当前可安全销毁的实例；若没有安全候选，group 会暂时超过容量，直到实例状态变化后再次执行约束。
 
 `gc.ttl_ms = 0` 会禁用 TTL 回收。GC 组容量为 `0` 会禁用该组的容量限制，而不是立即回收所有实例。
 
@@ -604,7 +644,7 @@ $p = '\\?\C:\absolute\path\to\nul'
 [IO.File]::Delete($p)      # 确认后再删除
 ```
 
-若当前 Fre buffer 已修改，`R` 会询问是否丢弃草稿；先保留需要的路径编辑。
+若当前 Fre buffer 已修改，`R` 会直接丢弃草稿；刷新前先保留需要的路径编辑。
 
 
 ## 限制与安全说明
@@ -618,7 +658,9 @@ $p = '\\?\C:\absolute\path\to\nul'
 - 跨实例复制要求源实例及源节点在 `prepare()` 时仍然存活。
 - symlink 按链接本身复制和删除；选择 symlink 时按文件打开。
 - 启用默认目录接管后，当前 Neovim 进程中没有恢复 netrw 的公共 API。
-- `refresh({ force = true })` 会丢弃未保存的 Fre buffer 草稿；默认 `R` action 会先询问。
+- `refresh({ force = true })` 和默认 `R` action 会直接丢弃未保存的 Fre buffer 草稿。
+- 通过原生 `:split`、`:sbuffer` 等命令手工复制 Fre buffer 不受支持；Fre 不会 adopt、扫描 reconcile 或自动修复这些 duplicate windows。
+- ActionContext 只支持 mapping/action 的同步调用；缓存后延迟执行不受支持。
 
 ## 开发与测试
 

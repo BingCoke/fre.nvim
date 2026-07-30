@@ -1,211 +1,30 @@
+local layout_module = require("fre.layout")
+
 local M = {}
-
-local positions = {
-  current = true,
-  left = true,
-  right = true,
-  top = true,
-  bottom = true,
-  float = true,
-}
-
-local fields = {
-  position = true,
-  size = true,
-  width = true,
-  height = true,
-  row = true,
-  col = true,
-  border = true,
-}
-
-local named_borders = {
-  none = true,
-  single = true,
-  double = true,
-  rounded = true,
-  solid = true,
-  shadow = true,
-}
 
 local function fail(message, level)
   error("fre.window: " .. message, level or 3)
-end
-
-local function place_initial_cursor(instance, winid)
-  return require("fre.buffer").place_initial_cursor(instance, winid)
-end
-
-local function finite(value)
-  return type(value) == "number" and value == value
-    and value ~= math.huge and value ~= -math.huge
-end
-
-local function dimension(value, path)
-  if not finite(value) or value <= 0 then
-    fail(path .. " must be a positive integer or a ratio greater than zero and less than one", 4)
-  end
-  if value < 1 then return value end
-  if value % 1 ~= 0 then
-    fail(path .. " absolute cell value must be an integer", 4)
-  end
-  return value
-end
-
-local function offset(value, path)
-  if not finite(value) or value < 0 then
-    fail(path .. " must be a non-negative integer or a ratio less than one", 4)
-  end
-  if value < 1 then return value end
-  if value % 1 ~= 0 then
-    fail(path .. " absolute cell value must be an integer", 4)
-  end
-  return value
-end
-
-local function sequence_length(value, path)
-  local count, maximum = 0, 0
-  for key in pairs(value) do
-    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
-      fail(path .. " must be an eight-item array", 4)
-    end
-    count = count + 1
-    maximum = math.max(maximum, key)
-  end
-  if count ~= maximum then fail(path .. " must not contain nil holes", 4) end
-  return maximum
-end
-
-local function validate_border(value, path)
-  if type(value) == "string" then
-    if not named_borders[value] then fail(path .. " is not supported", 4) end
-    return value
-  end
-  if type(value) ~= "table" or sequence_length(value, path) ~= 8 then
-    fail(path .. " must be a supported name or an eight-item array", 4)
-  end
-  local result = {}
-  for index, item in ipairs(value) do
-    if type(item) == "string" then
-      result[index] = item
-    elseif type(item) == "table" and sequence_length(item, path .. "[" .. index .. "]") == 2
-        and type(item[1]) == "string" and type(item[2]) == "string" then
-      result[index] = { item[1], item[2] }
-    else
-      fail(path .. "[" .. index .. "] must be a string or { text, highlight }", 4)
-    end
-  end
-  return result
 end
 
 local function copy(value)
   return vim.deepcopy(value)
 end
 
-local function allowed_fields(position)
-  if position == "current" then return { position = true } end
-  if position == "left" or position == "right"
-      or position == "top" or position == "bottom" then
-    return { position = true, size = true }
-  end
-  return {
-    position = true, width = true, height = true,
-    row = true, col = true, border = true,
-  }
+local function geometry()
+  return { columns = vim.o.columns, lines = vim.o.lines }
 end
 
---- Validate and copy a layout. Partial validation accepts omitted required
---- fields while setup and instance options are being merged, but still rejects
---- explicitly position-incompatible fields.
-function M.normalize(layout, opts)
-  opts = opts or {}
-  local path = opts.path or "layout"
-  if type(layout) ~= "table" then fail(path .. " must be a table", 3) end
-  for key in pairs(layout) do
-    if type(key) ~= "string" or not fields[key] then
-      fail(path .. " contains unknown field " .. tostring(key), 3)
-    end
+local function assert_window(winid, message)
+  if type(winid) ~= "number" or not vim.api.nvim_win_is_valid(winid) then
+    fail(message or "target window is not valid", 4)
   end
-
-  local result = {}
-  if layout.position ~= nil then
-    if type(layout.position) ~= "string" then fail(path .. ".position must be a string", 3) end
-    if not positions[layout.position] then fail(path .. ".position is not supported", 3) end
-    result.position = layout.position
-  elseif not opts.partial then
-    fail(path .. ".position is required", 3)
-  end
-  if layout.size ~= nil then result.size = dimension(layout.size, path .. ".size") end
-  if layout.width ~= nil then result.width = dimension(layout.width, path .. ".width") end
-  if layout.height ~= nil then result.height = dimension(layout.height, path .. ".height") end
-  if layout.row ~= nil then result.row = offset(layout.row, path .. ".row") end
-  if layout.col ~= nil then result.col = offset(layout.col, path .. ".col") end
-  if layout.border ~= nil then result.border = validate_border(layout.border, path .. ".border") end
-  if result.position == nil then return result end
-
-  local allowed = allowed_fields(result.position)
-  for key in pairs(result) do
-    if not allowed[key] then
-      fail(path .. "." .. key .. " is not valid for position " .. result.position, 3)
-    end
-  end
-  if not opts.partial then
-    if allowed.size and result.size == nil then
-      fail(path .. ".size is required for split layouts", 3)
-    end
-    if allowed.width and result.width == nil then
-      fail(path .. ".width is required for float layouts", 3)
-    end
-    if allowed.height and result.height == nil then
-      fail(path .. ".height is required for float layouts", 3)
-    end
-  end
-  local exact = {}
-  for key in pairs(allowed) do
-    if result[key] ~= nil then exact[key] = copy(result[key]) end
-  end
-  return exact
 end
 
-function M.merge_layout(base, override, opts)
-  opts = opts or {}
-  local path = opts.path or "layout"
-  local inherited = M.normalize(base, { path = path })
-  if override == nil then return inherited end
-  local patch = M.normalize(override, { path = path, partial = true })
-  local position = patch.position or inherited.position
-  local allowed = allowed_fields(position)
-  for key in pairs(patch) do
-    if not allowed[key] then
-      fail(path .. "." .. key .. " is not valid for position " .. position, 3)
-    end
-  end
-  local result
-  local inherited_split = inherited.position == "left" or inherited.position == "right"
-    or inherited.position == "top" or inherited.position == "bottom"
-  local patch_split = position == "left" or position == "right"
-    or position == "top" or position == "bottom"
-  local same_family = inherited.position == position or (inherited_split and patch_split)
-  if patch.position ~= nil and not same_family then
-    result = { position = position }
-  else
-    result = copy(inherited)
-    result.position = position
-  end
-  for key, value in pairs(patch) do result[key] = copy(value) end
-  return M.normalize(result, { path = path })
+function M.is_float(winid)
+  assert_window(winid)
+  return vim.api.nvim_win_get_config(winid).relative ~= ""
 end
 
-local function resolve_cells(value, total)
-  if value < 1 then return math.max(1, math.floor(total * value)) end
-  return value
-end
-
-local function resolve_offset(value, total, extent)
-  if value == nil then return math.max(0, math.floor((total - extent) / 2)) end
-  if value < 1 then return math.floor(total * value) end
-  return value
-end
 
 local function layout_extent(node, axis, minimum)
   if node[1] == "leaf" then
@@ -230,159 +49,34 @@ local function layout_extent(node, axis, minimum)
   return extent
 end
 
-local function split_capacity(position)
+local function split_capacity(position, anchor)
   local axis = (position == "left" or position == "right") and "width" or "height"
-  local root = vim.fn.winlayout()
+  local root = anchor and vim.api.nvim_win_call(anchor, vim.fn.winlayout) or vim.fn.winlayout()
   local usable = layout_extent(root, axis, false)
   local remaining = layout_extent(root, axis, true)
   return usable - remaining - 1
 end
 
-local function border_text(item)
-  if type(item) == "table" then item = item[1] end
-  return type(item) == "string" and item or ""
-end
-
-local function border_extents(border)
-  if border == nil or border == "none" then return 0, 0, 0, 0 end
-  if type(border) == "string" then
-    if border == "shadow" then return 0, 1, 1, 0 end
-    return 1, 1, 1, 1
+function M.prepare(requested)
+  local normalized = layout_module.normalize(requested, { path = "layout" })
+  local effective = layout_module.materialize(normalized, geometry())
+  if effective.position ~= "current" and effective.position ~= "float" then
+    layout_module.validate_split_fit(effective, split_capacity(effective.position))
   end
-  local present = {}
-  for index = 1, 8 do present[index] = border_text(border[index]) ~= "" end
-  local top = (present[1] or present[2] or present[3]) and 1 or 0
-  local right = (present[3] or present[4] or present[5]) and 1 or 0
-  local bottom = (present[5] or present[6] or present[7]) and 1 or 0
-  local left = (present[7] or present[8] or present[1]) and 1 or 0
-  return top, right, bottom, left
+  return copy(normalized), copy(effective)
 end
 
-function M.materialize(layout)
-  local position = layout.position
-  if position == "current" then return { position = position } end
-  if position ~= "float" then
-    local total = (position == "left" or position == "right") and vim.o.columns or vim.o.lines
-    local size = resolve_cells(layout.size, total)
-    if size >= total then fail("layout.size does not leave room for another split", 3) end
-    return { position = position, size = size }
+function M.prepare_split(requested, anchor)
+  local normalized = layout_module.normalize(requested, { path = "layout" })
+  if normalized.position ~= "left" and normalized.position ~= "right"
+      and normalized.position ~= "top" and normalized.position ~= "bottom" then
+    fail("layout.position must be left, right, top, or bottom", 2)
   end
-
-  local width = resolve_cells(layout.width, vim.o.columns)
-  local height = resolve_cells(layout.height, vim.o.lines)
-  local row = resolve_offset(layout.row, vim.o.lines, height)
-  local col = resolve_offset(layout.col, vim.o.columns, width)
-  local top, right, bottom, left = border_extents(layout.border)
-  if row + height + top + bottom > vim.o.lines then
-    fail("layout.row places the bordered float outside the editor", 3)
-  end
-  if col + width + left + right > vim.o.columns then
-    fail("layout.col places the bordered float outside the editor", 3)
-  end
-  return {
-    position = position,
-    width = width,
-    height = height,
-    row = row,
-    col = col,
-    border = copy(layout.border),
-  }
-end
-
-local function validate_split_fit(effective)
-  if effective.position ~= "current" and effective.position ~= "float"
-      and effective.size > split_capacity(effective.position) then
-    fail("layout.size cannot be materialized exactly in the current tab", 4)
-  end
-end
-
-local function current_tab_windows(instance)
-  local tabpage = vim.api.nvim_get_current_tabpage()
-  local result = {}
-  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
-    if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == instance.bufnr then
-      result[#result + 1] = winid
-    end
-  end
-  table.sort(result)
-  return result
-end
-
-function M.select(instance)
-  local windows = current_tab_windows(instance)
-  local current = vim.api.nvim_get_current_win()
-  for _, winid in ipairs(windows) do
-    if winid == current then return winid end
-  end
-  return windows[1]
-end
-
-local function metadata_name(instance)
-  return "fre_layout_" .. tostring(instance.id)
-end
-
-local function raw_named_metadata(winid, name)
-  if not winid or not vim.api.nvim_win_is_valid(winid) then return nil end
-  local ok, value = pcall(vim.api.nvim_win_get_var, winid, name)
-  if not ok or type(value) ~= "table" then return nil end
-  return value
-end
-
-local function raw_metadata(instance, winid)
-  return raw_named_metadata(winid, metadata_name(instance))
-end
-
-local function get_metadata(instance, winid)
-  if not winid or not vim.api.nvim_win_is_valid(winid)
-      or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return nil end
-  local metadata = raw_metadata(instance, winid)
-  if not metadata or metadata.bufnr ~= instance.bufnr then return nil end
-  return metadata
-end
-
-local function set_metadata(instance, winid, layout, effective)
-  vim.api.nvim_win_set_var(winid, metadata_name(instance), {
-    bufnr = instance.bufnr,
-    layout = copy(layout),
-    effective = copy(effective),
-  })
-end
-
-local function snapshot_named_metadata(winid, name)
-  local ok, value = pcall(vim.api.nvim_win_get_var, winid, name)
-  return { present = ok, value = ok and copy(value) or nil }
-end
-
-local function snapshot_metadata(instance, winid)
-  return snapshot_named_metadata(winid, metadata_name(instance))
-end
-
-local function restore_named_metadata(winid, name, snapshot)
-  if not vim.api.nvim_win_is_valid(winid) then return end
-  if snapshot.present then
-    pcall(vim.api.nvim_win_set_var, winid, name, copy(snapshot.value))
-  else
-    pcall(vim.api.nvim_win_del_var, winid, name)
-  end
-end
-
-local function restore_metadata(instance, winid, snapshot)
-  restore_named_metadata(winid, metadata_name(instance), snapshot)
-end
-
-local function effective_layout(instance, winid)
-  local metadata = get_metadata(instance, winid)
-  if metadata and type(metadata.effective) == "table" then return metadata.effective end
-  -- A manually-created ordinary view has current-window semantics until Fre
-  -- explicitly gives it another layout.
-  local config = vim.api.nvim_win_get_config(winid)
-  if config.relative == "" then return { position = "current" } end
-  return nil
-end
-
-function M.same_layout(instance, winid, effective)
-  local actual = effective_layout(instance, winid)
-  return actual ~= nil and vim.deep_equal(actual, effective)
+  assert_window(anchor, "split anchor window is not valid")
+  if M.is_float(anchor) then fail("split anchor window must be ordinary", 2) end
+  local effective = layout_module.materialize(normalized, geometry())
+  layout_module.validate_split_fit(effective, split_capacity(effective.position, anchor))
+  return copy(normalized), copy(effective)
 end
 
 function M.apply(instance, winid)
@@ -397,40 +91,14 @@ function M.apply(instance, winid)
   return true
 end
 
-local function assert_installed_buffer(winid, bufnr)
-  if not winid or not vim.api.nvim_win_is_valid(winid) then
-    fail("target window was invalidated during buffer installation", 4)
-  end
+local function assert_installed(winid, bufnr)
+  assert_window(winid, "target window was invalidated during buffer installation")
   if vim.api.nvim_win_get_buf(winid) ~= bufnr then
     fail("target window redirected buffer during installation", 4)
   end
 end
 
-local function observe_visibility(instance)
-  if instance._destroyed then return end
-  local visible = false
-  if vim.api.nvim_buf_is_valid(instance.bufnr) then
-    for _, winid in ipairs(vim.fn.win_findbuf(instance.bufnr)) do
-      if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == instance.bufnr then
-        visible = true
-        break
-      end
-    end
-  end
-  if visible and instance.state == "ready-hidden" then
-    instance.state = "ready-visible"
-  elseif not visible and instance.state == "ready-visible" then
-    instance.state = "ready-hidden"
-  end
-  if instance.manager then instance.manager:gc_visibility_changed(instance) end
-  return visible
-end
-
-function M.sync_visibility(instance)
-  return observe_visibility(instance)
-end
-
-local function save_view(winid)
+function M.save_view(winid)
   if not winid or not vim.api.nvim_win_is_valid(winid) then return nil end
   return {
     cursor = vim.api.nvim_win_get_cursor(winid),
@@ -438,554 +106,338 @@ local function save_view(winid)
   }
 end
 
-local function restore_view(winid, saved)
+function M.restore_view(winid, saved)
   if not saved or not vim.api.nvim_win_is_valid(winid) then return end
   pcall(vim.api.nvim_win_call, winid, vim.fn.winrestview, saved.view)
-  local count = vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(winid))
+  local bufnr = vim.api.nvim_win_get_buf(winid)
+  local count = vim.api.nvim_buf_line_count(bufnr)
   local row = math.max(1, math.min(saved.cursor[1], count))
-  local line = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(winid), row - 1, row, false)[1] or ""
-  local col = math.max(0, math.min(saved.cursor[2], #line))
-  pcall(vim.api.nvim_win_set_cursor, winid, { row, col })
+  local line = vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false)[1] or ""
+  pcall(vim.api.nvim_win_set_cursor, winid, { row, math.min(saved.cursor[2], #line) })
 end
 
-local function snapshot_destination(instance, winid)
+local function snapshot(winid)
+  assert_window(winid)
   local bufnr = vim.api.nvim_win_get_buf(winid)
-  local tabpage = vim.api.nvim_win_get_tabpage(winid)
   return {
     winid = winid,
+    tabpage = vim.api.nvim_win_get_tabpage(winid),
     bufnr = bufnr,
-    tabpage = tabpage,
     bufhidden = vim.api.nvim_get_option_value("bufhidden", { buf = bufnr }),
-    view = save_view(winid),
-    metadata = snapshot_metadata(instance, winid),
+    view = M.save_view(winid),
     focus = vim.api.nvim_get_current_win(),
-    instance_state = instance.state,
-    layout_history_present = instance._last_layout_by_tab ~= nil,
-    layout_history = instance._last_layout_by_tab and copy(instance._last_layout_by_tab) or nil,
   }
 end
 
-local function protect_destination_buffer(instance, snapshot)
-  if snapshot.bufnr == instance.bufnr then return end
-  if snapshot.bufhidden == "wipe" or snapshot.bufhidden == "delete"
-      or snapshot.bufhidden == "unload" then
-    vim.api.nvim_set_option_value("bufhidden", "hide", { buf = snapshot.bufnr })
-    snapshot.protected = true
+local function protect(snapshot_value, replacement)
+  if snapshot_value.bufnr == replacement then return end
+  if snapshot_value.bufhidden == "wipe" or snapshot_value.bufhidden == "delete"
+      or snapshot_value.bufhidden == "unload" then
+    vim.api.nvim_set_option_value("bufhidden", "hide", { buf = snapshot_value.bufnr })
+    snapshot_value.protected = true
   end
 end
 
-local function restore_destination_buffer(snapshot)
-  if snapshot.protected and vim.api.nvim_buf_is_valid(snapshot.bufnr) then
-    vim.api.nvim_set_option_value("bufhidden", snapshot.bufhidden, { buf = snapshot.bufnr })
-    snapshot.protected = nil
+local function finish_protection(snapshot_value)
+  if snapshot_value.protected and vim.api.nvim_buf_is_valid(snapshot_value.bufnr) then
+    vim.api.nvim_set_option_value(
+      "bufhidden", snapshot_value.bufhidden, { buf = snapshot_value.bufnr }
+    )
+    snapshot_value.protected = nil
   end
 end
 
-local function restore_destination(instance, snapshot)
-  local errors = {}
-  local function attempt(label, callback)
-    local ok, err = pcall(callback)
-    if not ok then errors[#errors + 1] = label .. ": " .. tostring(err) end
-    return ok
-  end
-  local function restore_snapshot_metadata(name, metadata_snapshot)
-    if metadata_snapshot.present then
-      vim.api.nvim_win_set_var(snapshot.winid, name, copy(metadata_snapshot.value))
-    elseif pcall(vim.api.nvim_win_get_var, snapshot.winid, name) then
-      vim.api.nvim_win_del_var(snapshot.winid, name)
-    end
-  end
-
-  local winid = snapshot.winid
-  local exact_source = false
-  if vim.api.nvim_win_is_valid(winid) then
-    attempt("layout metadata rollback failed", function()
-      restore_snapshot_metadata(metadata_name(instance), snapshot.metadata)
+local function rollback(snapshot_value)
+  local winid = snapshot_value.winid
+  if not vim.api.nvim_win_is_valid(winid)
+      or not vim.api.nvim_buf_is_valid(snapshot_value.bufnr) then return false end
+  local ok = pcall(vim.api.nvim_win_set_buf, winid, snapshot_value.bufnr)
+  if not ok or vim.api.nvim_win_get_buf(winid) ~= snapshot_value.bufnr then
+    ok = pcall(vim.api.nvim_win_call, winid, function()
+      vim.cmd("noautocmd buffer " .. tostring(snapshot_value.bufnr))
     end)
-
-    if not vim.api.nvim_buf_is_valid(snapshot.bufnr) then
-      errors[#errors + 1] = "source buffer rollback failed: snapshot buffer is invalid"
-    else
-      local current_ok, current = pcall(vim.api.nvim_win_get_buf, winid)
-      if not current_ok then
-        errors[#errors + 1] = "source buffer rollback failed: " .. tostring(current)
-      elseif current ~= snapshot.bufnr then
-        attempt("source buffer rollback failed", function()
-          vim.api.nvim_win_set_buf(winid, snapshot.bufnr)
-        end)
-      end
-      local restored_ok, restored = pcall(vim.api.nvim_win_get_buf, winid)
-      if vim.api.nvim_win_is_valid(winid)
-          and (not restored_ok or restored ~= snapshot.bufnr) then
-        attempt("noautocmd source buffer fallback failed", function()
-          vim.api.nvim_win_call(winid, function()
-            vim.cmd("noautocmd buffer " .. tostring(snapshot.bufnr))
-          end)
-        end)
-      end
-      restored_ok, restored = pcall(vim.api.nvim_win_get_buf, winid)
-      exact_source = vim.api.nvim_win_is_valid(winid)
-        and restored_ok and restored == snapshot.bufnr
-      if not exact_source then
-        errors[#errors + 1] = "source buffer rollback failed: target window does not display "
-          .. "snapshot buffer after noautocmd fallback"
-      end
-    end
-
-    if exact_source then
-      if snapshot.protected and vim.api.nvim_buf_is_valid(snapshot.bufnr) then
-        if attempt("source protection rollback failed", function()
-          vim.api.nvim_set_option_value(
-            "bufhidden", snapshot.bufhidden, { buf = snapshot.bufnr }
-          )
-        end) then
-          snapshot.protected = nil
-        end
-      end
-      restore_view(winid, snapshot.view)
-      if snapshot.layout_history_present then
-        instance._last_layout_by_tab = copy(snapshot.layout_history)
-      else
-        instance._last_layout_by_tab = nil
-      end
-      instance.state = snapshot.instance_state
-      if vim.api.nvim_win_is_valid(snapshot.focus) then
-        attempt("focus rollback failed", function()
-          vim.api.nvim_set_current_win(snapshot.focus)
-        end)
-      end
-    end
-  else
-    errors[#errors + 1] = "source window rollback failed: target window is invalid"
   end
-  if #errors > 0 then error(table.concat(errors, "; "), 0) end
-end
-
-local function transition_error(instance, snapshot, err)
-  local restored, restore_err = pcall(restore_destination, instance, snapshot)
-  if not restored then
-    return tostring(err) .. "; rollback failed: " .. tostring(restore_err)
+  if not ok or vim.api.nvim_win_get_buf(winid) ~= snapshot_value.bufnr then return false end
+  finish_protection(snapshot_value)
+  M.restore_view(winid, snapshot_value.view)
+  if vim.api.nvim_win_is_valid(snapshot_value.focus) then
+    pcall(vim.api.nvim_set_current_win, snapshot_value.focus)
   end
-  return err
+  return true
 end
 
-local function is_float(winid)
-  return vim.api.nvim_win_get_config(winid).relative ~= ""
-end
-
-local function normal_windows(tabpage)
-  local result = {}
-  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
-    if vim.api.nvim_win_is_valid(winid) and not is_float(winid) then
-      result[#result + 1] = winid
+function M.install(instance, winid)
+  assert_window(winid)
+  local before = snapshot(winid)
+  local ok, err = pcall(function()
+    protect(before, instance.bufnr)
+    vim.api.nvim_win_set_buf(winid, instance.bufnr)
+    assert_installed(winid, instance.bufnr)
+    if not M.apply(instance, winid) then
+      fail("target window was invalidated during option application", 4)
     end
-  end
-  table.sort(result)
-  return result
-end
-
-local function scratch_buffer()
-  local bufnr = vim.api.nvim_create_buf(false, true)
-  local ok, err = pcall(vim.api.nvim_set_option_value, "bufhidden", "wipe", { buf = bufnr })
+    finish_protection(before)
+  end)
   if not ok then
-    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+    local restored = rollback(before)
+    if not restored then err = tostring(err) .. "; destination rollback failed" end
     error(err, 0)
   end
-  return bufnr
+  return before
 end
 
-local function remove_view(instance, winid, preserve_normal)
-  if not vim.api.nvim_win_is_valid(winid)
-      or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return true end
-  local scratch
-  local snapshot
-  local ok, err = pcall(function()
-    if is_float(winid) then
-      vim.api.nvim_win_close(winid, true)
-      return
-    end
-    local tabpage = vim.api.nvim_win_get_tabpage(winid)
-    if preserve_normal or #normal_windows(tabpage) == 1 then
-      scratch = scratch_buffer()
-      snapshot = snapshot_destination(instance, winid)
-      vim.api.nvim_win_set_buf(winid, scratch)
-    else
-      vim.api.nvim_win_close(winid, true)
-    end
-  end)
-  local removed = not vim.api.nvim_win_is_valid(winid)
-    or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr
-  if removed then return true end
-  local remove_err = ok and "failed to remove selected Fre view" or err
-  if snapshot then remove_err = transition_error(instance, snapshot, remove_err) end
-  if scratch and vim.api.nvim_buf_is_valid(scratch) and #vim.fn.win_findbuf(scratch) == 0 then
-    pcall(vim.api.nvim_buf_delete, scratch, { force = true })
-  end
-  return false, remove_err
-end
-
-local function split_anchor(tabpage, preferred)
-  if preferred and vim.api.nvim_win_is_valid(preferred)
-      and vim.api.nvim_win_get_tabpage(preferred) == tabpage and not is_float(preferred) then
-    return preferred
-  end
-  return normal_windows(tabpage)[1]
-end
-
-local function resize_split(winid, layout, size)
-  if layout.position == "left" or layout.position == "right" then
-    vim.api.nvim_win_set_width(winid, size)
+local function resize_split(winid, effective)
+  if effective.position == "left" or effective.position == "right" then
+    vim.api.nvim_win_set_width(winid, effective.size)
   else
-    vim.api.nvim_win_set_height(winid, size)
+    vim.api.nvim_win_set_height(winid, effective.size)
   end
 end
 
-local function split_size(winid, layout)
-  if layout.position == "left" or layout.position == "right" then
+local function split_size(winid, effective)
+  if effective.position == "left" or effective.position == "right" then
     return vim.api.nvim_win_get_width(winid)
   end
   return vim.api.nvim_win_get_height(winid)
 end
 
-local function split_fix_option(layout)
-  if layout.position == "left" or layout.position == "right" then return "winfixwidth" end
-  return "winfixheight"
-end
-
-local function set_split_fixed(winid, option, value)
+function M.set_split_fixed(winid, normalized, value)
+  if normalized.position == "current" or normalized.position == "float" then return nil end
+  local option = (normalized.position == "left" or normalized.position == "right")
+    and "winfixwidth" or "winfixheight"
+  local previous = vim.api.nvim_get_option_value(option, { scope = "local", win = winid })
   vim.api.nvim_set_option_value(option, value, { scope = "local", win = winid })
+  return option, previous
 end
 
-local function create_split(layout, effective, preferred, noautocmd)
+function M.create(instance, normalized, effective, anchor)
   local tabpage = vim.api.nvim_get_current_tabpage()
-  local anchor = assert(split_anchor(tabpage, preferred), "current tab has no ordinary window")
-  vim.api.nvim_set_current_win(anchor)
-  local commands = {
-    left = "topleft vertical split",
-    right = "botright vertical split",
-    top = "topleft split",
-    bottom = "botright split",
-  }
-  local command = commands[layout.position]
-  vim.cmd(noautocmd and ("noautocmd " .. command) or command)
-  local winid = vim.api.nvim_get_current_win()
-  resize_split(winid, layout, effective.size)
-  return winid
-end
-
-local function build_split_buffer(bufnr, layout, effective, preferred)
-  local winid = create_split(layout, effective, preferred, true)
-  vim.api.nvim_win_set_buf(winid, bufnr)
-  assert_installed_buffer(winid, bufnr)
-  return winid
-end
-
-local function build_float(layout, effective, scratch)
-  local config = {
-    relative = "editor",
-    style = "minimal",
-    width = effective.width,
-    height = effective.height,
-    row = effective.row,
-    col = effective.col,
-  }
-  if layout.border ~= nil then config.border = copy(layout.border) end
-  return vim.api.nvim_open_win(scratch, true, config)
-end
-
-local function build_current(preferred)
-  local tabpage = vim.api.nvim_get_current_tabpage()
-  local winid = preferred
-  if not winid or not vim.api.nvim_win_is_valid(winid)
-      or vim.api.nvim_win_get_tabpage(winid) ~= tabpage then
-    winid = vim.api.nvim_get_current_win()
-  end
-  vim.api.nvim_set_current_win(winid)
-  return winid
-end
-
-local function snapshot_windows(tabpage)
-  local result = {}
-  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do result[winid] = true end
-  return result
-end
-
-local function rollback_created_windows(tabpage, before, caller_win)
-  local created = {}
-  for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
-    if not before[winid] then created[#created + 1] = winid end
-  end
-  table.sort(created, function(left, right) return left > right end)
-  for _, winid in ipairs(created) do
-    if vim.api.nvim_win_is_valid(winid) then
-      pcall(vim.api.nvim_win_close, winid, true)
-      if vim.api.nvim_win_is_valid(winid) then
-        pcall(vim.api.nvim_win_call, winid, function() vim.cmd("noautocmd close!") end)
-      end
-    end
-  end
-  if vim.api.nvim_win_is_valid(caller_win)
-      and vim.api.nvim_win_get_tabpage(caller_win) == tabpage then
-    pcall(vim.api.nvim_set_current_win, caller_win)
-  end
-end
-
-function M.replace(instance, winid)
-  if type(winid) ~= "number" or not vim.api.nvim_win_is_valid(winid) then
-    fail("target window is not valid", 2)
-  end
-  local snapshot = snapshot_destination(instance, winid)
-  local previous_transition = instance._window_transition
-  instance._window_transition = true
+  local caller = vim.api.nvim_get_current_win()
+  local winid
+  local before = {}
+  for _, existing in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do before[existing] = true end
   local ok, err = pcall(function()
-    protect_destination_buffer(instance, snapshot)
+    if normalized.position == "current" then
+      assert_window(anchor, "destination window is not valid in the current tab")
+      if vim.api.nvim_win_get_tabpage(anchor) ~= tabpage then
+        fail("destination window is not valid in the current tab", 4)
+      end
+      vim.api.nvim_set_current_win(anchor)
+      local before = M.install(instance, anchor)
+      winid = anchor
+      return before
+    end
+    if normalized.position == "float" then
+      local config = {
+        relative = "editor",
+        style = "minimal",
+        width = effective.width,
+        height = effective.height,
+        row = effective.row,
+        col = effective.col,
+      }
+      if effective.border ~= nil then config.border = copy(effective.border) end
+      winid = vim.api.nvim_open_win(instance.bufnr, true, config)
+      assert_installed(winid, instance.bufnr)
+      if not M.apply(instance, winid) then
+        fail("target window was invalidated during option application", 4)
+      end
+      return nil
+    end
+
+    if not anchor or not vim.api.nvim_win_is_valid(anchor)
+        or vim.api.nvim_win_get_tabpage(anchor) ~= tabpage or M.is_float(anchor) then
+      fail("split anchor window is not a valid ordinary window in the current tab", 4)
+    end
+    vim.api.nvim_set_current_win(anchor)
+    local commands = {
+      left = "topleft vertical split",
+      right = "botright vertical split",
+      top = "topleft split",
+      bottom = "botright split",
+    }
+    vim.cmd("noautocmd " .. commands[normalized.position])
+    winid = vim.api.nvim_get_current_win()
+    resize_split(winid, effective)
     vim.api.nvim_win_set_buf(winid, instance.bufnr)
-    assert_installed_buffer(winid, instance.bufnr)
+    assert_installed(winid, instance.bufnr)
     if not M.apply(instance, winid) then
       fail("target window was invalidated during option application", 4)
     end
-    restore_destination_buffer(snapshot)
-    if not is_float(winid) then
-      local current = { position = "current" }
-      set_metadata(instance, winid, current, current)
-      instance._last_layout_by_tab = instance._last_layout_by_tab or {}
-      instance._last_layout_by_tab[snapshot.tabpage] = current
+    if split_size(winid, effective) ~= effective.size then
+      fail("layout.size could not be materialized exactly", 4)
     end
-    M.sync_visibility(instance)
+    return nil
   end)
-  instance._window_transition = previous_transition
-  if not ok then
-    err = transition_error(instance, snapshot, err)
-    pcall(observe_visibility, instance)
-    error(err, 0)
+  if ok then return winid, err end
+  for _, created in ipairs(vim.api.nvim_tabpage_list_wins(tabpage)) do
+    if not before[created] and vim.api.nvim_win_is_valid(created) then
+      pcall(vim.api.nvim_win_close, created, true)
+    end
   end
-  if snapshot.bufnr ~= instance.bufnr then place_initial_cursor(instance, winid) end
-  return winid
+  if vim.api.nvim_win_is_valid(caller) then pcall(vim.api.nvim_set_current_win, caller) end
+  error(err, 0)
 end
 
-function M.replace_buffer(instance, winid, bufnr)
-  if type(winid) ~= "number" or not vim.api.nvim_win_is_valid(winid) then
-    fail("target window is not valid", 2)
-  end
-  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
-    fail("replacement buffer is not valid", 2)
-  end
-  local snapshot = snapshot_destination(instance, winid)
-  local ok, err = pcall(function()
-    protect_destination_buffer(instance, snapshot)
-    vim.api.nvim_win_set_buf(winid, bufnr)
-    assert_installed_buffer(winid, bufnr)
-    restore_destination_buffer(snapshot)
-  end)
-  if not ok then
-    err = transition_error(instance, snapshot, err)
-    pcall(M.sync_visibility, instance)
-    error(err, 0)
-  end
-  M.sync_visibility(instance)
-  return winid
+function M.safe_buffer()
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = bufnr })
+  return bufnr
 end
 
-function M.prepare_split(requested)
-  local layout = M.normalize(requested, { path = "layout" })
-  if layout.position ~= "left" and layout.position ~= "right"
-      and layout.position ~= "top" and layout.position ~= "bottom" then
-    fail("layout.position must be left, right, top, or bottom", 2)
+local function cleanup_safe_buffer(bufnr)
+  if bufnr and vim.api.nvim_buf_is_valid(bufnr) and #vim.fn.win_findbuf(bufnr) == 0 then
+    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
   end
-  local effective = M.materialize(layout)
-  validate_split_fit(effective)
-  return copy(layout), copy(effective)
 end
 
-function M.split_buffer(bufnr, requested)
-  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
-    fail("split buffer is not valid", 2)
-  end
-  local layout, effective = M.prepare_split(requested)
-  local tabpage = vim.api.nvim_get_current_tabpage()
+function M.discard_buffer(bufnr)
+  cleanup_safe_buffer(bufnr)
+end
+
+function M.close_window(winid)
+  if type(winid) ~= "number" or not vim.api.nvim_win_is_valid(winid) then return true end
+  local ok, err = pcall(vim.api.nvim_win_close, winid, true)
+  if not vim.api.nvim_win_is_valid(winid) then return true end
+  return false, err or "failed to close the created window"
+end
+
+function M.close_tab(tabpage)
+  if type(tabpage) ~= "number" or not vim.api.nvim_tabpage_is_valid(tabpage) then return true end
+  local number = vim.api.nvim_tabpage_get_number(tabpage)
+  local ok, err = pcall(vim.cmd, "noautocmd " .. tostring(number) .. "tabclose!")
+  if not vim.api.nvim_tabpage_is_valid(tabpage) then return true end
+  return false, err or "failed to close the created tab"
+end
+
+function M.create_split(normalized, effective, anchor)
+  assert_window(anchor, "split anchor window is not valid")
+  local tabpage = vim.api.nvim_win_get_tabpage(anchor)
+  if M.is_float(anchor) then fail("split anchor window must be ordinary", 2) end
+  local caller_tab = vim.api.nvim_get_current_tabpage()
   local caller_win = vim.api.nvim_get_current_win()
-  local before = snapshot_windows(tabpage)
+  local scratch = M.safe_buffer()
   local winid
+  local commands = {
+    left = "leftabove vertical sbuffer",
+    right = "rightbelow vertical sbuffer",
+    top = "leftabove sbuffer",
+    bottom = "rightbelow sbuffer",
+  }
   local ok, err = pcall(function()
-    winid = build_split_buffer(bufnr, layout, effective, caller_win)
-    if split_size(winid, layout) ~= effective.size then
+    if normalized.position ~= "left" and normalized.position ~= "right"
+        and normalized.position ~= "top" and normalized.position ~= "bottom" then
+      fail("layout.position must be left, right, top, or bottom", 4)
+    end
+    if vim.api.nvim_win_get_tabpage(anchor) ~= tabpage then
+      fail("split anchor window changed tab", 4)
+    end
+    vim.api.nvim_set_current_win(anchor)
+    vim.cmd("noautocmd " .. commands[normalized.position] .. " " .. tostring(scratch))
+    winid = vim.api.nvim_get_current_win()
+    if winid == anchor or vim.api.nvim_win_get_tabpage(winid) ~= tabpage
+        or vim.api.nvim_win_get_buf(winid) ~= scratch then
+      fail("created split destination is not exact", 4)
+    end
+    resize_split(winid, effective)
+    if split_size(winid, effective) ~= effective.size then
       fail("layout.size could not be materialized exactly", 4)
     end
   end)
+  if ok then return winid, scratch end
+  if winid then M.close_window(winid) end
+  cleanup_safe_buffer(scratch)
+  if vim.api.nvim_tabpage_is_valid(caller_tab) then
+    pcall(vim.api.nvim_set_current_tabpage, caller_tab)
+  end
+  if vim.api.nvim_win_is_valid(caller_win) then pcall(vim.api.nvim_set_current_win, caller_win) end
+  error(err, 0)
+end
+
+function M.create_tab()
+  local caller_tab = vim.api.nvim_get_current_tabpage()
+  local caller_win = vim.api.nvim_get_current_win()
+  local scratch = M.safe_buffer()
+  local created_tab
+  local created_win
+  local autocmd = vim.api.nvim_create_autocmd("TabNew", {
+    once = true,
+    callback = function()
+      created_tab = vim.api.nvim_get_current_tabpage()
+      created_win = vim.api.nvim_get_current_win()
+    end,
+  })
+  local ok, err = pcall(vim.cmd, "tab sbuffer " .. tostring(scratch))
+  pcall(vim.api.nvim_del_autocmd, autocmd)
+  if ok and created_tab and vim.api.nvim_tabpage_is_valid(created_tab)
+      and created_win and vim.api.nvim_win_is_valid(created_win)
+      and vim.api.nvim_win_get_tabpage(created_win) == created_tab
+      and vim.api.nvim_win_get_buf(created_win) == scratch then
+    vim.api.nvim_set_current_tabpage(created_tab)
+    vim.api.nvim_set_current_win(created_win)
+    return created_tab, created_win, scratch
+  end
+  if ok then err = "fre.window: created tab destination is not exact" end
+  if created_tab then M.close_tab(created_tab) end
+  cleanup_safe_buffer(scratch)
+  if vim.api.nvim_tabpage_is_valid(caller_tab) then
+    pcall(vim.api.nvim_set_current_tabpage, caller_tab)
+  end
+  if vim.api.nvim_win_is_valid(caller_win) then pcall(vim.api.nvim_set_current_win, caller_win) end
+  error(err, 0)
+end
+
+function M.remove(instance, winid, mode, previous_bufnr)
+  if not winid or not vim.api.nvim_win_is_valid(winid)
+      or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return true end
+  if mode == "restore" then
+    local replacement = previous_bufnr
+    local created_safe = false
+    if not replacement or not vim.api.nvim_buf_is_valid(replacement)
+        or replacement == instance.bufnr then
+      replacement = M.safe_buffer()
+      created_safe = true
+    end
+    local ok, err = pcall(vim.api.nvim_win_set_buf, winid, replacement)
+    if ok and vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return true end
+    if created_safe and vim.api.nvim_buf_is_valid(replacement)
+        and #vim.fn.win_findbuf(replacement) == 0 then
+      pcall(vim.api.nvim_buf_delete, replacement, { force = true })
+    end
+    return false, err or "failed to restore the previous buffer"
+  end
+
+  local ok, err = pcall(vim.api.nvim_win_close, winid, true)
+  if not vim.api.nvim_win_is_valid(winid) then return true end
+  if vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return true end
+  local replacement = M.safe_buffer()
+  local replaced, replace_err = pcall(vim.api.nvim_win_set_buf, winid, replacement)
+  if replaced and vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return true end
+  if vim.api.nvim_buf_is_valid(replacement) and #vim.fn.win_findbuf(replacement) == 0 then
+    pcall(vim.api.nvim_buf_delete, replacement, { force = true })
+  end
+  return false, replace_err or err or "failed to close the managed window"
+end
+
+
+function M.replace_buffer(instance, winid, bufnr)
+  if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
+    fail("replacement buffer is not valid", 2)
+  end
+  assert_window(winid)
+  local before = snapshot(winid)
+  local ok, err = pcall(function()
+    protect(before, bufnr)
+    vim.api.nvim_win_set_buf(winid, bufnr)
+    assert_installed(winid, bufnr)
+    finish_protection(before)
+  end)
   if not ok then
-    rollback_created_windows(tabpage, before, caller_win)
+    if not rollback(before) then err = tostring(err) .. "; destination rollback failed" end
     error(err, 0)
   end
   return winid
 end
 
-local function resolve(instance, layout, tabpage)
-  if layout ~= nil then return M.normalize(layout) end
-  local remembered = instance._last_layout_by_tab and instance._last_layout_by_tab[tabpage]
-  if remembered ~= nil then return M.normalize(remembered) end
-  return M.normalize(instance.config.layout)
-end
-
-local function remember(instance, tabpage, layout)
-  instance._last_layout_by_tab = instance._last_layout_by_tab or {}
-  instance._last_layout_by_tab[tabpage] = layout
-end
-
-local function open_prepared(instance, tabpage, layout, effective, selected, caller_win)
-  local remembered = copy(layout)
-  local newly_presented = false
-  if selected and M.same_layout(instance, selected, effective) then
-    local ok, result = pcall(function()
-      vim.api.nvim_set_current_win(selected)
-      assert_installed_buffer(selected, instance.bufnr)
-      if not M.apply(instance, selected) then
-        fail("target window was invalidated during option application", 4)
-      end
-    end)
-    if not ok then
-      if vim.api.nvim_win_is_valid(caller_win) then
-        pcall(vim.api.nvim_set_current_win, caller_win)
-      end
-      error(result, 0)
-    end
-    remember(instance, tabpage, remembered)
-    pcall(M.sync_visibility, instance)
-    return selected
-  end
-
-  local saved = save_view(selected)
-  local winid
-  if layout.position == "current" then
-    local destination = selected == caller_win and selected or caller_win
-    local snapshot = snapshot_destination(instance, destination)
-    local ok, result = pcall(function()
-      protect_destination_buffer(instance, snapshot)
-      winid = build_current(destination)
-      vim.api.nvim_win_set_buf(winid, instance.bufnr)
-      assert_installed_buffer(winid, instance.bufnr)
-      if not M.apply(instance, winid) then
-        fail("target window was invalidated during option application", 4)
-      end
-      newly_presented = snapshot.bufnr ~= instance.bufnr
-      restore_destination_buffer(snapshot)
-      restore_view(winid, saved)
-      set_metadata(instance, winid, layout, effective)
-    end)
-    if not ok then
-      error(transition_error(instance, snapshot, result), 0)
-    end
-    if selected and selected ~= winid then
-      local preserve = not is_float(selected) and #normal_windows(tabpage) == 1
-      local removed, remove_err = remove_view(instance, selected, preserve)
-      if not removed then
-        error(transition_error(instance, snapshot, remove_err), 0)
-      end
-    end
-  else
-    local before = snapshot_windows(tabpage)
-    local preserve_normal = selected and not is_float(selected)
-      and #normal_windows(tabpage) == 1
-    local fix_option, fixed_before
-    local scratch
-    local ok, result = pcall(function()
-      if layout.position == "float" then
-        scratch = scratch_buffer()
-        winid = build_float(layout, effective, scratch)
-      else
-        winid = create_split(layout, effective, caller_win, true)
-      end
-      vim.api.nvim_win_set_buf(winid, instance.bufnr)
-      assert_installed_buffer(winid, instance.bufnr)
-      if not M.apply(instance, winid) then
-        fail("target window was invalidated during option application", 4)
-      end
-      if scratch and vim.api.nvim_buf_is_valid(scratch)
-          and #vim.fn.win_findbuf(scratch) == 0 then
-        vim.api.nvim_buf_delete(scratch, { force = true })
-      end
-      newly_presented = true
-      restore_view(winid, saved)
-      set_metadata(instance, winid, layout, effective)
-      if layout.position ~= "float" and split_size(winid, layout) ~= effective.size then
-        fail("layout.size could not be materialized exactly", 4)
-      end
-      if selected and layout.position ~= "float" and not is_float(selected) then
-        fix_option = split_fix_option(layout)
-        fixed_before = vim.api.nvim_get_option_value(
-          fix_option, { scope = "local", win = winid }
-        )
-        set_split_fixed(winid, fix_option, true)
-      end
-    end)
-    if not ok then
-      rollback_created_windows(tabpage, before, caller_win)
-      if scratch and vim.api.nvim_buf_is_valid(scratch)
-          and #vim.fn.win_findbuf(scratch) == 0 then
-        pcall(vim.api.nvim_buf_delete, scratch, { force = true })
-      end
-      pcall(M.sync_visibility, instance)
-      error(result, 0)
-    end
-    if selected then
-      local removed, remove_err = remove_view(instance, selected, preserve_normal)
-      if not removed then
-        if fix_option then pcall(set_split_fixed, winid, fix_option, fixed_before) end
-        rollback_created_windows(tabpage, before, caller_win)
-        pcall(M.sync_visibility, instance)
-        error(remove_err, 0)
-      end
-    end
-    if fix_option then pcall(set_split_fixed, winid, fix_option, fixed_before) end
-  end
-  if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_get_current_win() ~= winid then
-    pcall(vim.api.nvim_set_current_win, winid)
-  end
-  if newly_presented and not selected then place_initial_cursor(instance, winid) end
-  remember(instance, tabpage, remembered)
-  pcall(M.sync_visibility, instance)
-  return winid
-end
-
-function M.open(instance, requested)
-  local tabpage = vim.api.nvim_get_current_tabpage()
-  -- Parsing and geometry checks precede the transition guard and editor state.
-  local layout = resolve(instance, requested, tabpage)
-  local effective = M.materialize(layout)
-  local selected = M.select(instance)
-  if not (selected and M.same_layout(instance, selected, effective)) then
-    validate_split_fit(effective)
-  end
-  local caller_win = vim.api.nvim_get_current_win()
-  local previous_transition = instance._window_transition
-  instance._window_transition = true
-  local ok, result = pcall(open_prepared, instance, tabpage, layout, effective, selected, caller_win)
-  instance._window_transition = previous_transition
-  if not ok then error(result, 0) end
-  return result
-end
-
-function M.hidden(instance)
-  local windows = current_tab_windows(instance)
-  for _, winid in ipairs(windows) do
-    if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == instance.bufnr then
-      local removed, err = remove_view(instance, winid)
-      if not removed then error(err, 0) end
-    end
-  end
-  M.sync_visibility(instance)
-  return true
-end
-
-function M.toggle(instance, requested)
-  local tabpage = vim.api.nvim_get_current_tabpage()
-  -- Toggle validates even when it will hide, preserving the same atomic
-  -- invalid-input contract as open().
-  local layout = resolve(instance, requested, tabpage)
-  local effective = M.materialize(layout)
-  local selected = M.select(instance)
-  if not selected then return M.open(instance, layout) end
-  if M.same_layout(instance, selected, effective) then return M.hidden(instance) end
-  return M.open(instance, layout)
-end
 
 return M

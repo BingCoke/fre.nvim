@@ -21,7 +21,7 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready-hidden" or instance.state == "ready-visible"
+    return instance.state == "ready"
       or instance.state == "load-failed"
   end)
   assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
@@ -263,6 +263,10 @@ describe("fre ticket 11 write workflow", function()
     assert.are.same({ "created.txt", "moved.txt" }, projected_paths(instance))
     assert.is_false(vim.bo[instance.bufnr].modified)
     assert.is_true(vim.bo[instance.bufnr].modifiable)
+    local reconciled = lines(instance)
+    vim.api.nvim_buf_call(instance.bufnr, function() vim.cmd("silent! undo") end)
+    assert.are.same(reconciled, lines(instance))
+    assert.is_false(vim.bo[instance.bufnr].modified)
     assert.are.equal("succeeded", instance._last_write_result.execution.state)
     assert.is_nil(instance._last_write_result.reconciliation_error)
   end)

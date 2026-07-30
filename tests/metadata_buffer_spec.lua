@@ -13,7 +13,7 @@ end
 
 local function wait_ready(instance)
   assert.is_true(vim.wait(1500, function()
-    return instance.state == "ready-hidden" or instance.state == "ready-visible"
+    return instance.state == "ready"
       or instance.state == "load-failed"
   end, 10))
   assert.are_not.equal("load-failed", instance.state, tostring(instance.error))

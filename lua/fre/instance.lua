@@ -6,7 +6,7 @@ local mutation_execute = require("fre.mutation.execute")
 local mutation_prepare = require("fre.mutation.prepare")
 local Tree = require("fre.tree")
 local Watch = require("fre.watch")
-local window = require("fre.window")
+local view = require("fre.view")
 
 local Instance = {}
 Instance.__index = Instance
@@ -30,9 +30,7 @@ local function require_ready(instance)
   if instance._destroyed or instance.state == "destroying" or instance.state == "destroyed" then
     fail("instance is destroyed", 4)
   end
-  if instance.state == "creating" or instance.state == "load-failed" then
-    fail("instance is not ready", 4)
-  end
+  if instance.state ~= "ready" then fail("instance is not ready", 4) end
 end
 
 local function safe_string(value)
@@ -111,9 +109,6 @@ function Instance:_set_lines(lines)
   return self:_replace_lines(0, -1, lines)
 end
 
-function Instance:_loading_line()
-  return "[fre] Loading " .. self.root
-end
 
 function Instance:_error_line(err)
   return "[fre] Error loading " .. safe_string(err)
@@ -144,7 +139,7 @@ function Instance:_on_marker_width_changed(generation)
   if self._destroyed or self.state == "destroying" or self.state == "destroyed" then
     return
   end
-  if self.state ~= "ready-hidden" and self.state ~= "ready-visible" then return end
+  if self.state ~= "ready" then return end
   if not vim.api.nvim_buf_is_valid(self.bufnr) or vim.bo[self.bufnr].modified then return end
   if (self.actions and self.actions.write) or self._refresh_request
       or self._watch_refresh_request then return end
@@ -174,7 +169,7 @@ function Instance:_on_marker_width_changed(generation)
   self._marker_width_stale = view_generation < self.manager:get_marker_widths().generation
 end
 
-function Instance:_snapshot_visibility()
+function Instance:_snapshot_projection_ranges()
   local snapshot = {}
   for _, node in pairs(self.nodes_by_id) do
     snapshot[node] = {
@@ -187,7 +182,7 @@ function Instance:_snapshot_visibility()
   return snapshot
 end
 
-function Instance:_restore_visibility(snapshot)
+function Instance:_restore_projection_ranges(snapshot)
   for node, value in pairs(snapshot) do
     node.visible_size = value.visible_size
     node.visible_start = value.visible_start
@@ -291,12 +286,12 @@ function Instance:_finish_initial(token, generation, err, children, real_root, o
       self.needs_refresh = true
       self:_set_lines({ self:_error_line(completion_err) })
     else
-      self.state = #vim.fn.win_findbuf(self.bufnr) > 0 and "ready-visible" or "ready-hidden"
+      self.state = "ready"
       self.error = nil
       self.needs_refresh = false
       self:_sync_watchers()
+      if self.hidden_since ~= nil then self.manager:gc_reconsider(self, true) end
     end
-    self.manager:gc_visibility_changed(self)
     -- This function already runs on the main loop. Existing observers complete
     -- before FreReady so reentrant event handlers cannot suppress them.
     for _, callback in ipairs(callbacks) do
@@ -355,7 +350,7 @@ function Instance:_start_load(initial, on_complete)
     self.state = "creating"
     self.error = nil
     self.result = nil
-    self:_set_lines({ self:_loading_line() })
+    self:_set_lines({ "" })
   end
   local finished = false
   local function done(load_err, loaded_children, loaded_real_root)
@@ -383,7 +378,7 @@ function Instance:when_ready(callback)
     fail("instance is destroyed", 2)
   end
   local entry = { fn = callback, active = true }
-  if self.state == "ready-hidden" or self.state == "ready-visible" then
+  if self.state == "ready" then
     self:_schedule_callback(entry, nil, self._attempt)
   elseif self.state == "load-failed" then
     self:_schedule_callback(entry, self.error, self._attempt)
@@ -519,16 +514,6 @@ function Instance:_active_directory(node)
   return current == self.root_node
 end
 
-function Instance:_is_visible()
-  if not vim.api.nvim_buf_is_valid(self.bufnr) then return false end
-  for _, winid in ipairs(vim.fn.win_findbuf(self.bufnr)) do
-    if vim.api.nvim_win_is_valid(winid)
-        and vim.api.nvim_win_get_buf(winid) == self.bufnr then
-      return true
-    end
-  end
-  return false
-end
 
 function Instance:_watch_specs()
   local specs = {
@@ -550,9 +535,7 @@ function Instance:_watch_specs()
 end
 
 function Instance:_sync_watchers(recreate_failed)
-  if self._destroyed or (self.state ~= "ready-hidden" and self.state ~= "ready-visible") then
-    return
-  end
+  if self._destroyed or self.state ~= "ready" then return end
   self._watchers:sync(self:_watch_specs(), { recreate_failed = recreate_failed == true })
 end
 
@@ -578,19 +561,19 @@ function Instance:_schedule_watch_followup()
   vim.schedule(function()
     if self._destroyed then return end
     self._watch_followup_scheduled = false
-    if self.needs_refresh then self:_on_visibility_enter() end
+    if self.needs_refresh and view.has_active(self) then self:_on_presentation_enter() end
   end)
 end
 
 function Instance:_watch_commit_safe(entry, request)
   if self._destroyed or self.state == "destroying" or self.state == "destroyed"
       or not vim.api.nvim_buf_is_valid(self.bufnr) then return false end
-  if self.state ~= "ready-hidden" and self.state ~= "ready-visible" then return false end
+  if self.state ~= "ready" then return false end
   if not self._watchers:is_current(entry) then return false end
   local node = self.nodes_by_id[entry.node_id]
   if not node or node.path ~= entry.path or node.kind ~= "directory"
       or not node.loaded or not self:_active_directory(node) then return false end
-  if not self:_is_visible() or vim.bo[self.bufnr].modified
+  if not view.has_active(self) or vim.bo[self.bufnr].modified
       or (self.actions and self.actions.write) or self._refresh_request then return false end
   if self._execution and not mutation_execute.is_terminal(self._execution) then return false end
   if request then
@@ -809,12 +792,12 @@ function Instance:set_hidden_file(hidden_file)
   self:_require_projection_change()
   if hidden_file == self.current_hidden_file then return nil end
   local previous = self.current_hidden_file
-  local visibility = self:_snapshot_visibility()
+  local projection_ranges = self:_snapshot_projection_ranges()
   self.current_hidden_file = hidden_file
   local ok, result = pcall(self._render_success, self)
   if not ok or result == false then
     self.current_hidden_file = previous
-    self:_restore_visibility(visibility)
+    self:_restore_projection_ranges(projection_ranges)
     if not ok then error(result, 0) end
     fail("buffer projection commit failed", 2)
   end
@@ -1033,7 +1016,7 @@ function Instance:set_cursor_to_path(snapshot_path, winid)
     if not position then fail("snapshot path is not visible: " .. snapshot_path, 3) end
     vim.api.nvim_win_set_cursor(winid, position)
   end
-  if self.state == "ready-hidden" or self.state == "ready-visible" then
+  if self.state == "ready" then
     place()
   elseif self.state == "creating" then
     self:when_ready(function(ready_err)
@@ -1043,21 +1026,6 @@ function Instance:set_cursor_to_path(snapshot_path, winid)
     require_ready(self)
   end
   return self
-end
-
-function Instance:_apply_pending_reveal(winid)
-  local request = self._pending_reveal
-  if not request or request.generation ~= self._reveal_generation or self._destroyed then
-    return false
-  end
-  local position = self:get_pos(request.relative)
-  winid = winid or window.select(self)
-  if not position or not winid or not vim.api.nvim_win_is_valid(winid)
-      or vim.api.nvim_win_get_tabpage(winid) ~= request.tabpage
-      or vim.api.nvim_win_get_buf(winid) ~= self.bufnr then return false end
-  vim.api.nvim_win_set_cursor(winid, position)
-  if self._pending_reveal == request then self._pending_reveal = nil end
-  return true
 end
 
 function Instance:reveal(snapshot_path)
@@ -1080,15 +1048,17 @@ function Instance:reveal(snapshot_path)
   if not position then self:_require_projection_change() end
 
   self._reveal_generation = self._reveal_generation + 1
+  local target_tabpage = vim.api.nvim_get_current_tabpage()
+  local target_winid
+  local selected_ok, selected = pcall(view.select, self, target_tabpage)
+  if selected_ok then target_winid = selected end
   local request = {
     generation = self._reveal_generation,
-    tabpage = vim.api.nvim_get_current_tabpage(),
     relative = relative,
     absolute = absolute,
     active = true,
     synchronous = true,
   }
-  self._pending_reveal = request
 
   local function current()
     return request.active and not self._destroyed
@@ -1098,12 +1068,18 @@ function Instance:reveal(snapshot_path)
     if not current() then return end
     request.active = false
     if err then
-      if self._pending_reveal == request then self._pending_reveal = nil end
       if request.synchronous then fail(err, 4) end
       self:_report_async_error(err)
       return
     end
-    self:_apply_pending_reveal()
+    if not target_winid then return end
+    pcall(function()
+      if view.select(self, target_tabpage) ~= target_winid
+          or not vim.api.nvim_win_is_valid(target_winid)
+          or vim.api.nvim_win_get_buf(target_winid) ~= self.bufnr then return end
+      local target = self:get_pos(request.relative)
+      if target then vim.api.nvim_win_set_cursor(target_winid, target) end
+    end)
   end
   local function finish(parent)
     if not current() then return end
@@ -1600,9 +1576,7 @@ function Instance:refresh(opts)
     end)
     return nil
   end
-  if self.state ~= "ready-hidden" and self.state ~= "ready-visible" then
-    fail("instance is not ready", 2)
-  end
+  if self.state ~= "ready" then fail("instance is not ready", 2) end
   for _, node in pairs(self.nodes_by_id) do
     if node.kind == "directory"
         and (node.load_state == "loading" or node.load_state == "refreshing") then
@@ -1618,12 +1592,16 @@ function Instance:refresh(opts)
   return nil
 end
 
-function Instance:_on_visibility_enter()
+function Instance:_on_presentation_leave()
   if self._destroyed then return end
-  if not self.manager:gc_visibility_changed(self) then return end
-  if self.state == "ready-hidden" then self.state = "ready-visible" end
-  if self.state ~= "ready-visible" or not self.needs_refresh
-      or self._pending_visibility_refresh or self._refresh_request
+  self.manager:gc_presentation_leave(self)
+end
+
+function Instance:_on_presentation_enter()
+  if self._destroyed then return end
+  if not self.manager:gc_presentation_enter(self) then return end
+  if self.state ~= "ready" or not self.needs_refresh
+      or self._pending_presentation_refresh or self._refresh_request
       or self._watch_refresh_request or vim.bo[self.bufnr].modified
       or (self.actions and self.actions.write) then return end
   if self._execution and not mutation_execute.is_terminal(self._execution) then return end
@@ -1631,17 +1609,17 @@ function Instance:_on_visibility_enter()
     if node.kind == "directory"
         and (node.load_state == "loading" or node.load_state == "refreshing") then return end
   end
-  self._pending_visibility_refresh = true
+  self._pending_presentation_refresh = true
   local ok, err = pcall(self.refresh, self, { on_complete = function(refresh_err)
     if self._destroyed then return end
-    self._pending_visibility_refresh = false
+    self._pending_presentation_refresh = false
     if refresh_err ~= nil then
       self.needs_refresh = true
       self:_report_async_error(refresh_err)
     end
   end })
   if not ok then
-    self._pending_visibility_refresh = false
+    self._pending_presentation_refresh = false
     self.needs_refresh = true
     self:_report_async_error(err)
   end
@@ -1649,26 +1627,23 @@ end
 
 function Instance:open(layout)
   if self._destroyed then fail("instance is destroyed", 2) end
-  local winid = window.open(self, layout)
-  if self._pending_reveal then self:_apply_pending_reveal(winid) end
-  self:_on_visibility_enter()
-  return self, winid
+  return self, view.open(self, layout)
 end
 
-function Instance:hidden()
+function Instance:hidden(tabpage)
   if self._destroyed then fail("instance is destroyed", 2) end
-  return window.hidden(self)
+  return view.hidden(self, tabpage)
+end
+
+function Instance:hide_all()
+  if self._destroyed then fail("instance is destroyed", 2) end
+  return view.hide_all(self)
 end
 
 function Instance:toggle(layout)
   if self._destroyed then fail("instance is destroyed", 2) end
-  local result = window.toggle(self, layout)
-  if type(result) == "number" then
-    if self._pending_reveal then self:_apply_pending_reveal(result) end
-    self:_on_visibility_enter()
-    return self
-  end
-  return result
+  local result = view.toggle(self, layout)
+  return type(result) == "number" and self or result
 end
 
 function Instance:prepare()
@@ -1722,6 +1697,7 @@ function Instance:_start_destroy()
   local manager = self.manager
   self.state = "destroying"
   self._destroyed = true
+  pcall(view.hide_all, self)
   manager:get_gc_controller():stop(self)
 
   self._attempt = self._attempt + 1
@@ -1730,10 +1706,8 @@ function Instance:_start_destroy()
   self._watch_event_generation = self._watch_event_generation + 1
   self._tree_generation = self._tree_generation + 1
   self._reveal_generation = self._reveal_generation + 1
-  if self._pending_reveal then self._pending_reveal.active = false end
-  self._pending_reveal = nil
   self._pending_initial_cursor = {}
-  self._pending_visibility_refresh = false
+  self._pending_presentation_refresh = false
 
   local ready_callbacks = self._ready_callbacks
   self._ready_callbacks = {}
@@ -1815,7 +1789,6 @@ local function invalidate_failed_constructor(self)
   if self.root_node and type(self.root_node.load_generation) == "number" then
     self.root_node.load_generation = self.root_node.load_generation + 1
   end
-  if self._pending_reveal then self._pending_reveal.active = false end
   self._pending_initial_cursor = {}
   for _, callback in ipairs(self._ready_callbacks or {}) do callback.active = false end
   self._ready_callbacks = {}
@@ -1909,13 +1882,12 @@ function Instance.new(manager, root, effective)
     self._watch_event_generation = 0
     self._watch_followup_scheduled = false
     self._tree_generation = 0
-    self._pending_visibility_refresh = false
+    self._pending_presentation_refresh = false
     self._execution = nil
     self._reveal_generation = 0
-    self._pending_reveal = nil
     self._marker_width_stale = false
     self._pending_initial_cursor = {}
-    self._last_layout_by_tab = {}
+    self._views = {}
     self._next_node_id = 1
     self.nodes_by_id = {}
     self.nodes_by_path = {}
@@ -1945,7 +1917,6 @@ function Instance.new(manager, root, effective)
     self._watchers = Watch.new(self, manager:get_watch_adapter())
     buffer.setup(self)
     mapping.setup(self)
-    self:_set_lines({ self:_loading_line() })
     manager:register(self)
     self:_start_load(true)
     return self
