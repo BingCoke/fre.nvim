@@ -35,6 +35,14 @@ local function ready(entries, opts)
   return wait_ready(keep(fre.new(opts)))
 end
 
+local function ready_from_adapter(entries, opts)
+  fre._set_fs_adapter({
+    load = function(scan_path, done) done(nil, entries, scan_path) end,
+  })
+  opts = vim.tbl_extend("force", { root = fixture.root }, opts or {})
+  return wait_ready(keep(fre.new(opts)))
+end
+
 local function lines(instance)
   return vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false)
 end
@@ -273,6 +281,108 @@ describe("fre ticket 10 prepare basic mutations", function()
     assert.are.same({ operations = {}, display = {} }, instance:prepare())
   end)
 
+  it("keeps unsupported snapshot kinds while planning unrelated mutations", function()
+    local instance = ready_from_adapter({
+      { name = "device", kind = "char" },
+      { name = "keep.txt", kind = "file" },
+    })
+    local device = physical_line(instance, "device")
+    local moved_keep = edited_line(instance, "keep.txt", "moved.txt")
+    local decoded = buffer.decode(instance, row_for(instance, "device"))
+
+    assert.are.equal("char", decoded.entry.kind)
+    assert.are.same({ operations = {}, display = {} }, instance:prepare())
+
+    set_lines(instance, { device, moved_keep, "new.txt" })
+    assert.are.same({
+      {
+        type = "move", from = fixture:path("keep.txt"),
+        to = fixture:path("moved.txt"), kind = "file",
+      },
+      { type = "create_file", path = fixture:path("new.txt") },
+    }, instance:prepare().operations)
+  end)
+
+  it("rejects direct mutation of unsupported snapshot kinds", function()
+    local instance = ready_from_adapter({ { name = "device", kind = "char" } })
+    local original = physical_line(instance, "device")
+    local renamed = edited_line(instance, "device", "renamed-device")
+    local copied = edited_line(instance, "device", "copied-device")
+
+    set_lines(instance, { renamed })
+    assert_error("row 2: unsupported snapshot kind char for device", function()
+      instance:prepare()
+    end)
+
+    set_lines(instance, { original, copied })
+    assert_error("row 3: unsupported snapshot kind char for device", function()
+      instance:prepare()
+    end)
+
+    set_lines(instance, {})
+    assert_error("unsupported snapshot kind char for device", function() instance:prepare() end)
+  end)
+
+  it("keeps hidden unsupported snapshot kinds as target occupants", function()
+    local instance = ready_from_adapter({
+      { name = ".device", kind = "char" },
+      { name = "keep.txt", kind = "file" },
+    })
+    assert.is_nil(instance:get_pos(".device"))
+
+    set_lines(instance, { edited_line(instance, "keep.txt", ".device") })
+    assert_error("target .device is occupied by snapshot path .device", function()
+      instance:prepare()
+    end)
+  end)
+
+  it("rejects foreign unsupported snapshot kinds", function()
+    local source_root = fixture:mkdir("source")
+    local destination_root = fixture:mkdir("destination")
+    fre._set_fs_adapter({
+      load = function(scan_path, done)
+        local entries = path.equal(scan_path, source_root)
+            and { { name = "device", kind = "char" } } or {}
+        done(nil, entries, scan_path)
+      end,
+    })
+    local source = wait_ready(keep(fre.new({ root = source_root })))
+    local destination = wait_ready(keep(fre.new({ root = destination_root })))
+
+    set_lines(destination, { edited_line(source, "device", "copied-device") })
+    assert_error("row 2: unsupported snapshot kind char for device", function()
+      destination:prepare()
+    end)
+  end)
+
+  it("rejects foreign directory copies with cached unsupported descendants", function()
+    local source_directory = fixture:mkdir("source-directory/folder")
+    local source_root = fixture:path("source-directory")
+    local destination_root = fixture:mkdir("directory-destination")
+    fre._set_fs_adapter({
+      load = function(scan_path, done)
+        local entries = {}
+        if path.equal(scan_path, source_root) then
+          entries = { { name = "folder", kind = "directory" } }
+        elseif path.equal(scan_path, source_directory) then
+          entries = { { name = "device", kind = "char" } }
+        end
+        done(nil, entries, scan_path)
+      end,
+    })
+    local source = wait_ready(keep(fre.new({ root = source_root })))
+    local destination = wait_ready(keep(fre.new({ root = destination_root })))
+    source:expand("folder")
+    local device_path = path.resolve(source_directory, "device")
+    wait_for(function() return source.nodes_by_path[device_path] ~= nil end)
+
+    set_lines(destination, { edited_line(source, "folder", "copied-folder/") })
+    local err = assert_error("row 2: unsupported snapshot kind char", function()
+      destination:prepare()
+    end)
+    assert.is_truthy(err:find(device_path, 1, true), err)
+  end)
+
   it("plans retained moves and missing projected IDs as one move and one delete", function()
     local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b", ["keep.txt"] = "k" })
     local current = lines(instance)
@@ -358,6 +468,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     set_lines(instance, { original })
     local row = row_for(instance, "a.txt")
     instance.nodes_by_id[buffer.decode(instance, row).node_id].kind = "other"
+    set_lines(instance, { edited_line(instance, "a.txt", "renamed.txt") })
     assert_error("row 2: unsupported snapshot kind other for a.txt", function() instance:prepare() end)
   end)
 

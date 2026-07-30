@@ -253,6 +253,46 @@ describe("fre ticket 12 duplicate and directory semantics", function()
     end
   end)
 
+  it("only moves directories with cached unsupported descendants", function()
+    local root = vim.fs.normalize(fixture.root)
+    local directory = vim.fs.normalize(fixture:path("dir"))
+    fre._set_fs_adapter({
+      load = function(scan_path, done)
+        local entries
+        if scan_path == root then
+          entries = { { name = "dir", kind = "directory" } }
+        elseif scan_path == directory then
+          entries = { { name = "device", kind = "char" } }
+        else
+          return done("unexpected scan path " .. scan_path)
+        end
+        done(nil, entries, scan_path)
+      end,
+    })
+    local instance = ready({})
+    expand(instance, "dir")
+    assert.are.equal("char", instance.nodes_by_path[fixture:path("dir", "device")].kind)
+    instance:collapse("dir")
+    local original = physical_line(instance, "dir")
+    local moved = edited_line(instance, "dir", "moved/")
+    local copied = edited_line(instance, "dir", "copied/")
+
+    set_lines(instance, { moved })
+    assert.are.same({ {
+      type = "move", from = directory, to = fixture:path("moved"), kind = "directory",
+    } }, instance:prepare().operations)
+
+    set_lines(instance, { original, copied })
+    assert_error("unsupported snapshot kind char for dir/device", function()
+      instance:prepare()
+    end)
+
+    set_lines(instance, {})
+    assert_error("unsupported snapshot kind char for dir/device", function()
+      instance:prepare()
+    end)
+  end)
+
   it("orders explicit descendant extraction before ancestor move copy and delete", function()
     local cases = {
       {

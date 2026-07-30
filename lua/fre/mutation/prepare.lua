@@ -22,6 +22,17 @@ local function validate_kind(kind, row, snapshot_path)
   if row then fail_row(row, message) else fail(message) end
 end
 
+local function cached_unsupported(node)
+  if not supported_kinds[node.kind] then return node end
+  if node.kind == "directory" and node.children_cached then
+    for _, child in ipairs(node.children_order or {}) do
+      local unsupported = cached_unsupported(child)
+      if unsupported then return unsupported end
+    end
+  end
+  return nil
+end
+
 local function sorted_node_ids(nodes_by_id)
   local ids = {}
   for id in pairs(nodes_by_id or {}) do ids[#ids + 1] = id end
@@ -146,13 +157,13 @@ function M.prepare(instance)
     if decoded.synthetic then
       -- Synthetic decoded rows never participate in filesystem plans.
     elseif decoded.marked then
-      validate_kind(decoded.entry.kind, row, decoded.entry.relative_path)
       local absolute, relative = target_for_row(instance, row, decoded)
       local occurrence = {
         row = row, node_id = decoded.node_id, kind = decoded.entry.kind,
         target = absolute, target_relative = relative,
       }
       if decoded.foreign then
+        validate_kind(decoded.entry.kind, row, decoded.entry.relative_path)
         occurrence.foreign = true
         occurrence.source = decoded.entry.absolute_path
         occurrence.source_node = decoded.source_node
@@ -194,6 +205,28 @@ function M.prepare(instance)
     if left_depth ~= right_depth then return left_depth < right_depth end
     return baseline_index[left] < baseline_index[right]
   end)
+  -- Opaque kinds remain in occupancy snapshots but never own direct actions.
+  local mutable_order = {}
+  for _, id in ipairs(classification_order) do
+    local node = instance.nodes_by_id[id]
+    if node == nil then
+      fail("projected baseline references missing local node " .. tostring(id), 3)
+    end
+    if supported_kinds[node.kind] then
+      mutable_order[#mutable_order + 1] = id
+    else
+      local source = path.normalize(baseline[id], { windows = windows })
+      local source_relative = assert(path.relative(instance.root, source))
+      local found = sorted_occurrences(occurrences[id], windows)
+      if #found == 0 then validate_kind(node.kind, nil, source_relative) end
+      for _, occurrence in ipairs(found) do
+        if occurrence.target ~= source then
+          validate_kind(node.kind, occurrence.row, source_relative)
+        end
+      end
+    end
+  end
+  classification_order = mutable_order
 
   local actions, intents = {}, {}
   local action_counter = 0
@@ -265,9 +298,7 @@ function M.prepare(instance)
   end
 
   for _, id in ipairs(classification_order) do
-    local node = instance.nodes_by_id[id]
-    if node == nil then fail("projected baseline references missing local node " .. tostring(id), 3) end
-    validate_kind(node.kind, nil, node.path)
+    local node = assert(instance.nodes_by_id[id])
     local source = path.normalize(baseline[id], { windows = windows })
     local source_relative = assert(path.relative(instance.root, source))
     local found = sorted_occurrences(occurrences[id], windows)
@@ -389,6 +420,30 @@ function M.prepare(instance)
         else
           intent.final_roots[#intent.final_roots + 1] = occurrence.target
         end
+      end
+    end
+  end
+
+  for _, action in ipairs(actions) do
+    if action.kind == "directory"
+        and (action.type == "copy" or action.type == "delete") then
+      local unsupported
+      if action.foreign then
+        for _, entry in ipairs(action.source_entries or {}) do
+          if not supported_kinds[entry.kind] then
+            unsupported = entry
+            break
+          end
+        end
+      else
+        unsupported = cached_unsupported(action.node)
+      end
+      if unsupported then
+        local snapshot_path = unsupported.path
+        if not action.foreign then
+          snapshot_path = assert(path.relative(instance.root, unsupported.path))
+        end
+        validate_kind(unsupported.kind, action.row, snapshot_path)
       end
     end
   end

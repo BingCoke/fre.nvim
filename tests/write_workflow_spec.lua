@@ -773,6 +773,29 @@ describe("fre ticket 11 write workflow", function()
     assert.is_nil(instance._last_write_result.execution)
   end)
 
+  it("writes retained unsupported snapshot kinds through the empty Plan path", function()
+    fre._set_fs_adapter({
+      load = function(scan_path, done)
+        done(nil, { { name = "device", kind = "char" } }, scan_path)
+      end,
+    })
+    local instance = wait_ready(keep(fre.new({ root = fixture.root, columns = {} })))
+    local ui = scripted_ui()
+    local baseline = lines(instance)
+    set_lines(instance, { "", physical_line(instance, "device"), "" })
+
+    assert.are.same({ operations = {}, display = {} }, instance:prepare())
+    assert.is_true(write_command(instance))
+    assert.is_nil(instance._execution)
+    wait_unlocked(instance)
+
+    assert.are.same(baseline, lines(instance))
+    assert.are.equal(0, #ui.confirmations)
+    assert.are.equal(0, #ui.progress_statuses)
+    assert.is_false(vim.bo[instance.bufnr].modified)
+    assert.is_nil(instance._last_write_result.execution)
+  end)
+
   it("cleans lock and UI references when confirmation, progress, update, close, or report throws", function()
     local confirm_instance = ready({ ["a.txt"] = "a" })
     scripted_ui({ confirm_error = "confirmation exploded" })
