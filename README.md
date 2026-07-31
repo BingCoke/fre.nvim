@@ -26,15 +26,12 @@ tests/
 
 ## 安装
 
-仓库当前没有配置可引用的远端 URL。以下示例假设你已经有一个本地仓库目录。
-
 使用 [lazy.nvim](https://github.com/folke/lazy.nvim) 的完整最小配置：
 
 ```lua
 require("lazy").setup({
   {
-    dir = "/absolute/path/to/fre.nvim",
-    name = "fre.nvim",
+    "BingCoke/fre.nvim",
     lazy = false,
     dependencies = { "nvim-tree/nvim-web-devicons" },
     config = function()
@@ -52,8 +49,6 @@ require("lazy").setup({
 vim.opt.runtimepath:prepend("/absolute/path/to/fre.nvim")
 require("fre").setup({})
 ```
-
-发布到 Git 远端后，应删除 `dir`，并把内层 spec 改为 `{ "owner/fre.nvim", ... }` 或使用插件管理器的 `url = "..."` 字段。
 
 ## 快速开始
 
