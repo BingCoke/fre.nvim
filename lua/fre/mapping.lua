@@ -1,5 +1,6 @@
 local buffer = require("fre.buffer")
 local manager_module = require("fre.manager")
+local view = require("fre.view")
 
 local M = {}
 
@@ -57,6 +58,7 @@ function M.context(expected_instance, opts)
   end
 
   local winid = vim.api.nvim_get_current_win()
+  local source_view = view.source(instance, winid)
   local cursor = vim.api.nvim_win_get_cursor(winid)
   local mode = vim.api.nvim_get_mode().mode
   local row, col = cursor[1], cursor[2]
@@ -72,6 +74,7 @@ function M.context(expected_instance, opts)
     bufnr = bufnr,
     winid = winid,
     tabpage = vim.api.nvim_win_get_tabpage(winid),
+    view = source_view,
     mode = mode,
     row = row,
     col = col,

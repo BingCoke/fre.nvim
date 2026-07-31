@@ -197,8 +197,7 @@ fre.setup({
     n = {
       ["<C-t>"] = actions.tab_select,
       ["<C-v>"] = function(ctx)
-        local inspected = fre.view.inspect(ctx.instance, ctx.tabpage)
-        if not inspected then error("fre: source View is no longer active") end
+        local inspected = ctx.view
         local anchor = ctx.winid
         if inspected.layout.position == "float" then
           anchor = inspected.origin_winid
@@ -304,11 +303,11 @@ instance:open({
 
 分屏 `size`、浮窗 `width`/`height` 和 `row`/`col` 支持绝对 cell 数；小于 `1` 的正数表示比例。浮窗支持 `none`、`single`、`double`、`rounded`、`solid`、`shadow` 及 Neovim 八段 border 数组。
 
-每个 Instance 在每个 tab 中最多有一个 Fre-managed active View；同一 Instance 可以同时显示在多个 tab。它们共享 Instance 的 tree、buffer 和展开状态，但 Neovim 为各 tab 的 View 独立保留 cursor、scroll 和 viewport。共享投影发生展开、折叠或刷新时，Fre 会按 Entry path 为所有仍有效的 active Views 尽力恢复语义 cursor 和相对 viewport；Entry 消失时回退到最近的可见祖先，再回退到 root/首行。hidden tab 不保存待应用的 cursor 意图。
+任何有效窗口只要正在显示一个已注册且未销毁的 Fre buffer，就是该 Instance 的一个 View。同一 Instance 在同一 tab 或不同 tab 都可以有多个 View；原生 `<C-w>v`、`<C-w>s`、`:split`、`:vsplit` 和 `:sbuffer` duplicate 都受支持。它们共享 tree、buffer 和展开状态，但各自保留 cursor、scroll 和 viewport。共享投影变化时，Fre 会按 Entry path 为全部实际 View 尽力恢复语义 cursor 和相对 viewport。
 
-当前 tab 已有 active View 时，`instance:open()` 不传 layout 只聚焦现有窗口；传入相同的 normalized layout 复用窗口和 view，传入不同 layout 才 relayout。`instance:hidden(tabpage?)` 只隐藏指定 tab（默认当前 tab）并删除 active View record；`instance:hide_all()` 才显式隐藏所有 tab。`instance:toggle(layout)` 是严格二元操作：active 时隐藏，inactive 时打开。隐藏后不保留 layout history，再次不带 explicit layout 打开时使用该 Instance 创建时复制的 immutable default layout。
+`instance:open()` 在当前窗口本身是 View 时选择当前窗口；否则复用当前 tab 的唯一 View；存在多个非当前候选时显示原生 `a/b/...` 选择提示。没有 View 时才按 explicit layout 或 Instance 创建时复制的 immutable default layout 打开。相同 normalized layout 直接复用，显式不同 layout 只 relayout 被选中的一个 View，其他 duplicate 不变。
 
-`position = "current"` 的 View 隐藏时恢复它替换前的 buffer；Fre 创建的 split、float 和 tab View 隐藏时关闭对应窗口（若是最后一个 ordinary window 且无法关闭，则换入安全空 buffer）。
+`instance:hidden(tabpage?)` 隐藏指定 tab（默认当前 tab）中的全部 View；`instance:hide_all()` 隐藏所有 tab。`instance:toggle(layout)` 是严格二元操作：当前 tab 只要有任意 View 就全部隐藏，否则打开。`position = "current"` 的 Fre-established View 隐藏时恢复它替换前的 buffer；Fre 创建的 split、float 和 tab destination 隐藏时关闭对应窗口。没有 Fre window policy 的原生 duplicate 采用保守 current-position 语义，恢复有效 alternate buffer 或安全空 buffer。
 
 ## 自定义映射与 actions
 
@@ -320,6 +319,7 @@ instance:open({
   bufnr = bufnr,
   winid = winid,
   tabpage = tabpage,
+  view = { winid = winid, origin_winid = origin_winid, layout = normalized_layout },
   mode = mode,
   row = row,             -- 1-based
   col = col,             -- 0-based UTF-8 byte offset
@@ -332,7 +332,7 @@ instance:open({
 }
 ```
 
-ActionContext 是 mapping 当次同步调用的 source snapshot。它不包含 layout、origin、visibility、View generation/token 或 reconciliation 字段；缓存它并延迟执行不受支持。需要 presentation 信息时，应在 callback 内同步调用 `fre.view.inspect()`。更多完整示例见 [TIPS.md](TIPS.md)。
+ActionContext 是 mapping 当次同步调用的 source snapshot。`ctx.view` 是 exact `ctx.winid` 的只读 View snapshot，mapping 可直接读取 `layout` 和 `origin_winid`；不会携带 visibility、generation/token 或 reconciliation 状态。缓存 context 并延迟执行不受支持。非 mapping 场景可同步调用 `fre.view.inspect()`。更多完整示例见 [TIPS.md](TIPS.md)。
 
 可视范围形状为：
 
@@ -380,9 +380,9 @@ actions.split_select(ctx, {
 
 三种 selection action 的 option table 都是 closed schema：`select` 只接受 `target_winid`、`hide_source`、`instance`；`tab_select` 只接受 `hide_source`、`instance`；`split_select` 必须提供 `layout`，此外只接受 `anchor_winid`、`hide_source`、`instance`。任何未列字段（包括 numeric key 和其他 non-string key）都会在 preflight 直接报错。`opts.instance` 仅用于 directory child，`root` 由 action 持有，action 计算的 `expanded` 会覆盖调用方值。
 
-三种 selection action 共享相同的 source、Entry、resource preparation、buffer install commit、View ownership、cursor、focus 和 post-commit `hide_source` 语义，只是 destination shape 不同：`select` 使用 exact `target_winid`，省略时是 captured `ctx.winid`；`tab_select` 创建一个 exact 新 tab；`split_select` 相对 exact ordinary anchor 创建目标。ordinary source 省略 `anchor_winid` 时只使用 captured source window；float source 必须显式提供同 tab 的 ordinary anchor，通常来自同步 `fre.view.inspect(...).origin_winid`。无效 option/source/target/anchor/layout 会在 destination、file buffer 或 child Instance 创建前报错，不会从当前焦点或其他窗口 fallback。
+三种 selection action 共享相同的 source、Entry、resource preparation、buffer install commit、window policy、cursor、focus 和 post-commit `hide_source` 语义，只是 destination shape 不同：`select` 使用 exact `target_winid`，省略时是 captured `ctx.winid`；`tab_select` 创建一个 exact 新 tab；`split_select` 相对 exact ordinary anchor 创建目标。ordinary source 省略 `anchor_winid` 时只使用 captured source window；float source 必须显式提供同 tab 的 ordinary anchor，通常直接使用 `ctx.view.origin_winid`。无效 option/source/target/anchor/layout 会在 destination、file buffer 或 child Instance 创建前报错，不会从当前焦点或其他窗口 fallback。
 
-`hide_source` 必须是 boolean，默认 `false`。它只在 selected buffer 成功安装后，作用于 captured source Instance/View/tab；不会隐藏同 Instance 在其他 tab 的 View。file/symlink 安装后 destination 是 ordinary file window，不保留 Fre View ownership。directory child 在 managed target 中 transfer ownership，在 ordinary target 中 adopt 并在隐藏时恢复旧 buffer，在 action-created tab/split 中 adopt 为 close-on-hide View。child 的异步 load failure 保留已提交 destination 和 ownership，不恢复 parent。`opts.instance` 只对 directory child 有效；file/symlink 在三种 action 中传入任何 non-nil `opts.instance` 都会 preflight 报错。
+`hide_source` 必须是 boolean，默认 `false`。它只在 selected buffer 成功安装后，隐藏 captured source tab 中该 source Instance 的全部实际 View；不会影响其他 tab。file/symlink 安装后 destination 是 ordinary file window，原 View 因窗口不再显示 Fre buffer 而自然消失。directory child buffer 安装后立即成为 exact destination 的 View；窗口原有 policy 会保留，ordinary target 会建立 current-position restore policy，action-created tab/split 使用 close-on-hide policy。parent/child/file 的原生 back/forward 都从实际 buffer 状态解析，不做 ownership transfer。child 的异步 load failure 保留已提交 destination，不恢复 parent。
 
 ## 列
 
@@ -483,7 +483,7 @@ instance.config
 instance:when_ready(function(err) end)
 
 local opened, winid = instance:open(layout) -- opened == instance
-instance:hidden(tabpage) -- 省略 tabpage 时使用当前 tab
+instance:hidden(tabpage) -- 隐藏该 tab 的全部 View；省略时使用当前 tab
 instance:hide_all()
 instance:toggle(layout)
 
@@ -511,11 +511,12 @@ instance:destroy()
 
 ```lua
 local inspected = require("fre").view.inspect(instance, tabpage)
+local exact = require("fre").view.inspect(instance, { winid = winid })
 -- nil，或：
 -- { winid = winid, origin_winid = origin_winid, layout = normalized_layout }
 ```
 
-`tabpage` 省略时使用当前 tab。无 active View 或 record 已 stale 时返回 `nil`；返回的 table 和 normalized `layout` 都是 copy，修改它们不会改变 ownership。`origin_winid` 只属于当前 active View：current View 通常是被替换窗口，split 是 exact anchor，float 是打开时的 ordinary origin，action-created tab child 是 captured source window。隐藏会删除该 View record，重开时重新捕获 origin。
+View 直接从实际窗口和 Fre buffer 解析，没有 active record。`tabpage` 省略时使用当前 tab：当前窗口是该 Instance 的 View 时返回 exact current View，否则唯一候选可直接返回；多个非当前候选会明确报错，调用方应传 `{ winid = ... }`。无实际 View 返回 `nil`。返回 table 和 normalized `layout` 都是 copy。Fre-established current/split/float View 带有 exact restore/close policy 与 origin；原生 ordinary duplicate 的 layout 是 `current`、origin 是自身，外部 float 不推断 ordinary origin。
 
 `get_entry(row)` 返回新的普通 Lua table：
 
@@ -613,6 +614,8 @@ execution:cancel()
 
 GC group 的容量由组内全部存活实例占用，包括可见、写入锁定、正在执行 mutation 或带修改的实例。回收时只会选择已隐藏且当前可安全销毁的实例；若没有安全候选，group 会暂时超过容量，直到实例状态变化后再次执行约束。
 
+GC 的可见性以全部实际 View 为准，原生 duplicate 与 Fre 创建的窗口同样阻止 TTL/容量销毁。首个 View 出现会取消隐藏区间，最后一个 View 离开才重新开始计时；销毁前仍会执行最终 `win_findbuf` 检查。
+
 `gc.ttl_ms = 0` 会禁用 TTL 回收。GC 组容量为 `0` 会禁用该组的容量限制，而不是立即回收所有实例。
 
 ## 稳定 marker 与特殊文件排查
@@ -664,7 +667,7 @@ $p = '\\?\C:\absolute\path\to\nul'
 - symlink 按链接本身复制和删除；选择 symlink 时按文件打开。
 - 启用默认目录接管后，当前 Neovim 进程中没有恢复 netrw 的公共 API。
 - `refresh({ force = true })` 和默认 `R` action 会直接丢弃未保存的 Fre buffer 草稿。
-- 通过原生 `:split`、`:sbuffer` 等命令手工复制 Fre buffer 不受支持；Fre 不会 adopt、扫描 reconcile 或自动修复这些 duplicate windows。
+- 原生 jumplist、buffer navigation 和普通 split duplicate 都按实际窗口支持；外部创建的 float 没有可可靠推断的 ordinary origin，需要相关 action 显式提供 `anchor_winid`。
 - ActionContext 只支持 mapping/action 的同步调用；缓存后延迟执行不受支持。
 
 ## 开发与测试

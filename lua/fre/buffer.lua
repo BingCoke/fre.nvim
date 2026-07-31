@@ -145,12 +145,9 @@ local function clear_undo_history(instance)
 end
 
 local function managed_windows(instance)
-  local tabpages = {}
-  for tabpage in pairs(instance._views or {}) do tabpages[#tabpages + 1] = tabpage end
   local windows = {}
-  for _, tabpage in ipairs(tabpages) do
-    local ok, winid = pcall(view.select, instance, tabpage)
-    if ok and winid then windows[winid] = tabpage end
+  for _, inspected in ipairs(view.list(instance)) do
+    windows[inspected.winid] = inspected.tabpage
   end
   return windows
 end
@@ -253,8 +250,7 @@ local function restore_view_cursors(instance, snapshots, prepared)
   for _, saved in ipairs(snapshots or {}) do
     local natural_view
     local ok = pcall(function()
-      local selected = view.select(instance, saved.tabpage)
-      if selected ~= saved.winid or not vim.api.nvim_win_is_valid(saved.winid)
+      if not vim.api.nvim_win_is_valid(saved.winid)
           or vim.api.nvim_win_get_buf(saved.winid) ~= instance.bufnr then return end
       local row_number
       if saved.navigation then
@@ -318,8 +314,6 @@ local function restore_windows(instance, windows)
     pcall(function()
       if not vim.api.nvim_win_is_valid(winid)
           or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return end
-      local selected = view.select(instance, vim.api.nvim_win_get_tabpage(winid))
-      if selected ~= winid then return end
       local count = vim.api.nvim_buf_line_count(instance.bufnr)
       local row_number = math.max(1, math.min(saved.cursor[1], count))
       local line = vim.api.nvim_buf_get_lines(
@@ -687,6 +681,7 @@ function M.setup(instance)
     callback = function()
       local winid = vim.api.nvim_get_current_win()
       window.apply(instance, winid)
+      view.sync(instance, { report = true })
       M.place_initial_cursor(instance, winid)
     end,
   })
@@ -699,7 +694,7 @@ function M.setup(instance)
       end
       vim.schedule(function()
         if instance._destroyed then return end
-        view.prune(instance)
+        view.sync(instance, { report = true })
       end)
     end,
   })

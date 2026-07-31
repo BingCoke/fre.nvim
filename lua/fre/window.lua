@@ -402,6 +402,14 @@ end
 function M.remove(instance, winid, mode, previous_bufnr)
   if not winid or not vim.api.nvim_win_is_valid(winid)
       or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return true end
+  if mode == "tab" then
+    local tabpage = vim.api.nvim_win_get_tabpage(winid)
+    local closed, close_err = M.close_tab(tabpage)
+    if closed then return true end
+    local replaced, replace_err = M.remove(instance, winid, "restore", nil)
+    if replaced then return true end
+    return false, replace_err or close_err or "failed to close the managed tab"
+  end
   if mode == "restore" then
     local replacement = previous_bufnr
     local created_safe = false

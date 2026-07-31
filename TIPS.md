@@ -1,6 +1,6 @@
 # Fre 配置技巧
 
-本文示例只使用公开 API。mapping callback 中的 `ctx` 和 `fre.view.inspect()` 结果都只适合同步使用；不要缓存后延迟执行。
+本文示例只使用公开 API。mapping callback 中的 `ctx`、`ctx.view` 和 `fre.view.inspect()` 结果都只适合同步使用；不要缓存后延迟执行。
 
 ## Buffer 身份与状态栏
 
@@ -183,7 +183,7 @@ vim.api.nvim_create_autocmd("BufEnter", {
 | `confirm(ctx, display, callback)` | 文本数组、回调 | 低层确认 UI |
 | `write(ctx)` | 无 | 完整 prepare/confirm/execute/reconcile 写入流程 |
 
-`opts.instance` 只会传给 directory child，不能包含 `root`；file/symlink selection 传入它会报错。`hide_source` 默认为 `false`，只在选择成功提交后隐藏 source 所在 tab 的 View。
+`opts.instance` 只会传给 directory child，不能包含 `root`；file/symlink selection 传入它会报错。`hide_source` 默认为 `false`，只在选择成功提交后隐藏 source 所在 tab 中该 Instance 的全部 View。
 
 内置默认映射只有 `<CR>`、`zv`、`zc`、`za`、`zM`、`q`、`g.` 和 `R`。下面关闭默认映射并显式配置一套日常使用所需的 actions，也展示 `tab_select` 和 float-safe `split_select`：
 
@@ -192,8 +192,7 @@ local fre = require("fre")
 local actions = require("fre.actions")
 
 local function split_right(ctx)
-  local inspected = fre.view.inspect(ctx.instance, ctx.tabpage)
-  if not inspected then error("fre: source View is no longer active") end
+  local inspected = ctx.view
 
   local anchor = ctx.winid
   if inspected.layout.position == "float" then
@@ -336,7 +335,7 @@ end, { desc = "Toggle Fre for global cwd" })
 
 `destroy()` 会关闭该 Instance 在全部 tab 中的 Views，并删除 buffer；它不会像默认 `q = actions.hidden` 那样保留未写草稿。root 变化和接管其他 Instance 时，上例也会销毁旧 global Instance。若需要保留草稿，应先 `:write`，或把策略改为 `hidden()`。隐藏期间 Instance 被 GC 销毁时，`is_alive()` 会在下次按 `-` 时自动创建新的 Instance。
 
-一个 Instance 可以在多个 tab 中各有一个 active View，因此这里的“单实例”不等于“单窗口”；`toggle(float_layout)` 只切换当前 tab 的 View。
+一个 Instance 可以在同一 tab 或多个 tab 中存在多个 View，因此这里的“单实例”不等于“单窗口”；`toggle(float_layout)` 在当前 tab 有任意 View 时会全部隐藏，否则打开一个。
 
 
 ## Oil-style 动态 `<CR>`
@@ -347,14 +346,9 @@ end, { desc = "Toggle Fre for global cwd" })
 local fre = require("fre")
 local actions = require("fre.actions")
 
-local function active_view(ctx)
-  local inspected = fre.view.inspect(ctx.instance, ctx.tabpage)
-  if not inspected then error("fre: source View is no longer active") end
-  return inspected
-end
 
 local function oil_style_select(ctx)
-  local inspected = active_view(ctx)
+  local inspected = ctx.view
   local entry = ctx.entry
   if inspected.layout.position == "float" and entry
       and (entry.kind == "file" or entry.kind == "symlink") then
@@ -383,7 +377,7 @@ Instance-specific `mapping.n` 会与 setup/default mappings 合并。覆盖同�
 
 ## 固定 source 与 origin 的独立快捷键
 
-一个快捷键始终选择到 captured source window；另一个始终同步查询 active View，并选择到它记录的 exact origin。origin 缺失或失效属于错误，不从当前焦点或其他窗口推断目标。
+一个快捷键始终选择到 captured source window；另一个使用 exact `ctx.view`，并选择到它记录的 origin。origin 缺失或失效属于错误，不从当前焦点或其他窗口推断目标。
 
 ```lua
 local fre = require("fre")
@@ -396,8 +390,7 @@ fre.setup({
         return actions.select(ctx, { target_winid = ctx.winid })
       end,
       ["<C-o>"] = function(ctx)
-        local inspected = fre.view.inspect(ctx.instance, ctx.tabpage)
-        if not inspected then error("fre: source View is no longer active") end
+        local inspected = ctx.view
         if not inspected.origin_winid
             or not vim.api.nvim_win_is_valid(inspected.origin_winid) then
           error("fre: View origin is no longer valid")
@@ -414,7 +407,7 @@ fre.setup({
 
 ## 从 float 创建 split
 
-`split_select` 从 float source 调用时必须显式传入同 tab 的 ordinary `anchor_winid`。使用当前 active View 的 origin，不从焦点、窗口编号或窗口列表做 fallback。
+`split_select` 从 float source 调用时必须显式传入同 tab 的 ordinary `anchor_winid`。使用 exact `ctx.view` 的 origin，不从焦点、窗口编号或窗口列表做 fallback。
 
 ```lua
 local fre = require("fre")
@@ -424,8 +417,7 @@ fre.setup({
   mapping = {
     n = {
       ["<C-v>"] = function(ctx)
-        local inspected = fre.view.inspect(ctx.instance, ctx.tabpage)
-        if not inspected then error("fre: source View is no longer active") end
+        local inspected = ctx.view
         local anchor = inspected.origin_winid
         if not anchor or not vim.api.nvim_win_is_valid(anchor) then
           error("fre: View origin is no longer valid")
@@ -440,4 +432,4 @@ fre.setup({
 })
 ```
 
-`fre.view.inspect()` 返回的是当次调用的 copied snapshot。它返回 `nil` 表示该 Instance 在请求 tab 中没有有效 active View；此时应直接返回或报错，不应使用旧 snapshot。上面的错误检查只负责给 mapping 提供更明确的信息，window/anchor 的最终有效性仍由 action preflight 校验。
+`ctx.view` 是 mapping exact source window 的 copied snapshot。`fre.view.inspect()` 适合非 mapping 场景：当前 exact View 优先，否则返回请求 tab 的唯一候选；多个非当前候选会报错，应改传 `{ winid = ... }`。任何 snapshot 都不应缓存延迟使用，window/anchor 的最终有效性仍由 action preflight 校验。

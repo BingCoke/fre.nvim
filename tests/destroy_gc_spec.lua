@@ -341,7 +341,6 @@ describe("fre ticket 19 destroy and GC", function()
     vim.cmd("tabnew")
     instance:open({ position = "current" })
     assert.are.equal(3, #sorted_windows(instance.bufnr))
-    assert.are.equal(2, vim.tbl_count(instance._views))
     vim.bo[instance.bufnr].modifiable = true
     vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, { "unsaved draft" })
     vim.bo[instance.bufnr].modified = true
@@ -366,7 +365,7 @@ describe("fre ticket 19 destroy and GC", function()
     for _, field in ipairs({
       "manager", "config", "tree", "root_node", "nodes_by_id", "nodes_by_path", "view",
       "actions", "_execution", "_watchers", "_buffer_augroup", "_mapping_installed",
-      "_installed_mappings", "_views", "_last_layout_by_tab",
+      "_installed_mappings", "_last_layout_by_tab",
       "_pending_initial_cursor", "_pending_reveal", "_pending_presentation_refresh",
       "hidden_since", "_gc_timer", "_gc_expired_reconsider", "needs_refresh",
       "result", "error", "real_root",
@@ -695,7 +694,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert.is_nil(ready_error)
   end)
 
-  it("completes loading as ready with zero, one, or multiple managed Views", function()
+  it("completes loading as ready with zero, one, or multiple actual Views", function()
     local callbacks = {}
     fre._set_fs_adapter({
       load = function(_, done) callbacks[#callbacks + 1] = done end,
@@ -711,20 +710,20 @@ describe("fre ticket 19 destroy and GC", function()
     vim.cmd("tabnew")
     many:open({ position = "current" })
 
-    assert.are.equal(0, vim.tbl_count(hidden._views))
-    assert.are.equal(1, vim.tbl_count(one._views))
-    assert.are.equal(2, vim.tbl_count(many._views))
+    assert.are.equal(0, #sorted_windows(hidden.bufnr))
+    assert.are.equal(1, #sorted_windows(one.bufnr))
+    assert.are.equal(2, #sorted_windows(many.bufnr))
     for _, done in ipairs(callbacks) do done(nil, {}, fixture.root) end
     wait_for(function()
       return hidden.state == "ready" and one.state == "ready" and many.state == "ready"
     end)
-    assert.are.equal(0, vim.tbl_count(hidden._views))
-    assert.are.equal(1, vim.tbl_count(one._views))
-    assert.are.equal(2, vim.tbl_count(many._views))
+    assert.are.equal(0, #sorted_windows(hidden.bufnr))
+    assert.are.equal(1, #sorted_windows(one.bufnr))
+    assert.are.equal(2, #sorted_windows(many.bufnr))
     fre._reset_fs_adapter()
   end)
 
-  it("keeps one ready lifecycle across managed Views and rejects stale hidden intervals", function()
+  it("keeps one ready lifecycle across actual Views and rejects stale hidden intervals", function()
     fre.setup({ columns = {}, gc = {
       ttl_ms = 100, groups = { default = 0, project = 0 },
     } })
@@ -743,12 +742,12 @@ describe("fre ticket 19 destroy and GC", function()
     local second_tab = vim.api.nvim_get_current_tabpage()
     instance:open({ position = "current" })
     assert.are.equal("ready", instance.state)
-    assert.are.equal(2, vim.tbl_count(instance._views))
+    assert.are.equal(2, #sorted_windows(instance.bufnr))
     assert.is_nil(instance.hidden_since)
 
     instance:hidden(second_tab)
     assert.are.equal("ready", instance.state)
-    assert.are.equal(1, vim.tbl_count(instance._views))
+    assert.are.equal(1, #sorted_windows(instance.bufnr))
     assert.is_nil(instance.hidden_since)
 
     vim.api.nvim_set_current_tabpage(first_tab)
@@ -775,7 +774,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert.are.equal(1, reset_timer.close_count)
   end)
 
-  it("prunes stale managed Views locally and starts only the final hidden interval", function()
+  it("synchronizes actual window departures and starts only the final hidden interval", function()
     fre.setup({ columns = {}, gc = {
       ttl_ms = 100, groups = { default = 0, project = 0 },
     } })
@@ -783,23 +782,26 @@ describe("fre ticket 19 destroy and GC", function()
     local first_tab = vim.api.nvim_get_current_tabpage()
     local _, replaced_win = instance:open({ position = "current" })
     vim.api.nvim_win_set_buf(replaced_win, scratch())
-    assert.is_not_nil(instance._views[first_tab])
-    wait_for(function() return instance._views[first_tab] == nil end)
-    assert.are.equal(0, instance.hidden_since)
+    wait_for(function()
+      return #sorted_windows(instance.bufnr) == 0 and instance.hidden_since == 0
+    end)
 
     local _, closed_win = instance:open({ position = "right", size = 20 })
     assert.is_nil(instance.hidden_since)
     vim.api.nvim_win_close(closed_win, true)
-    wait_for(function() return instance._views[first_tab] == nil end)
-    assert.are.equal(0, instance.hidden_since)
+    wait_for(function()
+      return #sorted_windows(instance.bufnr) == 0 and instance.hidden_since == 0
+    end)
 
     vim.cmd("tabnew")
     local removed_tab = vim.api.nvim_get_current_tabpage()
     instance:open({ position = "current" })
     assert.is_nil(instance.hidden_since)
     vim.cmd("tabclose")
-    wait_for(function() return instance._views[removed_tab] == nil end)
-    assert.are.equal(0, instance.hidden_since)
+    wait_for(function()
+      return not vim.api.nvim_tabpage_is_valid(removed_tab)
+        and #sorted_windows(instance.bufnr) == 0 and instance.hidden_since == 0
+    end)
 
     instance:open({ position = "current" })
     local first_win = assert(fre.view.inspect(instance, first_tab)).winid
@@ -808,13 +810,14 @@ describe("fre ticket 19 destroy and GC", function()
     instance:open({ position = "current" })
     local second_win = assert(fre.view.inspect(instance, second_tab)).winid
     vim.api.nvim_win_set_buf(second_win, scratch())
-    wait_for(function() return instance._views[second_tab] == nil end)
+    wait_for(function() return fre.view.inspect(instance, second_tab) == nil end)
     assert.is_nil(instance.hidden_since)
 
     vim.api.nvim_set_current_tabpage(first_tab)
     vim.api.nvim_win_set_buf(first_win, scratch())
-    wait_for(function() return instance._views[first_tab] == nil end)
-    assert.are.equal(0, instance.hidden_since)
+    wait_for(function()
+      return #sorted_windows(instance.bufnr) == 0 and instance.hidden_since == 0
+    end)
     assert.are.equal("ready", instance.state)
   end)
 
@@ -849,12 +852,11 @@ describe("fre ticket 19 destroy and GC", function()
     end
   end)
 
-  it("contains and reports persistent stale-prune GC retry failures", function()
+  it("contains and reports persistent visibility-sync GC retry failures", function()
     fre.setup({ columns = {}, gc = {
       ttl_ms = 100, groups = { default = 0, project = 0 },
     } })
     local instance = ready()
-    local tabpage = vim.api.nvim_get_current_tabpage()
     local _, winid = instance:open({ position = "current" })
     local replacement = scratch()
     local reported = {}
@@ -870,51 +872,49 @@ describe("fre ticket 19 destroy and GC", function()
     local replaced, replace_err = pcall(vim.api.nvim_win_set_buf, winid, replacement)
     assert.is_true(replaced, tostring(replace_err))
     wait_for(function()
-      return instance._views[tabpage] == nil and #reported == 1
+      return #sorted_windows(instance.bufnr) == 0 and starts == 2 and #reported == 1
     end)
 
     assert.are.equal(replacement, vim.api.nvim_win_get_buf(winid))
-    assert.are.equal(1, starts)
-    assert.is_truthy(reported[1]:find("presentation leave failed", 1, true))
+    assert.is_truthy(reported[1]:find("presentation synchronization failed", 1, true))
     assert.is_truthy(reported[1]:find("adapter.timer_start() failed", 1, true))
     assert.is_nil(instance._gc_timer)
     assert.are.equal("ready", instance.state)
-    assert.are.equal(0, vim.tbl_count(instance._views))
 
     local drained, drain_err = pcall(clock.drain, clock)
-
     assert.is_true(drained, tostring(drain_err))
-    assert.are.equal(2, starts)
+    assert.are.equal(3, starts)
     assert.are.equal(2, #reported)
     assert.is_truthy(reported[2]:find("GC reconsideration failed", 1, true))
     assert.is_truthy(reported[2]:find("adapter.timer_start() failed", 1, true))
     assert.is_nil(instance._gc_timer)
     assert.are.equal("ready", instance.state)
-    assert.are.equal(0, vim.tbl_count(instance._views))
     assert.are.equal(replacement, vim.api.nvim_win_get_buf(winid))
     assert.are.same({}, clock.scheduled)
 
     drained, drain_err = pcall(clock.drain, clock)
     assert.is_true(drained, tostring(drain_err))
-    assert.are.equal(2, starts)
+    assert.are.equal(3, starts)
     assert.are.equal(2, #reported)
   end)
 
-  it("defers TTL and capacity destruction for actual native duplicate windows", function()
+  it("treats native duplicates as presentation for TTL and capacity", function()
     fre.setup({ columns = {}, gc = {
       ttl_ms = 20, groups = { default = 0, project = 0 },
     } })
     local ttl = ready()
     vim.api.nvim_win_set_buf(0, ttl.bufnr)
-    assert.are.equal(0, ttl.hidden_since)
+    assert.is_nil(ttl.hidden_since)
     assert.are.equal("ready", ttl.state)
     clock:advance(20)
     assert.are.equal("ready", ttl.state)
-    assert.are.equal(0, ttl.hidden_since)
+    assert.is_nil(ttl.hidden_since)
     assert.is_nil(ttl._gc_timer)
     assert.is_false(manager_module.default:is_gc_eligible(ttl))
 
     vim.api.nvim_win_set_buf(0, scratch())
+    wait_for(function() return ttl.hidden_since == 20 end)
+    clock:advance(20)
     wait_for(function()
       clock:drain()
       return ttl.state == "destroyed"
@@ -935,26 +935,19 @@ describe("fre ticket 19 destroy and GC", function()
     local native_win = vim.api.nvim_get_current_win()
     assert.are_not.equal(managed_win, native_win)
     assert.are.equal(2, #sorted_windows(victim.bufnr))
-    assert.are.equal(1, vim.tbl_count(victim._views))
-
-    victim:hidden(victim_tab)
-    assert.are.equal(0, vim.tbl_count(victim._views))
-    assert.are.same({ native_win }, sorted_windows(victim.bufnr))
     clock:drain()
-    drain_editor()
-    clock:drain()
-    assert.are.equal("ready", protected.state)
     assert.are.equal("ready", victim.state)
     assert.is_false(manager_module.default:is_gc_eligible(victim))
 
-    vim.api.nvim_win_close(native_win, true)
-    wait_for(function()
-      clock:drain()
-      return victim.state == "destroyed"
-    end)
-
+    victim:hidden(victim_tab)
+    clock:drain()
+    drain_editor()
+    clock:drain()
+    assert.are.same({}, sorted_windows(victim.bufnr))
     assert.are.equal("ready", protected.state)
     assert.are.equal("destroyed", victim.state)
+    assert.is_true(vim.api.nvim_win_is_valid(native_win))
+    assert.are_not.equal(victim.bufnr, vim.api.nvim_win_get_buf(native_win))
     assert.is_true(#sorted_windows(protected.bufnr) > 0)
     assert.are.equal(protected,
       manager_module.default.groups.default.instances[protected.id])

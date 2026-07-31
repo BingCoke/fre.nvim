@@ -68,9 +68,17 @@ function Controller:_buffer_is_visible(instance)
   return false
 end
 
+function Controller:_sync_visibility(instance)
+  local ok, view = pcall(require, "fre.view")
+  if ok and type(view.sync) == "function" then
+    pcall(view.sync, instance, { report = true })
+  end
+end
+
 function Controller:is_eligible(instance)
-  if not self:_registered(instance) or instance.state ~= "ready"
-      or instance.hidden_since == nil
+  if not self:_registered(instance) then return false end
+  self:_sync_visibility(instance)
+  if instance.state ~= "ready" or instance.hidden_since == nil
       or not vim.api.nvim_buf_is_valid(instance.bufnr)
       or self:_buffer_is_visible(instance) then
     return false
@@ -205,7 +213,9 @@ function Controller:presentation_leave(instance)
 end
 
 function Controller:reconsider(instance)
-  if not self:_registered(instance) or instance.hidden_since == nil then return false end
+  if not self:_registered(instance) then return false end
+  self:_sync_visibility(instance)
+  if instance.hidden_since == nil then return false end
   local eligible = self:is_eligible(instance)
   local ttl = instance.config.gc.ttl_ms
   if ttl > 0 then

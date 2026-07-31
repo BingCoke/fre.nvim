@@ -1,3 +1,4 @@
+local actions = require("fre.actions")
 local fre = require("fre")
 local manager_module = require("fre.manager")
 local path = require("fre.path")
@@ -203,6 +204,96 @@ describe("fre ticket 20 default directory explorer", function()
     assert.are.equal(before, instance_count(manager))
   end)
 
+  it("resolves the exact takeover View when native jump-back returns to it", function()
+    reset_editor()
+    local source, winid = source_buffer(fixture.root)
+    fre.setup({
+      default_file_explorer = true,
+      columns = {},
+      gc = { ttl_ms = 60000 },
+    })
+    local instance = fre.get_instance()
+    if not instance then instance = assert(controller:check(source, winid)) end
+    wait_for(function() return instance.state == "ready" end)
+
+    vim.api.nvim_win_set_cursor(winid, { 1, 0 })
+    vim.cmd("normal! G")
+    local target_row
+    for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
+      local entry = instance:get_entry(row)
+      if entry and entry.name == "root.txt" then target_row = row; break end
+    end
+    assert.is_not_nil(target_row)
+    vim.api.nvim_win_set_cursor(winid, { target_row, 0 })
+    local selected = actions.select(actions.context())
+
+    assert.are.equal(selected, vim.api.nvim_get_current_buf())
+    assert.is_nil(fre.view.inspect(instance))
+    assert.are.equal(instance, fre.get_instance_by_id(instance.id))
+
+    vim.cmd("normal! \15")
+
+    assert.are.equal(instance.bufnr, vim.api.nvim_get_current_buf())
+    assert.are.same({
+      winid = winid,
+      origin_winid = winid,
+      layout = { position = "current" },
+    }, fre.view.inspect(instance))
+    assert.are.same(fre.view.inspect(instance), actions.context().view)
+    vim.api.nvim_feedkeys(string.char(9), "nx", false)
+    assert.are.equal(selected, vim.api.nvim_get_current_buf())
+    vim.cmd("normal! " .. string.char(15))
+    assert.are.equal(instance.bufnr, vim.api.nvim_get_current_buf())
+    assert.are.same(fre.view.inspect(instance), actions.context().view)
+  end)
+
+  it("resolves the parent View when native jump-back returns to its Instance", function()
+    reset_editor()
+    local source, winid = source_buffer(fixture.root)
+    fre.setup({
+      default_file_explorer = true,
+      columns = {},
+      gc = { ttl_ms = 60000 },
+    })
+    local parent = fre.get_instance()
+    if not parent then parent = assert(controller:check(source, winid)) end
+    wait_for(function() return parent.state == "ready" end)
+
+    vim.cmd("normal! G")
+    local directory_row
+    for row = 1, vim.api.nvim_buf_line_count(parent.bufnr) do
+      local entry = parent:get_entry(row)
+      if entry and entry.name == "one" then directory_row = row; break end
+    end
+    assert.is_not_nil(directory_row)
+    vim.api.nvim_win_set_cursor(winid, { directory_row, 0 })
+    local child = actions.select(actions.context())
+    wait_for(function() return child.state == "ready" end)
+
+    assert.are.equal(child.bufnr, vim.api.nvim_get_current_buf())
+    assert.is_nil(fre.view.inspect(parent))
+    assert.are.equal(winid, assert(fre.view.inspect(child)).winid)
+
+    vim.cmd("normal! \15")
+
+    assert.are.equal(parent.bufnr, vim.api.nvim_get_current_buf())
+    assert.are.same({
+      winid = winid,
+      origin_winid = winid,
+      layout = { position = "current" },
+    }, fre.view.inspect(parent))
+    assert.is_nil(fre.view.inspect(child))
+    assert.are.same(fre.view.inspect(parent), actions.context().view)
+    vim.api.nvim_feedkeys(string.char(9), "nx", false)
+    assert.are.equal(child.bufnr, vim.api.nvim_get_current_buf())
+    assert.is_nil(fre.view.inspect(parent))
+    assert.are.same(fre.view.inspect(child), actions.context().view)
+    vim.cmd("normal! " .. string.char(15))
+    assert.are.equal(parent.bufnr, vim.api.nvim_get_current_buf())
+    assert.are.same(fre.view.inspect(parent), actions.context().view)
+  end)
+
+
   it("ignores invalid, unnamed, reserved, Manager-owned, URI, file, and mismatched targets", function()
     reset_editor()
     local current_win = vim.api.nvim_get_current_win()
@@ -403,7 +494,7 @@ describe("fre ticket 20 default directory explorer", function()
     end
   end)
 
-  it("registers a successful takeover as the active managed current View", function()
+  it("resolves a successful takeover as the exact current View", function()
     reset_editor()
     fre.setup({ columns = {}, window = { options = { cursorline = true } } })
     local source, winid = source_buffer(fixture:path("two"))

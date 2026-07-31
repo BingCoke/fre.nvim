@@ -430,23 +430,34 @@ describe("fre ticket 07 sort hidden and reveal", function()
     assert.are_not.same(instance:get_pos("c.txt"), vim.api.nvim_win_get_cursor(0))
   end)
 
-  it("moves reveal only in the active managed View and ignores a manual duplicate", function()
+  it("selects one actual View for reveal without moving another duplicate", function()
     local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b", ["c.txt"] = "c" })
     instance:open()
-    local managed = vim.api.nvim_get_current_win()
+    local first = vim.api.nvim_get_current_win()
     vim.cmd("vsplit")
-    local manual = vim.api.nvim_get_current_win()
-    vim.api.nvim_win_set_cursor(managed, instance:get_pos("a.txt"))
-    vim.api.nvim_win_set_cursor(manual, instance:get_pos("a.txt"))
+    local second = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_cursor(first, instance:get_pos("a.txt"))
+    vim.api.nvim_win_set_cursor(second, instance:get_pos("a.txt"))
     vim.cmd("new")
     local scratch_window = vim.api.nvim_get_current_win()
     assert.are_not.equal(instance.bufnr, vim.api.nvim_win_get_buf(scratch_window))
     local before = vim.fn.win_findbuf(instance.bufnr)
 
-    instance:reveal("c.txt")
+    local confirm = vim.fn.confirm
+    local confirm_calls = 0
+    vim.fn.confirm = function(_, choices)
+      confirm_calls = confirm_calls + 1
+      assert.is_truthy(choices:find("&a", 1, true))
+      assert.is_truthy(choices:find("&b", 1, true))
+      return 2
+    end
+    local ok, err = pcall(instance.reveal, instance, "c.txt")
+    vim.fn.confirm = confirm
+    assert.is_true(ok, tostring(err))
+    assert.are.equal(1, confirm_calls)
     assert.are.same(before, vim.fn.win_findbuf(instance.bufnr))
-    assert.are.same(instance:get_pos("c.txt"), vim.api.nvim_win_get_cursor(managed))
-    assert.are.same(instance:get_pos("a.txt"), vim.api.nvim_win_get_cursor(manual))
+    assert.are.same(instance:get_pos("a.txt"), vim.api.nvim_win_get_cursor(first))
+    assert.are.same(instance:get_pos("c.txt"), vim.api.nvim_win_get_cursor(second))
   end)
 
   it("does not move another tab or defer a cursor when the target tab is hidden", function()

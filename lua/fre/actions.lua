@@ -82,21 +82,19 @@ local function validate_source(ctx, instance)
   end
 end
 
-local function capture_target(instance, winid)
+local function capture_target(_, winid)
   validate_target(winid)
   return {
     winid = winid,
     tabpage = vim.api.nvim_win_get_tabpage(winid),
     bufnr = vim.api.nvim_win_get_buf(winid),
-    owner = view.owner(instance.manager, winid),
   }
 end
 
-local function recheck_target(instance, captured)
+local function recheck_target(_, captured)
   validate_target(captured.winid)
   if vim.api.nvim_win_get_tabpage(captured.winid) ~= captured.tabpage
-      or vim.api.nvim_win_get_buf(captured.winid) ~= captured.bufnr
-      or view.owner(instance.manager, captured.winid) ~= captured.owner then
+      or vim.api.nvim_win_get_buf(captured.winid) ~= captured.bufnr then
     fail("target window changed during selection preparation", 4)
   end
 end
@@ -245,31 +243,54 @@ local function install_selection(instance, prepared, captured)
   return window.install(prepared.child, captured.winid)
 end
 
-local function commit_ownership(target, prepared, captured, previous, destination)
+local function capture_enter_errors(prepared)
+  if prepared.kind == "child" then return view.capture_errors(prepared.child) end
+  return function() return nil end
+end
+
+local function append_error(errors, err)
+  if err ~= nil then errors[#errors + 1] = tostring(err) end
+end
+
+local function sync_error(instance, errors)
+  local ok, err = pcall(view.sync, instance)
+  if not ok then append_error(errors, err) end
+end
+
+local function commit_selection(instance, target, prepared, captured, previous, destination)
+  local errors = {}
   if prepared.kind == "file" then
-    if captured.owner then view.detach(captured.owner, captured.winid) end
-    return prepared.bufnr
+    sync_error(instance, errors)
+    return prepared.bufnr, errors
   end
   local child = prepared.child
-  if captured.owner then
-    view.transfer(captured.owner, child, captured.winid)
-  elseif destination then
-    view.adopt_created(
-      child, captured.winid, destination.layout, destination.origin_winid
+  if destination then
+    view.track_created(
+      captured.winid, destination.layout, destination.origin_winid, destination.mode
     )
   else
-    view.adopt(child, captured.winid, previous.bufnr)
+    view.track_current(captured.winid, previous and previous.bufnr or nil)
   end
   buffer.place_initial_cursor(child, captured.winid)
   if target.cursor then child:set_cursor_to_path(target.cursor, captured.winid) end
-  return child
+  sync_error(instance, errors)
+  sync_error(child, errors)
+  return child, errors
 end
 
 local function finish_select(ctx, instance, target_winid, hide_source)
   vim.api.nvim_set_current_win(target_winid)
-  if hide_source and view.select(instance, ctx.tabpage) == ctx.winid then
+  if hide_source and vim.api.nvim_win_is_valid(ctx.winid)
+      and vim.api.nvim_win_get_tabpage(ctx.winid) == ctx.tabpage
+      and vim.api.nvim_win_get_buf(ctx.winid) == instance.bufnr then
     instance:hidden(ctx.tabpage)
   end
+end
+
+local function finish_committed(ctx, instance, target_winid, hide_source, errors)
+  local ok, err = pcall(finish_select, ctx, instance, target_winid, hide_source)
+  if not ok then append_error(errors, err) end
+  if #errors > 0 then error(table.concat(errors, "; "), 0) end
 end
 
 local function restore_caller(tabpage, winid)
@@ -341,7 +362,7 @@ end
 
 function M.hidden(ctx, opts)
   no_options(opts, "hidden")
-  return instance_from(ctx):hidden()
+  return instance_from(ctx):hidden(ctx.tabpage)
 end
 
 function M.toggle(ctx, opts)
@@ -383,13 +404,16 @@ function M.select(ctx, opts)
   if target.kind == "noop" then return nil end
 
   local prepared = prepare_selection(instance, target, opts.instance)
+  local finish_capture = capture_enter_errors(prepared)
   local installed, previous = pcall(function()
     validate_source(ctx, instance)
     return install_selection(instance, prepared, captured)
   end)
+  local enter_err = finish_capture()
   if not installed then precommit_error(prepared, previous) end
-  local result = commit_ownership(target, prepared, captured, previous)
-  finish_select(ctx, instance, captured.winid, hide_source)
+  local result, errors = commit_selection(instance, target, prepared, captured, previous)
+  append_error(errors, enter_err)
+  finish_committed(ctx, instance, captured.winid, hide_source, errors)
   return result
 end
 
@@ -402,6 +426,7 @@ function M.tab_select(ctx, opts)
   if target.kind == "noop" then return nil end
 
   local prepared = prepare_selection(instance, target, opts.instance)
+  local finish_capture = capture_enter_errors(prepared)
   local created_tab
   local target_winid
   local destination_bufnr
@@ -415,17 +440,20 @@ function M.tab_select(ctx, opts)
     window.discard_buffer(destination_bufnr)
     return snapshot
   end)
+  local enter_err = finish_capture()
   if not installed then
     if created_tab then window.close_tab(created_tab) end
     restore_caller(ctx.tabpage, ctx.winid)
     precommit_error(prepared, previous)
   end
 
-  local result = commit_ownership(target, prepared, captured, previous, {
+  local result, errors = commit_selection(instance, target, prepared, captured, previous, {
     layout = { position = "current" },
-    origin_winid = ctx.winid,
+    origin_winid = target_winid,
+    mode = "tab",
   })
-  finish_select(ctx, instance, target_winid, hide_source)
+  append_error(errors, enter_err)
+  finish_committed(ctx, instance, target_winid, hide_source, errors)
   return result
 end
 
@@ -443,6 +471,7 @@ function M.split_select(ctx, opts)
   if target.kind == "noop" then return nil end
 
   local prepared = prepare_selection(instance, target, opts.instance)
+  local finish_capture = capture_enter_errors(prepared)
   local target_winid
   local destination_bufnr
   local captured
@@ -458,17 +487,19 @@ function M.split_select(ctx, opts)
     window.discard_buffer(destination_bufnr)
     return snapshot
   end)
+  local enter_err = finish_capture()
   if not installed then
     if target_winid then window.close_window(target_winid) end
     restore_caller(ctx.tabpage, ctx.winid)
     precommit_error(prepared, previous)
   end
 
-  local result = commit_ownership(target, prepared, captured, previous, {
+  local result, errors = commit_selection(instance, target, prepared, captured, previous, {
     layout = normalized,
     origin_winid = anchor,
   })
-  finish_select(ctx, instance, target_winid, hide_source)
+  append_error(errors, enter_err)
+  finish_committed(ctx, instance, target_winid, hide_source, errors)
   return result
 end
 

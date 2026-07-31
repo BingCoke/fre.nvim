@@ -70,7 +70,7 @@ local function scratch()
   return bufnr
 end
 
-describe("fre tab-local active Views", function()
+describe("fre editor-derived Views", function()
   before_each(function()
     pcall(vim.cmd, "silent! tabonly")
     pcall(vim.cmd, "silent! only")
@@ -114,7 +114,7 @@ describe("fre tab-local active Views", function()
     fixture:cleanup()
   end)
 
-  it("materializes current, split, ratio, and float layouts with one managed View", function()
+  it("materializes current, split, ratio, and float layouts for one selected View", function()
     local instance = ready()
     local original = vim.api.nvim_get_current_win()
     assert.are.equal(original, open_view(instance, { position = "current" }))
@@ -150,7 +150,15 @@ describe("fre tab-local active Views", function()
     assert.are.equal(10, config.row)
     assert.are.equal(30, config.col)
     assert.are.equal(1, #current_tab_views(instance))
-    assert.are.equal(floated, fre.view.inspect(instance).winid)
+    assert.are.same({
+      winid = floated, origin_winid = original,
+      layout = {
+        position = "float", width = 0.5, height = 0.5,
+        row = 0.25, col = 0.25, border = "rounded",
+      },
+    }, fre.view.inspect(instance))
+    instance:destroy()
+    assert.is_false(vim.api.nvim_win_is_valid(floated))
   end)
 
   it("rejects one over-capacity split and one out-of-bounds bordered float", function()
@@ -334,7 +342,7 @@ describe("fre tab-local active Views", function()
     assert.are_not.equal(instance.bufnr, vim.api.nvim_win_get_buf(second))
   end)
 
-  it("prunes closed-tab Views immediately through inspect and hidden", function()
+  it("derives closed-tab Views immediately through inspect and hidden", function()
     local instance = ready()
     vim.cmd("tabnew")
     local inspected_tab = vim.api.nvim_get_current_tabpage()
@@ -344,7 +352,6 @@ describe("fre tab-local active Views", function()
     vim.cmd("tabclose")
     assert.is_false(vim.api.nvim_tabpage_is_valid(inspected_tab))
     assert.is_nil(fre.view.inspect(instance, inspected_tab))
-    assert.is_nil(instance._views[inspected_tab])
     assert.are.equal("ready", instance.state)
 
     vim.cmd("tabnew")
@@ -353,7 +360,6 @@ describe("fre tab-local active Views", function()
     vim.cmd("tabclose")
     assert.is_false(vim.api.nvim_tabpage_is_valid(hidden_tab))
     assert.is_true(instance:hidden(hidden_tab))
-    assert.is_nil(instance._views[hidden_tab])
     assert.are.equal("ready", instance.state)
   end)
 
@@ -405,7 +411,7 @@ describe("fre tab-local active Views", function()
     assert.is_nil(fre.view.inspect(instance))
   end)
 
-  it("inspects defensively, retains requested layout through resize, and prunes stale ownership", function()
+  it("inspects editor truth defensively and retains requested layout through resize", function()
     local instance = ready()
     local origin = vim.api.nvim_get_current_win()
     local winid = open_view(instance, { position = "left", size = 20 })
@@ -426,7 +432,7 @@ describe("fre tab-local active Views", function()
     assert.are_not.equal(instance.bufnr, vim.api.nvim_win_get_buf(winid))
   end)
 
-  it("keeps old ownership when a replacement layout cannot be installed", function()
+  it("keeps the existing View when a replacement layout cannot be installed", function()
     local instance = ready()
     local managed = open_view(instance, { position = "current" })
     local before_wins = vim.api.nvim_tabpage_list_wins(0)
@@ -537,20 +543,140 @@ describe("fre tab-local active Views", function()
     assert.are.equal(6, vim.api.nvim_win_get_height(opened))
   end)
 
-  it("does not adopt or retire manually duplicated Fre buffers", function()
+  it("supports native duplicate Views and hides every duplicate in the tab", function()
     local instance = ready()
     local managed = open_view(instance, { position = "current" })
     vim.cmd("vsplit")
-    local manual = vim.api.nvim_get_current_win()
-    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(manual))
-    assert.are_not.equal(managed, manual)
+    local duplicate = vim.api.nvim_get_current_win()
+    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(duplicate))
+    assert.are_not.equal(managed, duplicate)
 
-    assert.are.equal(managed, open_view(instance))
-    assert.are.equal(managed, fre.view.inspect(instance).winid)
+    assert.are.same({
+      winid = duplicate, origin_winid = duplicate, layout = { position = "current" },
+    }, fre.view.inspect(instance))
+    assert.are.same({ managed, duplicate }, current_tab_views(instance))
     assert.is_true(instance:hidden())
     assert.is_nil(fre.view.inspect(instance))
-    assert.is_true(vim.api.nvim_win_is_valid(manual))
-    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(manual))
+    assert.are.same({}, current_tab_views(instance))
+    assert.is_true(vim.api.nvim_win_is_valid(managed))
+    assert.is_true(vim.api.nvim_win_is_valid(duplicate))
+    assert.are_not.equal(instance.bufnr, vim.api.nvim_win_get_buf(managed))
+    assert.are_not.equal(instance.bufnr, vim.api.nvim_win_get_buf(duplicate))
+  end)
+
+  it("reconciles a noautocmd View before reusing it through open", function()
+    local instance = ready()
+    local winid = vim.api.nvim_get_current_win()
+    assert.is_not_nil(instance.hidden_since)
+    vim.cmd("noautocmd buffer " .. tostring(instance.bufnr))
+    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(winid))
+    assert.is_not_nil(instance.hidden_since)
+
+    assert.are.equal(winid, open_view(instance))
+    assert.is_nil(instance.hidden_since)
+  end)
+
+  it("focuses a reused noncurrent View before surfacing its enter failure", function()
+    local instance = ready()
+    local caller = vim.api.nvim_get_current_win()
+    vim.cmd("vsplit")
+    local target = vim.api.nvim_get_current_win()
+    vim.cmd("noautocmd buffer " .. tostring(instance.bufnr))
+    vim.api.nvim_set_current_win(caller)
+    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(target))
+    assert.are_not.equal(target, vim.api.nvim_get_current_win())
+    assert.is_not_nil(instance.hidden_since)
+
+    local original = instance._on_presentation_enter
+    instance._on_presentation_enter = function()
+      error("injected noncurrent open presentation failure")
+    end
+    local ok, err = pcall(instance.open, instance)
+    instance._on_presentation_enter = original
+
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):find(
+      "injected noncurrent open presentation failure", 1, true
+    ))
+    assert.are.equal(target, vim.api.nvim_get_current_win())
+    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(target))
+    assert.is_nil(instance.hidden_since)
+    assert.are.equal(target, assert(fre.view.inspect(instance)).winid)
+  end)
+
+  it("surfaces an explicit open enter failure after keeping the View committed", function()
+    local instance = ready()
+    local original = instance._on_presentation_enter
+    instance._on_presentation_enter = function()
+      error("injected explicit open presentation failure")
+    end
+
+    local ok, err = pcall(instance.open, instance, { position = "current" })
+    instance._on_presentation_enter = original
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):find(
+      "injected explicit open presentation failure", 1, true
+    ))
+    local inspected = assert(fre.view.inspect(instance))
+    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(inspected.winid))
+    assert.are.equal(inspected.winid, vim.api.nvim_get_current_win())
+    assert.is_nil(instance.hidden_since)
+  end)
+
+  it("discards malformed exact policy and hides with conservative View behavior", function()
+    local instance = ready()
+    local winid = open_view(instance, { position = "current" })
+    vim.api.nvim_win_set_var(winid, "fre_view", {
+      version = 1,
+      winid = winid,
+      tabpage = vim.api.nvim_win_get_tabpage(winid),
+      layout = { position = "bogus" },
+      mode = "restore",
+      origin_winid = "bad",
+      previous_bufnr = "bad",
+    })
+
+    assert.are.same({
+      winid = winid, origin_winid = winid, layout = { position = "current" },
+    }, fre.view.inspect(instance, { winid = winid }))
+    assert.is_true(instance:hidden())
+    assert.are_not.equal(instance.bufnr, vim.api.nvim_win_get_buf(winid))
+  end)
+
+  it("uses native View selection when open is ambiguous away from every View", function()
+    local instance = ready()
+    local first = open_view(instance, { position = "current" })
+    vim.cmd("vsplit")
+    local second = vim.api.nvim_get_current_win()
+    vim.cmd("new")
+    local ordinary = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(ordinary, scratch())
+
+    local confirm = vim.fn.confirm
+    local prompt, choices
+    vim.fn.confirm = function(actual_prompt, actual_choices)
+      prompt, choices = actual_prompt, actual_choices
+      return 2
+    end
+    local ok, selected = pcall(function() return select(2, instance:open()) end)
+    vim.fn.confirm = confirm
+    assert.is_true(ok, tostring(selected))
+    assert.are.equal(second, selected)
+    assert.are.equal(second, vim.api.nvim_get_current_win())
+    assert.are.equal("fre: select View", prompt)
+    assert.is_truthy(choices:find("&a", 1, true))
+    assert.is_truthy(choices:find("&b", 1, true))
+
+    vim.api.nvim_set_current_win(ordinary)
+    local before = current_tab_views(instance)
+    vim.fn.confirm = function() return 0 end
+    ok, selected = pcall(instance.open, instance)
+    vim.fn.confirm = confirm
+    assert.is_false(ok)
+    assert.is_truthy(tostring(selected):find("selection was cancelled", 1, true))
+    assert.are.same(before, current_tab_views(instance))
+    assert.are.equal(ordinary, vim.api.nvim_get_current_win())
+    assert.are.same({ first, second }, before)
   end)
 
   it("rejects invalid hidden opens before mutating editor state", function()

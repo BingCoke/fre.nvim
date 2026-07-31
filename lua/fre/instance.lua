@@ -1049,9 +1049,7 @@ function Instance:reveal(snapshot_path)
 
   self._reveal_generation = self._reveal_generation + 1
   local target_tabpage = vim.api.nvim_get_current_tabpage()
-  local target_winid
-  local selected_ok, selected = pcall(view.select, self, target_tabpage)
-  if selected_ok then target_winid = selected end
+  local target_winid = view.select(self, target_tabpage)
   local request = {
     generation = self._reveal_generation,
     relative = relative,
@@ -1074,8 +1072,8 @@ function Instance:reveal(snapshot_path)
     end
     if not target_winid then return end
     pcall(function()
-      if view.select(self, target_tabpage) ~= target_winid
-          or not vim.api.nvim_win_is_valid(target_winid)
+      if not vim.api.nvim_win_is_valid(target_winid)
+          or vim.api.nvim_win_get_tabpage(target_winid) ~= target_tabpage
           or vim.api.nvim_win_get_buf(target_winid) ~= self.bufnr then return end
       local target = self:get_pos(request.relative)
       if target then vim.api.nvim_win_set_cursor(target_winid, target) end
@@ -1887,7 +1885,6 @@ function Instance.new(manager, root, effective)
     self._reveal_generation = 0
     self._marker_width_stale = false
     self._pending_initial_cursor = {}
-    self._views = {}
     self._next_node_id = 1
     self.nodes_by_id = {}
     self.nodes_by_path = {}

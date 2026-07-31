@@ -186,8 +186,11 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.same(instance:get_entry(row), first.entry)
     assert.are_not.equal(first.entry, second.entry)
     assert.is_nil(first.range)
+    assert.are.same({
+      winid = winid, origin_winid = winid, layout = { position = "current" },
+    }, first.view)
     for _, field in ipairs({
-      "layout", "origin", "origin_winid", "visibility", "view",
+      "layout", "origin", "origin_winid", "visibility",
       "generation", "token", "reconciliation",
     }) do
       assert.is_nil(first[field], field)
@@ -567,6 +570,61 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal(instance, manager_module.default:find_by_id(instance.id))
   end)
 
+  it("resolves every exact file return and native duplicate from editor state", function()
+    local instance = ready({ ["file.txt"] = "x" })
+    local previous_bufnr = vim.api.nvim_get_current_buf()
+    local ctx = context_for(instance, "file.txt")
+    local selected = actions.select(ctx)
+
+    assert.is_nil(fre.view.inspect(instance, ctx.tabpage))
+    vim.cmd("vsplit")
+    local duplicate = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_buf(duplicate, instance.bufnr)
+    assert.are.same({
+      winid = duplicate, origin_winid = duplicate, layout = { position = "current" },
+    }, fre.view.inspect(instance, ctx.tabpage))
+    local duplicate_ctx = actions.context()
+    assert.are.equal(duplicate, duplicate_ctx.winid)
+    assert.are.same(fre.view.inspect(instance, { winid = duplicate }), duplicate_ctx.view)
+    vim.api.nvim_win_close(duplicate, true)
+
+    vim.api.nvim_set_current_win(ctx.winid)
+    vim.api.nvim_win_set_buf(ctx.winid, instance.bufnr)
+    assert.are.same({
+      winid = ctx.winid,
+      origin_winid = ctx.winid,
+      layout = { position = "current" },
+    }, fre.view.inspect(instance, ctx.tabpage))
+
+    assert.is_true(instance:hidden(ctx.tabpage))
+    assert.are.equal(previous_bufnr, vim.api.nvim_win_get_buf(ctx.winid))
+    vim.api.nvim_win_set_buf(ctx.winid, selected)
+    vim.api.nvim_win_set_buf(ctx.winid, instance.bufnr)
+    assert.is_not_nil(fre.view.inspect(instance, ctx.tabpage))
+  end)
+
+  it("runs exact buffer-local mappings in both horizontal duplicate Views", function()
+    local seen = {}
+    local instance = ready({ ["file.txt"] = "x" }, {
+      mapping = { n = { x = function(ctx)
+        seen[#seen + 1] = { winid = ctx.winid, view = ctx.view }
+      end } },
+    })
+    local first = open_current(instance)
+    vim.cmd("split")
+    local second = vim.api.nvim_get_current_win()
+    assert.are_not.equal(first, second)
+
+    invoke(instance.bufnr, "n", "x")
+    vim.api.nvim_set_current_win(first)
+    invoke(instance.bufnr, "n", "x")
+
+    assert.are.equal(second, seen[1].winid)
+    assert.are.equal(first, seen[2].winid)
+    assert.are.same(fre.view.inspect(instance, { winid = second }), seen[1].view)
+    assert.are.same(fre.view.inspect(instance, { winid = first }), seen[2].view)
+  end)
+
   it("keeps a same-target directory child committed when hide_source becomes a no-op", function()
     local instance = ready({ ["dir/child.txt"] = "x" })
     local ctx = context_for(instance, "dir")
@@ -618,7 +676,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal(target_buf, vim.api.nvim_win_get_buf(target_win))
   end)
 
-  it("transfers current-position directory ownership and restores its prior buffer", function()
+  it("preserves current-position policy for a directory child and restores its prior buffer", function()
     local instance = ready({ ["dir/child.txt"] = "x" })
     local previous_buf = vim.api.nvim_get_current_buf()
     local ctx = context_for(instance, "dir")
@@ -692,7 +750,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_nil(fre.view.inspect(child, source_tab))
   end)
 
-  it("adopts an ordinary target immediately and restores its buffer after loading", function()
+  it("establishes an ordinary target View immediately and restores its buffer after loading", function()
     local instance = ready({ ["dir/child.txt"] = "x" })
     local ctx = context_for(instance, "dir")
     vim.cmd("vsplit")
@@ -731,7 +789,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_nil(fre.view.inspect(child, ctx.tabpage))
   end)
 
-  it("keeps an adopted load-failed directory child installed and visible", function()
+  it("keeps an ordinary-target load-failed directory child installed and visible", function()
     local instance = ready({ ["dir/child.txt"] = "x" })
     local ctx = context_for(instance, "dir")
     vim.cmd("vsplit")
@@ -917,17 +975,17 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.same(source_view, fre.view.inspect(instance, ctx.tabpage))
   end)
 
-  it("keeps transferred ownership committed after a presentation callback error", function()
+  it("keeps a child destination committed after a source presentation callback error", function()
     local instance = ready({ ["dir/child.txt"] = "x" })
     local ctx = context_for(instance, "dir")
     local original_leave = instance._on_presentation_leave
-    instance._on_presentation_leave = function() error("injected ownership failure") end
+    instance._on_presentation_leave = function() error("injected presentation leave failure") end
 
     local ok, err = pcall(actions.select, ctx)
     instance._on_presentation_leave = original_leave
 
     assert.is_false(ok)
-    assert.is_truthy(tostring(err):find("injected ownership failure", 1, true))
+    assert.is_truthy(tostring(err):find("injected presentation leave failure", 1, true))
     local child
     for _, candidate in ipairs(manager_instances()) do
       if candidate ~= instance and path.equal(candidate.root, fixture:path("dir")) then
@@ -940,7 +998,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_not_nil(fre.view.inspect(child, ctx.tabpage))
   end)
 
-  it("keeps created split ownership committed after its presentation callback errors", function()
+  it("keeps a created split committed after its presentation callback errors", function()
     local instance = ready({ ["dir/child.txt"] = "x" })
     local ctx = context_for(instance, "dir")
     local child
@@ -966,13 +1024,15 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_truthy(tostring(err):find(
       "injected created View presentation failure", 1, true
     ))
-    local target_win = vim.api.nvim_get_current_win()
+    local committed = assert(fre.view.inspect(child, ctx.tabpage))
+    local target_win = committed.winid
+    assert.are.equal(target_win, vim.api.nvim_get_current_win())
     assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(target_win))
     assert.are.same({
       winid = target_win,
       origin_winid = ctx.winid,
       layout = { position = "right", size = 20 },
-    }, fre.view.inspect(child, ctx.tabpage))
+    }, committed)
     assert.is_not_nil(fre.view.inspect(instance, ctx.tabpage))
   end)
 
@@ -1154,10 +1214,22 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_true(#vim.fn.win_findbuf(instance.bufnr) > 0)
     assert.are.same({
       winid = target_win,
-      origin_winid = tab_ctx.winid,
+      origin_winid = target_win,
       layout = { position = "current" },
     }, fre.view.inspect(tab_child, target_tab))
     wait_ready(tab_child)
+    local _, relaid = tab_child:open({ position = "right", size = 20 })
+    assert.are.equal(target_tab, vim.api.nvim_win_get_tabpage(relaid))
+    assert.are.equal(20, vim.api.nvim_win_get_width(relaid))
+    assert.are.same({
+      winid = relaid, origin_winid = target_win,
+      layout = { position = "right", size = 20 },
+    }, fre.view.inspect(tab_child, target_tab))
+    local _, current = tab_child:open({ position = "current" })
+    assert.are.equal(target_win, current)
+    assert.are.same({
+      winid = current, origin_winid = current, layout = { position = "current" },
+    }, fre.view.inspect(tab_child, target_tab))
     tab_child:hidden(target_tab)
     assert.is_false(vim.api.nvim_tabpage_is_valid(target_tab))
     assert.is_true(vim.api.nvim_win_is_valid(tab_ctx.winid))
