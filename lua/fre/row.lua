@@ -149,6 +149,21 @@ local function navigation_callback_entry(source, navigation_kind)
   return entry
 end
 
+local function has_hidden_path_segment(relative_path)
+  for segment in relative_path:gmatch("[^/\\]+") do
+    if segment:sub(1, 1) == "." then return true end
+  end
+  return false
+end
+
+local function path_highlight(relative_path, kind, navigation_kind)
+  if navigation_kind == "parent" then return "FreHiddenPath" end
+  if navigation_kind == "root" then return "FreDirectoryPath" end
+  if has_hidden_path_segment(relative_path) then return "FreHiddenPath" end
+  if kind == "directory" then return "FreDirectoryPath" end
+  return nil
+end
+
 local function active_layout(source, override)
   if override and override.source_instance_id == source.id then return override end
   return source.view
@@ -435,6 +450,76 @@ function M.decode(instance, row_number, line, opts)
   return common
 end
 
+local function add_unchanged_decoration(result, line, decoration)
+  if decoration and line:sub(decoration.start_col + 1, decoration.end_col) == decoration.text then
+    result[#result + 1] = decoration
+  end
+end
+
+function M.decorations(instance, row_number, line)
+  if type(line) ~= "string" then return {} end
+  if line:sub(1, 1) ~= US then
+    local proposed_path, path_range = trim_range(line, 0)
+    local kind = proposed_path:sub(-1) == "/" and "directory" or nil
+    local group = path_highlight(proposed_path, kind, nil)
+    if not group or path_range.end_byte <= path_range.start_byte then return {} end
+    return { {
+      start_col = path_range.start_byte,
+      end_col = path_range.end_byte,
+      text = proposed_path,
+      hl_group = group,
+    } }
+  end
+
+  local identity = M.decode_marker(instance.manager, row_number, line)
+  local source = marker_source(instance, identity.instance_id, row_number)
+  local layout = source.view
+  local template = template_for(layout, identity.node_id)
+  if not template or template.instance_id ~= identity.instance_id then return {} end
+
+  local node
+  local navigation_kind = template.navigation_kind
+  if identity.node_id == 0 then
+    node = source.root_node
+    if not node or not navigation_kind then return {} end
+  else
+    node = source.nodes_by_id[identity.node_id]
+    if not node or node.id ~= identity.node_id then return {} end
+    if source ~= instance and (type(node.path) ~= "string"
+        or type(source.nodes_by_path) ~= "table" or source.nodes_by_path[node.path] ~= node) then
+      return {}
+    end
+  end
+
+  local result = {}
+  for _, field in ipairs(template.fields or {}) do
+    add_unchanged_decoration(result, line, field.highlight)
+  end
+
+  local descriptors = source.config.columns or {}
+  local suffix = line:sub(identity.marker_end + 1)
+  local resolved = resolve_layout(descriptors, suffix, identity.marker_end, layout)
+  if not resolved then
+    add_unchanged_decoration(result, line, template.path_highlight)
+    return result
+  end
+
+  local path_offset = identity.marker_end + resolved.consumed
+  local proposed_path, path_range = trim_range(
+    suffix:sub(resolved.consumed + 1), path_offset
+  )
+  local group = path_highlight(proposed_path, node.kind, navigation_kind)
+  if group and path_range.end_byte > path_range.start_byte then
+    result[#result + 1] = {
+      start_col = path_range.start_byte,
+      end_col = path_range.end_byte,
+      text = proposed_path,
+      hl_group = group,
+    }
+  end
+  return result
+end
+
 local function byte_boundary(text, byte_offset)
   byte_offset = math.max(0, math.min(byte_offset, #text))
   local boundary = 0
@@ -619,6 +704,9 @@ function M.prepare(instance, projection, render_path, opts)
       node_id = node_id,
       fields = fields,
       path = rendered_path,
+      path_highlight = path_highlight(
+        callback_entry.relative_path, callback_entry.kind, navigation_kind
+      ),
       synthetic = navigation_kind ~= nil,
       navigation_kind = navigation_kind,
     }
@@ -700,6 +788,20 @@ function M.prepare(instance, projection, render_path, opts)
     if #physical > 0 then suffix = table.concat(physical, " ") .. " " .. suffix end
     lines[row_number] = marker_text .. suffix
     template.path_range = { start_byte = offset, end_byte = offset + #item.path }
+    if item.path_highlight and #item.path > 0 then
+      highlights[#highlights + 1] = {
+        row = row_number - 1,
+        start_col = offset,
+        end_col = offset + #item.path,
+        hl_group = item.path_highlight,
+      }
+      template.path_highlight = {
+        start_col = offset,
+        end_col = offset + #item.path,
+        text = item.path,
+        hl_group = item.path_highlight,
+      }
+    end
     template.line = lines[row_number]
     row_templates[item.node_id] = template
     if not item.synthetic then baseline[item.node.id] = item.node.path end

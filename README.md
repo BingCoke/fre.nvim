@@ -425,6 +425,13 @@ columns.icon({
 })
 ```
 
+路径高亮默认遵循 Oil 的语义：普通目录和根导航 `/` 使用 `FreDirectoryPath`（链接到 `Directory`），父导航 `../`、隐藏文件、隐藏目录以及隐藏目录下的后代路径使用 `FreHiddenPath`（链接到 `Comment`）；普通文件保持 colorscheme 的默认文本色。两个组都可以覆盖：
+
+```lua
+vim.api.nvim_set_hl(0, "FreDirectoryPath", { fg = "#7aa2f7" })
+vim.api.nvim_set_hl(0, "FreHiddenPath", { fg = "#6b7280" })
+```
+
 默认可见顺序是 `icon -> permissions -> size -> mtime -> path`。`size` 使用 `lstat.size` 和十进制单位：`999`、`1.0k`、`1.0M`、`1.0G`；目录显示自身元数据而非递归总量，symlink 显示 link 对象本身的大小，缺失值显示 `-`。
 
 列是 buffer 中真实、可选择和可 yank 的文本，但语义只读。Fre 允许把元数据修改保留为草稿，直到写入准备阶段重新解析并按行号、列 ID 验证；复制或移动带 marker 的行时，Fre 会为新位置增量恢复对应的 highlight。导航行使用相同列序和投影宽度；custom callback 会收到 `ctx.synthetic = true`、`ctx.navigation_kind` 以及代表 `..` 或 `/` 的 callback-only directory Entry，但 `instance:get_entry(1)` 仍返回 `nil`。

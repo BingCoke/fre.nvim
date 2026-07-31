@@ -1,6 +1,7 @@
 local fre = require("fre")
 local buffer = require("fre.buffer")
 local columns = require("fre.columns")
+local row = require("fre.row")
 local fs = require("tests.helpers.fs")
 
 local instances = {}
@@ -160,6 +161,135 @@ describe("fre metadata buffer rows", function()
     assert.are.equal("LEFT MID RIGHT bbbbb.txt", second_suffix)
   end)
 
+  it("renders Oil-like directory and hidden path highlights", function()
+    local instance = ready({
+      [".env"] = "x",
+      [".cache/inside.txt"] = "x",
+      ["src/child.txt"] = "x",
+      ["plain.txt"] = "x",
+    }, { hidden_file = true, expanded = { ".cache", "src" } })
+    instance:open({ position = "current" })
+
+    local function path_mark(row)
+      local decoded = assert(buffer.decode(instance, row))
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
+        instance.bufnr, -1, 0, -1, { details = true }
+      )) do
+        local details = mark[4] or {}
+        if mark[2] == row - 1 and mark[3] == decoded.path_range.start_byte
+            and details.end_col == decoded.path_range.end_byte
+            and (details.hl_group == "FreDirectoryPath"
+              or details.hl_group == "FreHiddenPath") then
+          return details.hl_group
+        end
+      end
+      return nil
+    end
+
+    assert.are.equal("FreHiddenPath", path_mark(1))
+    assert.are.equal("FreHiddenPath", path_mark(row_for(instance, ".env")))
+    assert.are.equal("FreHiddenPath", path_mark(row_for(instance, ".cache")))
+    assert.are.equal("FreHiddenPath", path_mark(row_for(instance, ".cache/inside.txt")))
+    assert.are.equal("FreDirectoryPath", path_mark(row_for(instance, "src")))
+    assert.is_nil(path_mark(row_for(instance, "src/child.txt")))
+    assert.is_nil(path_mark(row_for(instance, "plain.txt")))
+
+    local hidden_row = row_for(instance, ".env")
+    vim.api.nvim_win_set_cursor(0, { hidden_row, buffer.decode(instance, hidden_row).path_range.start_byte })
+    vim.cmd.normal({ args = { "yyp" }, bang = true })
+    assert.is_true(vim.wait(1000, function()
+      local count = 0
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
+        instance.bufnr, -1, 0, -1, { details = true }
+      )) do
+        if mark[4].hl_group == "FreHiddenPath" then count = count + 1 end
+      end
+      return count == 5
+    end, 10))
+  end)
+
+  it("reclassifies edited paths without parsing metadata columns", function()
+    local parse_calls = 0
+    local descriptor = columns.custom({
+      id = "value",
+      render = function() return "X" end,
+      parse = function(suffix)
+        parse_calls = parse_calls + 1
+        local value, rest = suffix:match("^(%S+) +(.*)$")
+        return value, rest
+      end,
+      equals = function(_, value) return value == "X" end,
+    })
+    local instance = ready({ ["plain.txt"] = "x" }, { columns = { descriptor } })
+    local entry_row = row_for(instance, "plain.txt")
+    local physical = lines(instance)[entry_row]
+    local decoded = assert(buffer.decode(instance, entry_row))
+    local path_start = decoded.path_range.start_byte
+    local prefix = physical:sub(1, path_start)
+    parse_calls = 0
+
+    local function path_group()
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
+        instance.bufnr, -1, 0, -1, { details = true }
+      )) do
+        local details = mark[4] or {}
+        if mark[2] == entry_row - 1 and mark[3] == path_start
+            and (details.hl_group == "FreDirectoryPath"
+              or details.hl_group == "FreHiddenPath") then
+          return details.hl_group
+        end
+      end
+      return nil
+    end
+
+    set_line(instance, entry_row, prefix .. ".hidden")
+    assert.is_true(vim.wait(1000, function()
+      return not instance._highlight_update_scheduled
+        and path_group() == "FreHiddenPath"
+    end, 10))
+    assert.are.equal(0, parse_calls)
+
+    set_line(instance, entry_row, prefix .. "plain.txt")
+    assert.is_true(vim.wait(1000, function()
+      return not instance._highlight_update_scheduled and path_group() == nil
+    end, 10))
+    assert.are.equal(0, parse_calls)
+  end)
+
+  it("classifies Windows separators inside row decorations", function()
+    local root = { id = 1, path = "C:/Project", kind = "directory", name = "" }
+    local node = {
+      id = 2, path = "C:/Project/plain.txt", kind = "file", name = "plain.txt",
+    }
+    local marker_widths = { instance = 3, node = 3, generation = 1 }
+    local fake = {
+      id = 777, root = root.path, root_node = root,
+      config = { columns = {} }, nodes_by_id = { [1] = root, [2] = node },
+    }
+    fake.manager = {
+      get_marker_widths = function() return marker_widths end,
+      find_by_id = function(_, id) return id == fake.id and fake or nil end,
+    }
+    function fake:_entry(current)
+      return {
+        instance_id = self.id, node_id = current.id, absolute_path = current.path,
+        relative_path = current == root and "" or "plain.txt",
+        name = current.name, kind = current.kind,
+      }
+    end
+
+    local prepared = row.prepare(fake, { nodes = { node } }, function() return "plain.txt" end)
+    fake.view = prepared
+    local template = assert(prepared.row_templates[node.id])
+    local edited_path = "visible\\.hidden\\file.txt"
+    local line = prepared.lines[2]:sub(1, template.path_range.start_byte) .. edited_path
+    assert.are.same({ {
+      start_col = template.path_range.start_byte,
+      end_col = template.path_range.start_byte + #edited_path,
+      text = edited_path,
+      hl_group = "FreHiddenPath",
+    } }, row.decorations(fake, 2, line))
+  end)
   it("keeps exact provider highlights through copy move delete undo and redo", function()
     vim.api.nvim_set_hl(0, "FreTestIcon", { fg = "#ff3366" })
     local glyph = ""

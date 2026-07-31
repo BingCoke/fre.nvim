@@ -482,23 +482,6 @@ function M.project(instance, projection, render_path)
   return M.commit(instance, prepared)
 end
 
-local function row_highlight_templates(instance, line)
-  local ok, identity = pcall(row.decode_marker, instance.manager, 0, line)
-  if not ok then return nil end
-  local source = identity.instance_id == instance.id and instance
-    or instance.manager:find_by_id(identity.instance_id)
-  if not source or source._destroyed then return nil end
-  local templates = source.view and source.view.row_templates
-  local template = templates and templates[identity.node_id]
-  if not template then return nil end
-  local result = {}
-  for _, field in ipairs(template.fields or {}) do
-    local highlight = field.highlight
-    if highlight then result[#result + 1] = highlight end
-  end
-  return result
-end
-
 local function redecorate_rows(instance, first_row, last_row)
   if not vim.api.nvim_buf_is_valid(instance.bufnr) or last_row < first_row then return end
   local count = vim.api.nvim_buf_line_count(instance.bufnr)
@@ -512,8 +495,9 @@ local function redecorate_rows(instance, first_row, last_row)
     instance.bufnr, first_row - 1, last_row, false
   )
   for offset, line in ipairs(lines) do
-    local templates = row_highlight_templates(instance, line)
-    for _, template in ipairs(templates or {}) do
+    local row_number = first_row + offset - 1
+    local ok, decorations = pcall(row.decorations, instance, row_number, line)
+    for _, template in ipairs(ok and decorations or {}) do
       if line:sub(template.start_col + 1, template.end_col) == template.text then
         vim.api.nvim_buf_set_extmark(
           instance.bufnr, highlight_namespace, first_row + offset - 2,
@@ -643,6 +627,8 @@ function M.setup(instance)
   vim.api.nvim_set_hl(0, "FreSymlinkIcon", { default = true, link = "Special" })
   vim.api.nvim_set_hl(0, "FreFileIcon", { default = true, link = "Normal" })
   vim.api.nvim_set_hl(0, "FreUnsupportedIcon", { default = true, link = "DiagnosticWarn" })
+  vim.api.nvim_set_hl(0, "FreDirectoryPath", { default = true, link = "Directory" })
+  vim.api.nvim_set_hl(0, "FreHiddenPath", { default = true, link = "Comment" })
   vim.api.nvim_buf_call(instance.bufnr, function()
     vim.cmd("runtime! syntax/fre.vim")
   end)
