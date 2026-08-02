@@ -1,5 +1,6 @@
 local buffer = require("fre.buffer")
 local Instance = require("fre.instance")
+local Sync = require("fre.sync")
 local manager_module = require("fre.manager")
 local mapping = require("fre.mapping")
 local fre = require("fre")
@@ -36,7 +37,7 @@ end
 local function projected_paths(instance)
   local result = {}
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
@@ -52,7 +53,7 @@ describe("fre async hidden instances", function()
 
   after_each(function()
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then
+      if not instance:is_destroyed() then
         instance:destroy()
       end
     end
@@ -71,7 +72,7 @@ describe("fre async hidden instances", function()
     assert.has_error(function() fre.new({}) end)
 
     local instance = keep(fre.new({ root = "." }))
-    assert.are.equal("creating", instance.state)
+    assert.are.equal("creating", instance:status())
     assert.are.equal(path.absolute("."), instance.root)
     assert.is_true(vim.api.nvim_buf_is_valid(instance.bufnr))
     assert.are.equal("acwrite", vim.bo[instance.bufnr].buftype)
@@ -86,7 +87,7 @@ describe("fre async hidden instances", function()
     assert.is_not_nil(pending)
 
     pending(nil, {})
-    wait_for(function() return instance.state == "ready" end)
+    wait_for(function() return instance:is_ready() end)
   end)
 
   it("sets a window cursor to a snapshot path after readiness", function()
@@ -105,7 +106,7 @@ describe("fre async hidden instances", function()
       { name = "b.txt", kind = "file" },
     })
     wait_for(function()
-      return instance.state == "ready"
+      return instance:is_ready()
         and vim.deep_equal(instance:get_pos("b.txt"), vim.api.nvim_win_get_cursor(winid))
     end)
     assert.has_error(function() instance:set_cursor_to_path("missing.txt", winid) end)
@@ -127,20 +128,20 @@ describe("fre async hidden instances", function()
     assert.are.equal(first, fre.get_instance(first.bufnr))
     callbacks[1](nil, {})
     callbacks[2](nil, {})
-    wait_for(function() return first.state == "ready" and second.state == "ready" end)
+    wait_for(function() return first:is_ready() and second:is_ready() end)
     assert.are.equal(first, fre.get_instance_by_id(first.id))
   end)
 
   it("loads direct children asynchronously and renders root-relative paths", function()
     fixture:tree({ ["adir"] = true, ["b.txt"] = "ok" })
     local instance = keep(fre.new({ root = fixture.root }))
-    assert.are.equal("creating", instance.state)
-    wait_for(function() return instance.state == "ready" end)
+    assert.are.equal("creating", instance:status())
+    wait_for(function() return instance:is_ready() end)
     assert_markers(instance.bufnr)
     assert.are.same({ "adir/", "b.txt" }, projected_paths(instance))
-    assert.are.equal(instance.root_node, instance.nodes_by_path[instance.root]) -- root has no rendered row
-    assert.is_truthy(instance.nodes_by_id[2])
-    assert.is_truthy(instance.nodes_by_id[3])
+    assert.are.equal(instance.tree.root, instance.tree.nodes_by_path[instance.root]) -- root has no rendered row
+    assert.is_truthy(instance.tree.nodes_by_id[2])
+    assert.is_truthy(instance.tree.nodes_by_id[3])
   end)
 
   it("sorts with fresh public Entry arguments including the root parent", function()
@@ -174,7 +175,7 @@ describe("fre async hidden instances", function()
       { name = "middle", kind = "directory" },
       { name = "a.txt", kind = "file" },
     }, fixture.root)
-    wait_for(function() return instance.state == "ready" end)
+    wait_for(function() return instance:is_ready() end)
     assert_markers(instance.bufnr)
     assert.are.same({ "a.txt", "middle/", "z.txt" }, projected_paths(instance))
     assert.is_true(#calls > 0)
@@ -239,7 +240,7 @@ describe("fre async hidden instances", function()
     }, fixture.root)
     pending(nil, {})
     wait_for(function()
-      return instance.state == "load-failed" and callback_count == 1 and #events == 1
+      return instance:status() == "load-failed" and callback_count == 1 and #events == 1
     end)
     assert.is_truthy(tostring(callback_error):find("sort exploded", 1, true))
     assert.are.equal(callback_error, events[1].error)
@@ -264,8 +265,8 @@ describe("fre async hidden instances", function()
       return
     end
     local instance = keep(fre.new({ root = link }))
-    wait_for(function() return instance.state ~= "creating" end)
-    assert.are.equal("ready", instance.state)
+    wait_for(function() return not instance:is_creating() end)
+    assert.are.equal("ready", instance:status())
     assert_markers(instance.bufnr)
     assert.are.same({ "file.txt" }, projected_paths(instance))
   end)
@@ -273,7 +274,7 @@ describe("fre async hidden instances", function()
   it("reports nonexistent and file roots without unregistering the instance", function()
     local missing = keep(fre.new({ root = fixture:path("missing") }))
     local file = keep(fre.new({ root = fixture:write("file", "x") }))
-    wait_for(function() return missing.state == "load-failed" and file.state == "load-failed" end)
+    wait_for(function() return missing:status() == "load-failed" and file:status() == "load-failed" end)
     assert.is_truthy(lines(missing.bufnr)[1]:find("%[fre%] Error loading", 1, false))
     assert.is_truthy(lines(file.bufnr)[1]:find("%[fre%] Error loading", 1, false))
     assert.are.equal(missing, fre.get_instance_by_id(missing.id))
@@ -281,7 +282,7 @@ describe("fre async hidden instances", function()
     assert.is_false(lines(missing.bufnr)[1]:sub(1, 1) == string.char(31))
     missing:open()
     assert.are.equal(missing.bufnr, vim.api.nvim_get_current_buf())
-    assert.are.equal("load-failed", missing.state)
+    assert.are.equal("load-failed", missing:status())
   end)
 
   it("delivers when_ready and FreReady exactly once for one attempt", function()
@@ -306,7 +307,7 @@ describe("fre async hidden instances", function()
     end)
     pending(nil, {})
     pending(nil, {})
-    wait_for(function() return instance.state == "ready" and #events == 1 and callback_count == 1 end)
+    wait_for(function() return instance:is_ready() and #events == 1 and callback_count == 1 end)
     assert.is_nil(callback_error)
     assert.are.equal(instance.id, events[1].instance_id)
     assert.are.equal(instance.bufnr, events[1].bufnr)
@@ -342,7 +343,7 @@ describe("fre async hidden instances", function()
       order[#order + 1] = "callback"
     end)
     pending(nil, {}, fixture.root)
-    wait_for(function() return instance.state == "destroyed" end)
+    wait_for(function() return instance:is_destroyed() end)
     assert.is_true(callback_on_main_loop)
     assert.are.same({ "callback", "event" }, order)
   end)
@@ -391,7 +392,7 @@ describe("fre async hidden instances", function()
       if err then failures = failures + 1 end
     end)
     callbacks[1]("first failure")
-    wait_for(function() return instance.state == "load-failed" and failures == 1 and #events == 1 end)
+    wait_for(function() return instance:status() == "load-failed" and failures == 1 and #events == 1 end)
     assert.are.equal("first failure", events[1].error)
     instance:refresh({ on_complete = function(err)
       assert.is_nil(err)
@@ -400,17 +401,17 @@ describe("fre async hidden instances", function()
     instance:when_ready(function(err)
       if not err then successes = successes + 1 end
     end)
-    assert.are.equal("creating", instance.state)
+    assert.are.equal("creating", instance:status())
     callbacks[2](nil, {})
     wait_for(function()
-      return instance.state == "ready" and failures == 1 and successes == 1
+      return instance:is_ready() and failures == 1 and successes == 1
         and refresh_completions == 1 and #events == 2
     end)
     assert.is_nil(events[2].error)
     assert.are.equal(instance.id, events[2].instance_id)
     local bufnr, id = instance.bufnr, instance.id
     instance:destroy()
-    assert.are.equal("destroyed", instance.state)
+    assert.are.equal("destroyed", instance:status())
     assert.is_nil(fre.get_instance(bufnr))
     assert.is_nil(fre.get_instance_by_id(id))
     assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
@@ -488,12 +489,12 @@ describe("fre async hidden instances", function()
       {
         name = "load start",
         install = function()
-          local original = Instance._start_load
-          Instance._start_load = function(instance, ...)
-            original(instance, ...)
+          local original = Sync.load_initial
+          Sync.load_initial = function(sync, ...)
+            original(sync, ...)
             error("injected load start constructor fault")
           end
-          return function() Instance._start_load = original end
+          return function() Sync.load_initial = original end
         end,
       },
     }

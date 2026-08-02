@@ -20,10 +20,10 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -35,8 +35,8 @@ end
 
 local function wait_idle(instance)
   wait_for(function()
-    if instance._refresh_request or instance._watch_refresh_request then return false end
-    for _, node in pairs(instance.nodes_by_id) do
+    if instance.sync:is_busy() then return false end
+    for _, node in pairs(instance.tree.nodes_by_id) do
       if node.kind == "directory"
           and (node.load_state == "loading" or node.load_state == "refreshing") then
         return false
@@ -60,7 +60,7 @@ end
 local function projected_paths(instance)
   local result = {}
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
@@ -175,12 +175,14 @@ end
 local function snapshot(instance)
   return {
     tree = instance.tree,
-    root_node = instance.root_node,
-    nodes_by_id = instance.nodes_by_id,
-    nodes_by_path = instance.nodes_by_path,
-    view = instance.view,
+    root_node = instance.tree.root,
+    nodes_by_id = instance.tree.nodes_by_id,
+    nodes_by_path = instance.tree.nodes_by_path,
+    view = instance.buffer.view,
     text = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false),
-    baseline = vim.deepcopy(instance.view.baseline),
+    baseline = vim.deepcopy(instance.buffer.view.baseline),
+    projection_ranges = vim.deepcopy(instance.buffer.projection_ranges),
+    row_extmarks = vim.deepcopy(instance.buffer.row_extmarks),
     extmarks = vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}),
     modified = vim.bo[instance.bufnr].modified,
     modifiable = vim.bo[instance.bufnr].modifiable,
@@ -189,12 +191,14 @@ end
 
 local function assert_snapshot(instance, expected)
   assert.are.equal(expected.tree, instance.tree)
-  assert.are.equal(expected.root_node, instance.root_node)
-  assert.are.equal(expected.nodes_by_id, instance.nodes_by_id)
-  assert.are.equal(expected.nodes_by_path, instance.nodes_by_path)
-  assert.are.equal(expected.view, instance.view)
+  assert.are.equal(expected.root_node, instance.tree.root)
+  assert.are.equal(expected.nodes_by_id, instance.tree.nodes_by_id)
+  assert.are.equal(expected.nodes_by_path, instance.tree.nodes_by_path)
+  assert.are.equal(expected.view, instance.buffer.view)
   assert.are.same(expected.text, vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false))
-  assert.are.same(expected.baseline, instance.view.baseline)
+  assert.are.same(expected.baseline, instance.buffer.view.baseline)
+  assert.are.same(expected.projection_ranges, instance.buffer.projection_ranges)
+  assert.are.same(expected.row_extmarks, instance.buffer.row_extmarks)
   assert.are.same(expected.extmarks,
     vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}))
   assert.are.equal(expected.modified, vim.bo[instance.bufnr].modified)
@@ -216,7 +220,7 @@ describe("fre ticket 15 directory watchers", function()
   after_each(function()
     vim.notify = original_notify
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then pcall(instance.destroy, instance) end
+      if instance:status() ~= "destroyed" then pcall(instance.destroy, instance) end
     end
     fre._reset_fs_adapter()
     fre._reset_watch_adapter()
@@ -227,14 +231,14 @@ describe("fre ticket 15 directory watchers", function()
 
   it("watches only root and active expanded ancestor chains", function()
     local instance = ready({ ["a/n/deep.txt"] = "x", ["b/other.txt"] = "y" })
-    assert.are.same({ instance.root }, instance._watchers:paths())
+    assert.are.same({ instance.root }, instance.sync:watcher_paths())
 
     instance:expand("a/n")
     wait_for(function() return instance:get_pos("a/n/deep.txt") ~= nil end)
     wait_idle(instance)
     assert.are.same({ instance.root, path.resolve(instance.root, "a"),
       path.resolve(instance.root, "a/n") },
-      instance._watchers:paths())
+      instance.sync:watcher_paths())
 
     local root_handle = watcher:latest(instance.root)
     local a_handle = watcher:latest(path.resolve(instance.root, "a"))
@@ -247,14 +251,14 @@ describe("fre ticket 15 directory watchers", function()
     assert.is_false(a_handle.closed)
     assert.is_false(nested_handle.closed)
     instance:collapse("a")
-    assert.are.same({ instance.root }, instance._watchers:paths())
+    assert.are.same({ instance.root }, instance.sync:watcher_paths())
     assert.is_true(a_handle.closed)
     assert.is_true(nested_handle.closed)
 
     instance:expand("a")
     assert.are.same({ instance.root, path.resolve(instance.root, "a"),
       path.resolve(instance.root, "a/n") },
-      instance._watchers:paths())
+      instance.sync:watcher_paths())
     assert.are_not.equal(a_handle, watcher:latest(path.resolve(instance.root, "a")))
   end)
 
@@ -275,7 +279,7 @@ describe("fre ticket 15 directory watchers", function()
     local counts = loader_counts()
 
     instance:collapse_all()
-    assert.are.same({ instance.root }, instance._watchers:paths())
+    assert.are.same({ instance.root }, instance.sync:watcher_paths())
     for _, handle in ipairs({ a_handle, n_handle, b_handle }) do
       assert.is_true(handle.closed)
       assert.is_true(handle.timer.closed)
@@ -286,30 +290,35 @@ describe("fre ticket 15 directory watchers", function()
     assert.is_nil(counts[a])
     assert.is_nil(counts[n])
     assert.is_nil(counts[b])
-    assert.is_false(instance.nodes_by_path[a].expanded)
-    assert.is_false(instance.nodes_by_path[n].expanded)
-    assert.is_false(instance.nodes_by_path[b].expanded)
+    assert.is_false(instance.tree.nodes_by_path[a].expanded)
+    assert.is_false(instance.tree.nodes_by_path[n].expanded)
+    assert.is_false(instance.tree.nodes_by_path[b].expanded)
 
     instance:expand("a")
-    assert.are.same({ instance.root, a }, instance._watchers:paths())
+    assert.are.same({ instance.root, a }, instance.sync:watcher_paths())
     assert.are_not.equal(a_handle, watcher:latest(a))
-    assert.is_false(instance.nodes_by_path[n].expanded)
+    assert.is_false(instance.tree.nodes_by_path[n].expanded)
     wait_idle(instance)
-    assert.are.same({ instance.root, a }, instance._watchers:paths())
+    assert.are.same({ instance.root, a }, instance.sync:watcher_paths())
   end)
 
-  it("follows canceled root watch refreshes after collapse_all, including a no-op collapse_all", function()
+  it("follows canceled root watch refreshes after asynchronous projection changes and a no-op", function()
     local instance = ready({ ["dir/old.txt"] = "old" })
     instance:expand("dir")
     wait_idle(instance)
     instance:open()
     local counts, pending = {}, {}
-    local delay_next_root = false
+    local dir_path = fixture:path("dir")
+    local delay_next_root, delay_next_dir = false, false
+    local pending_dir
     fre._set_fs_adapter({ load = function(scan_path, done)
       counts[scan_path] = (counts[scan_path] or 0) + 1
       if scan_path == instance.root and delay_next_root then
         delay_next_root = false
         pending[#pending + 1] = done
+      elseif scan_path == dir_path and delay_next_dir then
+        delay_next_dir = false
+        pending_dir = done
       else
         real_fs.load(scan_path, done)
       end
@@ -321,19 +330,22 @@ describe("fre ticket 15 directory watchers", function()
       watcher:emit(instance.root, nil, filename)
       watcher:fire(instance.root)
       wait_for(function()
-        return pending[#pending] ~= nil and instance._watch_refresh_request ~= nil
+        return pending[#pending] ~= nil and instance.sync:is_busy()
       end)
     end
 
-    start_delayed_root_watch("after-collapse.txt")
+    instance:collapse("dir")
+    delay_next_dir = true
+    start_delayed_root_watch("after-expand.txt")
     local first_stale = pending[1]
-    instance:collapse_all()
-    assert.is_false(instance.nodes_by_path[fixture:path("dir")].expanded)
+    instance:expand("dir")
+    wait_for(function() return pending_dir ~= nil end)
+    assert.is_true(instance.sync:is_dirty())
+    real_fs.load(dir_path, pending_dir)
     wait_for(function()
-      return instance:get_pos("after-collapse.txt") ~= nil
-        and not instance.needs_refresh
-        and instance._refresh_request == nil
-        and instance._watch_refresh_request == nil
+      return instance:get_pos("after-expand.txt") ~= nil
+        and not instance.sync:is_dirty()
+        and not instance.sync:is_busy()
     end)
 
     start_delayed_root_watch("after-noop.txt")
@@ -341,19 +353,17 @@ describe("fre ticket 15 directory watchers", function()
     instance:collapse_all()
     wait_for(function()
       return instance:get_pos("after-noop.txt") ~= nil
-        and not instance.needs_refresh
-        and instance._refresh_request == nil
-        and instance._watch_refresh_request == nil
-        and not instance._watch_followup_scheduled
+        and not instance.sync:is_dirty()
+        and not instance.sync:is_busy()
+        and not instance.sync:is_followup_scheduled()
     end)
 
     real_fs.load(instance.root, first_stale)
     real_fs.load(instance.root, second_stale)
     vim.wait(40, function() return false end, 10)
     assert.are.equal(4, counts[instance.root])
-    assert.is_false(instance.needs_refresh)
-    assert.is_nil(instance._refresh_request)
-    assert.is_nil(instance._watch_refresh_request)
+    assert.is_false(instance.sync:is_dirty())
+    assert.is_false(instance.sync:is_busy())
   end)
 
   it("debounces each directory independently and ignores event filenames", function()
@@ -388,15 +398,15 @@ describe("fre ticket 15 directory watchers", function()
     assert.are.equal(1, counts[a])
     assert.is_nil(counts[b])
 
-    local generation_after_a = instance._watch_event_generation
+    local generation_after_a = instance.sync:watch_event_generation_value()
     b_handle.timer.callbacks[1]()
     vim.wait(30, function() return false end, 10)
-    assert.are.equal(generation_after_a, instance._watch_event_generation)
+    assert.are.equal(generation_after_a, instance.sync:watch_event_generation_value())
     b_handle.timer.callbacks[2]()
     wait_for(function()
-      return instance._watch_event_generation == generation_after_a + 1
+      return instance.sync:watch_event_generation_value() == generation_after_a + 1
     end)
-    assert.is_true(instance.needs_refresh)
+    assert.is_true(instance.sync:is_dirty())
     assert.is_nil(counts[b])
 
     local complete_a = pending_a
@@ -406,13 +416,12 @@ describe("fre ticket 15 directory watchers", function()
       return counts[instance.root] == 1 and counts[a] == 2 and counts[b] == 1
         and instance:get_pos("a/new.txt") ~= nil
         and instance:get_pos("b/new.txt") ~= nil
-        and not instance.needs_refresh
-        and instance._refresh_request == nil
-        and instance._watch_refresh_request == nil
+        and not instance.sync:is_dirty()
+        and not instance.sync:is_busy()
     end)
 
     vim.wait(40, function() return false end, 10)
-    assert.is_false(instance._watch_followup_scheduled)
+    assert.is_false(instance.sync:is_followup_scheduled())
     assert.are.equal(1, counts[instance.root])
     assert.are.equal(2, counts[a])
     assert.are.equal(1, counts[b])
@@ -430,7 +439,7 @@ describe("fre ticket 15 directory watchers", function()
     wait_idle(instance)
     instance:open()
     counts = loader_counts()
-    local b_before = instance.nodes_by_path[fixture:path("b", "old.txt")].id
+    local b_before = instance.tree.nodes_by_path[fixture:path("b", "old.txt")].id
 
     fixture:write("a/new.txt", "new")
     fixture:write("b/dormant.txt", "not scanned")
@@ -441,9 +450,9 @@ describe("fre ticket 15 directory watchers", function()
     assert.are.equal(1, counts[fixture:path("a")])
     assert.is_nil(counts[fixture.root])
     assert.is_nil(counts[fixture:path("b")])
-    assert.are.equal(b_before, instance.nodes_by_path[fixture:path("b", "old.txt")].id)
-    assert.is_nil(instance.nodes_by_path[fixture:path("b", "dormant.txt")])
-    assert.is_false(instance.needs_refresh)
+    assert.are.equal(b_before, instance.tree.nodes_by_path[fixture:path("b", "old.txt")].id)
+    assert.is_nil(instance.tree.nodes_by_path[fixture:path("b", "dormant.txt")])
+    assert.is_false(instance.sync:is_dirty())
   end)
 
   it("only marks pending while hidden, modified, or write-locked", function()
@@ -456,7 +465,7 @@ describe("fre ticket 15 directory watchers", function()
       local before = snapshot(instance)
       watcher:emit(instance.root, nil, "new.txt")
       watcher:fire(instance.root)
-      wait_for(function() return instance.needs_refresh end)
+      wait_for(function() return instance.sync:is_dirty() end)
       assert_snapshot(instance, before)
       assert.is_nil(counts[instance.root])
       if restore then restore(instance) end
@@ -471,8 +480,9 @@ describe("fre ticket 15 directory watchers", function()
       vim.bo[instance.bufnr].modifiable = true
       vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, { "draft" })
     end)
-    exercise(function(instance) instance:_acquire_write_lock() end,
-      function(instance) instance:_release_write_lock(instance.actions.write) end)
+    local request
+    exercise(function(instance) request = instance.work:_acquire_write() end,
+      function(instance) instance.work:_release_write(request) end)
   end)
 
   it("performs one pending full refresh on the first managed presentation enter", function()
@@ -486,15 +496,15 @@ describe("fre ticket 15 directory watchers", function()
 
     watcher:emit(instance.root, nil, "ignored")
     watcher:fire(instance.root)
-    wait_for(function() return instance.needs_refresh end)
+    wait_for(function() return instance.sync:is_dirty() end)
     instance:open()
     instance:open()
     wait_for(function()
-      return not instance.needs_refresh and instance:get_pos("root-new.txt") ~= nil
+      return not instance.sync:is_dirty() and instance:get_pos("root-new.txt") ~= nil
         and instance:get_pos("dir/new.txt") ~= nil
     end)
 
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     assert.are.equal(1, counts[instance.root])
     assert.are.equal(1, counts[fixture:path("dir")])
     assert.is_false(instance._pending_presentation_refresh)
@@ -518,15 +528,15 @@ describe("fre ticket 15 directory watchers", function()
     wait_for(function() return pending[directory] ~= nil end)
 
     fixture:write("late.txt", "late")
-    local generation = instance._watch_event_generation
+    local generation = instance.sync:watch_event_generation_value()
     watcher:emit(instance.root, nil, "ignored")
     watcher:fire(instance.root)
-    wait_for(function() return instance._watch_event_generation > generation end)
+    wait_for(function() return instance.sync:watch_event_generation_value() > generation end)
     complete(directory)
 
     wait_for(function()
-      return callbacks == 1 and not instance.needs_refresh
-        and instance:get_pos("late.txt") ~= nil and instance._refresh_request == nil
+      return callbacks == 1 and not instance.sync:is_dirty()
+        and instance:get_pos("late.txt") ~= nil and not instance.sync:is_busy()
     end)
     vim.wait(40, function() return false end, 10)
     assert.is_nil(refresh_error)
@@ -543,13 +553,15 @@ describe("fre ticket 15 directory watchers", function()
     wait_idle(instance)
     instance:open()
     local counts, pending, complete = delayed_first_scans()
-    local token = instance:_acquire_write_lock()
+    local request = instance.work:_acquire_write()
     local callbacks, reconciliation_error, first_saw_late = 0, nil, nil
-    instance:_reconcile_write(token, function(err)
+    instance.sync:write_reconcile(function(_, finish)
+      finish(nil, true)
+    end, function(_, err)
       callbacks = callbacks + 1
       reconciliation_error = err
       first_saw_late = instance:get_pos("write-late.txt") ~= nil
-      assert.is_true(instance:_release_write_lock(token))
+      assert.is_true(instance.work:_release_write(request))
     end)
     wait_for(function() return pending[instance.root] ~= nil end)
     complete(instance.root)
@@ -557,15 +569,15 @@ describe("fre ticket 15 directory watchers", function()
     wait_for(function() return pending[directory] ~= nil end)
 
     fixture:write("write-late.txt", "late")
-    local generation = instance._watch_event_generation
+    local generation = instance.sync:watch_event_generation_value()
     watcher:emit(instance.root, nil, "ignored")
     watcher:fire(instance.root)
-    wait_for(function() return instance._watch_event_generation > generation end)
+    wait_for(function() return instance.sync:watch_event_generation_value() > generation end)
     complete(directory)
 
     wait_for(function()
-      return callbacks == 1 and token.released and not instance.needs_refresh
-        and instance:get_pos("write-late.txt") ~= nil and instance._refresh_request == nil
+      return callbacks == 1 and request.released and not instance.sync:is_dirty()
+        and instance:get_pos("write-late.txt") ~= nil and not instance.sync:is_busy()
     end)
     vim.wait(40, function() return false end, 10)
     assert.is_nil(reconciliation_error)
@@ -573,7 +585,7 @@ describe("fre ticket 15 directory watchers", function()
     assert.are.equal(1, callbacks)
     assert.are.equal(2, counts[instance.root])
     assert.are.equal(2, counts[directory])
-    assert.is_nil(instance.actions)
+    assert.is_false(instance.work:is_write_active())
     assert.is_false(instance._pending_presentation_refresh)
   end)
 
@@ -588,7 +600,7 @@ describe("fre ticket 15 directory watchers", function()
 
     assert.is_true(failed.closed)
     assert.is_true(failed.timer.closed)
-    assert.is_true(instance.needs_refresh)
+    assert.is_true(instance.sync:is_dirty())
     assert.is_nil(watcher:latest(instance.root))
     assert.is_truthy(notices[1]:find(instance.root, 1, true))
     assert.is_truthy(notices[1]:find("watch exploded", 1, true))
@@ -597,7 +609,7 @@ describe("fre ticket 15 directory watchers", function()
     local replacement = watcher:latest(instance.root)
     assert.is_not_nil(replacement)
     assert.are_not.equal(failed, replacement)
-    assert.is_false(instance.needs_refresh)
+    assert.is_false(instance.sync:is_dirty())
     assert.are.equal(1, #notices)
   end)
 
@@ -625,7 +637,7 @@ describe("fre ticket 15 directory watchers", function()
     destroyed.callback(nil, "late", {})
     destroyed_timer()
     vim.wait(40, function() return false end, 10)
-    assert.are.equal("destroyed", instance.state)
+    assert.are.equal("destroyed", instance:status())
   end)
 
   it("commits a directory loader completion at most once", function()
@@ -637,7 +649,7 @@ describe("fre ticket 15 directory watchers", function()
       calls = calls + 1
       pending = done
     end })
-    local generation = instance.view.projection_generation
+    local generation = instance.buffer.view.projection_generation
     watcher:emit(instance.root, nil, "ignored")
     watcher:fire(instance.root)
     wait_for(function() return pending ~= nil end)
@@ -646,11 +658,11 @@ describe("fre ticket 15 directory watchers", function()
       { name = "new.txt", kind = "file" },
     }, instance.root)
     pending(nil, { { name = "duplicate.txt", kind = "file" } }, instance.root)
-    wait_for(function() return instance.view.projection_generation == generation + 1 end)
+    wait_for(function() return instance.buffer.view.projection_generation == generation + 1 end)
     vim.wait(30, function() return false end, 10)
     assert.are.equal(1, calls)
     assert.are.same({ "new.txt", "old.txt" }, projected_paths(instance))
-    assert.are.equal(generation + 1, instance.view.projection_generation)
+    assert.are.equal(generation + 1, instance.buffer.view.projection_generation)
   end)
 
   it("recreates the active watcher set after write reconciliation", function()
@@ -659,23 +671,26 @@ describe("fre ticket 15 directory watchers", function()
     wait_idle(instance)
     local previous_root = watcher:latest(instance.root)
     local previous_dir = watcher:latest(fixture:path("dir"))
-    local token = instance:_acquire_write_lock()
+    local request = instance.work:_acquire_write()
     assert.is_not_nil(watcher:latest(instance.root))
-    instance:_suspend_watchers_for_write(token)
-    if path.is_windows(instance.root) then
-      assert.are.same({}, instance._watchers:paths())
-    else
-      assert.are.same({ instance.root, fixture:path("dir") }, instance._watchers:paths())
-    end
     local done, reconciliation_error = false, nil
-    instance:_reconcile_write(token, function(err)
+    instance.sync:write_reconcile(function(execute)
+      execute(function(finish)
+        if path.is_windows(instance.root) then
+          assert.are.same({}, instance.sync:watcher_paths())
+        else
+          assert.are.same({ instance.root, fixture:path("dir") }, instance.sync:watcher_paths())
+        end
+        finish(nil, true)
+      end)
+    end, function(_, err)
       reconciliation_error = err
+      instance.work:_release_write(request)
       done = true
     end)
     wait_for(function() return done end)
-    instance:_release_write_lock(token)
     assert.is_nil(reconciliation_error)
-    assert.are.same({ instance.root, fixture:path("dir") }, instance._watchers:paths())
+    assert.are.same({ instance.root, fixture:path("dir") }, instance.sync:watcher_paths())
     if path.is_windows(instance.root) then
       assert.is_true(previous_root.closed)
       assert.is_true(previous_dir.closed)
@@ -715,6 +730,6 @@ describe("fre ticket 15 directory watchers", function()
     instance:open()
     fixture:write("real-event.txt", "event")
     wait_for(function() return instance:get_pos("real-event.txt") ~= nil end, 5000)
-    assert.is_false(instance.needs_refresh)
+    assert.is_false(instance.sync:is_dirty())
   end)
 end)

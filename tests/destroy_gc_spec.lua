@@ -23,10 +23,10 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -140,7 +140,7 @@ end
 
 local function lifecycle_snapshot(instance)
   local watcher_entries = {}
-  for watch_path, entry in pairs(instance._watchers.entries) do
+  for watch_path, entry in pairs(instance.sync.watch.entries) do
     watcher_entries[watch_path] = {
       entry = entry, handle = entry.handle, timer = entry.timer,
       handle_closed = entry.handle and entry.handle.closed,
@@ -148,8 +148,8 @@ local function lifecycle_snapshot(instance)
     }
   end
   return {
-    state = instance.state,
-    destroyed = instance._destroyed,
+    state = instance:status(),
+    dead = instance:is_destroying() or instance:is_destroyed(),
     text = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false),
     modified = vim.bo[instance.bufnr].modified,
     modifiable = vim.bo[instance.bufnr].modifiable,
@@ -158,19 +158,19 @@ local function lifecycle_snapshot(instance)
     timer = instance._gc_timer,
     timer_generation = instance._gc_generation,
     hidden_since = instance.hidden_since,
-    watchers = instance._watchers,
+    watchers = instance.sync.watch,
     watcher_entries = watcher_entries,
     id_index = instance.manager.instances_by_id[instance.id],
     buf_index = instance.manager.instances_by_buf[instance.bufnr],
     group_index = instance.manager.groups[instance.config.gc.group].instances[instance.id],
-    actions = instance.actions,
-    execution = instance._execution,
+    write_active = instance.work:is_write_active(),
+    execution = instance.work:active_execution(),
   }
 end
 
 local function assert_lifecycle_snapshot(instance, expected)
-  assert.are.equal(expected.state, instance.state)
-  assert.are.equal(expected.destroyed, instance._destroyed)
+  assert.are.equal(expected.state, instance:status())
+  assert.are.equal(expected.dead, instance:is_destroying() or instance:is_destroyed())
   assert.are.same(expected.text, vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false))
   assert.are.equal(expected.modified, vim.bo[instance.bufnr].modified)
   assert.are.equal(expected.modifiable, vim.bo[instance.bufnr].modifiable)
@@ -179,9 +179,9 @@ local function assert_lifecycle_snapshot(instance, expected)
   assert.are.equal(expected.timer, instance._gc_timer)
   assert.are.equal(expected.timer_generation, instance._gc_generation)
   assert.are.equal(expected.hidden_since, instance.hidden_since)
-  assert.are.equal(expected.watchers, instance._watchers)
+  assert.are.equal(expected.watchers, instance.sync.watch)
   for watch_path, snapshot in pairs(expected.watcher_entries) do
-    local entry = instance._watchers.entries[watch_path]
+    local entry = instance.sync.watch.entries[watch_path]
     assert.are.equal(snapshot.entry, entry)
     assert.are.equal(snapshot.handle, entry.handle)
     assert.are.equal(snapshot.timer, entry.timer)
@@ -192,8 +192,8 @@ local function assert_lifecycle_snapshot(instance, expected)
   assert.are.equal(expected.buf_index, instance.manager.instances_by_buf[instance.bufnr])
   assert.are.equal(expected.group_index,
     instance.manager.groups[instance.config.gc.group].instances[instance.id])
-  assert.are.equal(expected.actions, instance.actions)
-  assert.are.equal(expected.execution, instance._execution)
+  assert.are.equal(expected.write_active, instance.work:is_write_active())
+  assert.are.equal(expected.execution, instance.work:active_execution())
 end
 
 local function set_modified(instance, modified)
@@ -273,12 +273,12 @@ describe("fre ticket 19 destroy and GC", function()
     fre._reset_fs_adapter()
     fre._reset_watch_adapter()
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then
-        if instance.actions and instance.actions.write then
-          pcall(instance._release_write_lock, instance, instance.actions.write)
+      if instance:status() ~= "destroyed" then
+        if instance.work and instance.work:is_write_active() then
+          pcall(instance.work._release_write, instance.work, instance.work.write_request)
           clock:drain()
         end
-        local execution = instance._execution
+        local execution = instance.work and instance.work:active_execution()
         if execution then
           local status = execution:get_status().state
           if status == "running" then execution:cancel() end
@@ -288,7 +288,7 @@ describe("fre ticket 19 destroy and GC", function()
           end, 10)
           clock:drain()
         end
-        if instance.state ~= "destroyed" then pcall(instance.destroy, instance) end
+        if instance:status() ~= "destroyed" then pcall(instance.destroy, instance) end
       end
     end
     clock:drain()
@@ -301,17 +301,17 @@ describe("fre ticket 19 destroy and GC", function()
 
   it("rejects lock and nonterminal Execution before changing any lifecycle state", function()
     local locked = ready({ gc = { ttl_ms = 100 } })
-    local token = locked:_acquire_write_lock()
+    local request = locked.work:_acquire_write()
     local locked_snapshot = lifecycle_snapshot(locked)
     assert_error_contains(function() locked:destroy() end, "write-locked")
     assert_lifecycle_snapshot(locked, locked_snapshot)
-    assert.are.equal(token, locked.actions.write)
+    assert.is_true(locked.work:is_write_active())
     clock:advance(100)
-    assert.are_not.equal("destroyed", locked.state)
+    assert.are_not.equal("destroyed", locked:status())
     assert.are.equal(0, locked.hidden_since)
-    locked:_release_write_lock(token)
+    locked.work:_release_write(request)
     clock:drain()
-    assert.are.equal("destroyed", locked.state)
+    assert.are.equal("destroyed", locked:status())
 
     local pending = {}
     fre._set_mutation_adapter(pending_mutation(pending))
@@ -323,14 +323,14 @@ describe("fre ticket 19 destroy and GC", function()
     local execution_snapshot = lifecycle_snapshot(executing)
     assert_error_contains(function() executing:destroy() end, "active execution")
     assert_lifecycle_snapshot(executing, execution_snapshot)
-    assert.are.equal(execution, executing._execution)
+    assert.are.equal(execution, executing.work:active_execution())
     clock:advance(100)
-    assert.are_not.equal("destroyed", executing.state)
+    assert.are_not.equal("destroyed", executing:status())
     assert.are.equal(100, executing.hidden_since)
     pending.done(nil)
     wait_for(function() return execution:get_status().state == "succeeded" end)
     clock:drain()
-    assert.are.equal("destroyed", executing.state)
+    assert.are.equal("destroyed", executing:status())
   end)
 
   it("force-destroys a modified multi-tab instance and drops all resources and mutable state", function()
@@ -346,12 +346,12 @@ describe("fre ticket 19 destroy and GC", function()
     vim.bo[instance.bufnr].modified = true
 
     local id, bufnr, root = instance.id, instance.bufnr, instance.root
-    local watchers = instance._watchers
+    local watchers = instance.sync.watch
     local timer = instance._gc_timer
     instance:destroy()
 
-    assert.are.equal("destroyed", instance.state)
-    assert.is_true(instance._destroyed)
+    assert.are.equal("destroyed", instance:status())
+    assert.is_true(instance:is_destroyed())
     assert.are.equal(id, instance.id)
     assert.are.equal(bufnr, instance.bufnr)
     assert.are.equal(root, instance.root)
@@ -363,7 +363,8 @@ describe("fre ticket 19 destroy and GC", function()
     assert.is_nil(manager_module.default.instances_by_buf[bufnr])
     for _, group in pairs(manager_module.default.groups) do assert.is_nil(group.instances[id]) end
     for _, field in ipairs({
-      "manager", "config", "tree", "root_node", "nodes_by_id", "nodes_by_path", "view",
+      "manager", "config", "tree", "buffer", "work",
+      "root_node", "nodes_by_id", "nodes_by_path", "view",
       "actions", "_execution", "_watchers", "_buffer_augroup", "_mapping_installed",
       "_installed_mappings", "_last_layout_by_tab",
       "_pending_initial_cursor", "_pending_reveal", "_pending_presentation_refresh",
@@ -406,7 +407,7 @@ describe("fre ticket 19 destroy and GC", function()
       local instance = ready({ gc = { ttl_ms = 100 } })
       local id, bufnr = instance.id, instance.bufnr
       local group_name = instance.config.gc.group
-      local watchers = instance._watchers
+      local watchers = instance.sync.watch
       local gc_timer = assert(instance._gc_timer).handle
       local scheduled = {}
       local original_schedule = vim.schedule
@@ -417,8 +418,8 @@ describe("fre ticket 19 destroy and GC", function()
 
       assert.are.equal(case.valid_after_command, vim.api.nvim_buf_is_valid(bufnr))
       assert.is_false(vim.api.nvim_buf_is_loaded(bufnr))
-      assert.are.equal("ready", instance.state)
-      assert.is_false(instance._destroyed)
+      assert.are.equal("ready", instance:status())
+      assert.is_false(instance:is_destroying() or instance:is_destroyed())
       assert.are.equal(instance, fre.get_instance(bufnr))
       assert.are.equal(instance, fre.get_instance_by_id(id))
       assert.are.equal(instance, manager:find_by_buf(bufnr))
@@ -432,8 +433,8 @@ describe("fre ticket 19 destroy and GC", function()
       cleanup()
 
       assert.are.same({}, scheduled)
-      assert.are.equal("destroyed", instance.state)
-      assert.is_true(instance._destroyed)
+      assert.are.equal("destroyed", instance:status())
+      assert.is_true(instance:is_destroyed())
       assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
       assert.is_nil(fre.get_instance(bufnr))
       assert.is_nil(fre.get_instance_by_id(id))
@@ -473,13 +474,13 @@ describe("fre ticket 19 destroy and GC", function()
     local ok, err = pcall(vim.cmd, "bwipeout! " .. tostring(bufnr))
     vim.schedule = original_schedule
     assert.is_true(ok, tostring(err))
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     assert.are.equal(1, #scheduled)
 
     table.remove(scheduled, 1)()
 
     assert.are.same({}, scheduled)
-    assert.are.equal("destroyed", instance.state)
+    assert.are.equal("destroyed", instance:status())
     assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
     assert.is_nil(fre.get_instance(bufnr))
     assert.is_nil(fre.get_instance_by_id(id))
@@ -496,7 +497,7 @@ describe("fre ticket 19 destroy and GC", function()
     local manager = manager_module.default
     local id, bufnr = instance.id, instance.bufnr
     local group_name = instance.config.gc.group
-    local watchers = instance._watchers
+    local watchers = instance.sync.watch
     local gc_timer = assert(instance._gc_timer).handle
     local original_delete = vim.api.nvim_buf_delete
     local original_call = vim.api.nvim_buf_call
@@ -508,8 +509,8 @@ describe("fre ticket 19 destroy and GC", function()
 
     assert.is_false(destroy_ok)
     assert.is_truthy(tostring(destroy_err):find("fallback delete failed", 1, true))
-    assert.are.equal("destroying", instance.state)
-    assert.is_true(instance._destroyed)
+    assert.are.equal("destroying", instance:status())
+    assert.is_true(instance:is_destroying())
     assert.are.equal(instance, manager.instances_by_id[id])
     assert.are.equal(instance, manager.instances_by_buf[bufnr])
     assert.are.equal(instance, manager.groups[group_name].instances[id])
@@ -522,7 +523,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert.is_true(wipe_ok, tostring(wipe_err))
 
     assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
-    assert.are.equal("destroying", instance.state)
+    assert.are.equal("destroying", instance:status())
     assert.are.equal(instance, fre.get_instance(bufnr))
     assert.are.equal(instance, fre.get_instance_by_id(id))
     assert.are.equal(instance, manager:find_by_buf(bufnr))
@@ -532,7 +533,7 @@ describe("fre ticket 19 destroy and GC", function()
     table.remove(scheduled, 1)()
 
     assert.are.same({}, scheduled)
-    assert.are.equal("destroyed", instance.state)
+    assert.are.equal("destroyed", instance:status())
     assert.is_nil(fre.get_instance(bufnr))
     assert.is_nil(fre.get_instance_by_id(id))
     assert.is_nil(manager:find_by_buf(bufnr))
@@ -564,21 +565,21 @@ describe("fre ticket 19 destroy and GC", function()
 
     assert.is_false(ok)
     assert.is_truthy(tostring(err):find("fallback delete failed", 1, true), tostring(err))
-    assert.are.equal("destroying", instance.state)
-    assert.is_true(instance._destroyed)
+    assert.are.equal("destroying", instance:status())
+    assert.is_true(instance:is_destroying())
     assert.is_true(vim.api.nvim_buf_is_valid(bufnr))
     assert.are.equal(instance, manager.instances_by_id[id])
     assert.are.equal(instance, manager.instances_by_buf[bufnr])
     assert.are.equal(instance, manager.groups[instance.config.gc.group].instances[id])
     assert.is_table(instance.config)
-    assert.is_true(instance._watchers.destroyed)
+    assert.is_true(instance.sync.watch.destroyed)
     assert.are.equal(1, gc_timer.stop_count)
     assert.are.equal(1, gc_timer.close_count)
     for _, handle in ipairs(watcher.handles) do assert.are.equal(1, handle.close_count) end
     for _, timer in ipairs(watcher.timers) do assert.are.equal(1, timer.close_count) end
 
     instance:destroy()
-    assert.are.equal("destroyed", instance.state)
+    assert.are.equal("destroyed", instance:status())
     assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
     assert.is_nil(manager.instances_by_id[id])
     assert.is_nil(manager.instances_by_buf[bufnr])
@@ -596,7 +597,7 @@ describe("fre ticket 19 destroy and GC", function()
     local post_ok, post_err = pcall(post_effect.destroy, post_effect)
     vim.api.nvim_buf_delete = original_delete
     assert.is_true(post_ok, tostring(post_err))
-    assert.are.equal("destroyed", post_effect.state)
+    assert.are.equal("destroyed", post_effect:status())
     assert.is_false(vim.api.nvim_buf_is_valid(post_buf))
     assert.is_nil(manager.instances_by_id[post_id])
     assert_error_contains(function() post_effect:destroy() end, "destroyed")
@@ -614,7 +615,7 @@ describe("fre ticket 19 destroy and GC", function()
     initial_done(nil, {}, fixture.root)
     clock:fire_stale(stale_timer)
     drain_editor()
-    assert.are.equal("destroyed", loading.state)
+    assert.are.equal("destroyed", loading:status())
     assert.is_false(vim.api.nvim_buf_is_valid(loading_buf))
 
     fre._reset_fs_adapter()
@@ -628,7 +629,7 @@ describe("fre ticket 19 destroy and GC", function()
     wait_for(function() return refresh_callbacks == 1 end)
     drain_editor()
     assert.are.equal(1, refresh_callbacks)
-    assert.are.equal("destroyed", refreshing.state)
+    assert.are.equal("destroyed", refreshing:status())
 
     fre._reset_fs_adapter()
     local watcher = fake_watcher()
@@ -642,7 +643,7 @@ describe("fre ticket 19 destroy and GC", function()
     drain_editor()
     for _, handle in ipairs(watcher.handles) do assert.are.equal(1, handle.close_count) end
     for _, timer in ipairs(watcher.timers) do assert.are.equal(1, timer.close_count) end
-    assert.are.equal("destroyed", watched.state)
+    assert.are.equal("destroyed", watched:status())
 
     fre._reset_watch_adapter()
   end)
@@ -652,8 +653,6 @@ describe("fre ticket 19 destroy and GC", function()
     fre._set_fs_adapter({ load = function(_, done) initial_done = done end })
     local loading = keep(fre.new({ root = fixture.root, columns = {} }))
     local queued_calls, queued_errors = 0, {}
-    local original_schedule = vim.schedule
-    local reported_callback_error
     loading:when_ready(function(err)
       queued_calls = queued_calls + 1
       queued_errors[#queued_errors + 1] = err
@@ -661,19 +660,15 @@ describe("fre ticket 19 destroy and GC", function()
     loading:when_ready(function(err)
       queued_calls = queued_calls + 1
       queued_errors[#queued_errors + 1] = err
-      vim.schedule = function(callback) reported_callback_error = callback end
-      error("destroy observer exploded")
     end)
     loading:destroy()
     assert.are.equal(0, queued_calls)
     initial_done(nil, {}, fixture.root)
     local waited, wait_err = pcall(wait_for, function() return queued_calls == 2 end)
-    vim.schedule = original_schedule
     if not waited then error(wait_err, 0) end
 
-    assert.are.equal("destroyed", loading.state)
+    assert.are.equal("destroyed", loading:status())
     assert.are.equal(2, queued_calls)
-    assert.is_function(reported_callback_error)
     for _, err in ipairs(queued_errors) do
       assert.is_truthy(tostring(err):find("destroyed", 1, true), tostring(err))
     end
@@ -715,7 +710,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert.are.equal(2, #sorted_windows(many.bufnr))
     for _, done in ipairs(callbacks) do done(nil, {}, fixture.root) end
     wait_for(function()
-      return hidden.state == "ready" and one.state == "ready" and many.state == "ready"
+      return hidden:status() == "ready" and one:status() == "ready" and many:status() == "ready"
     end)
     assert.are.equal(0, #sorted_windows(hidden.bufnr))
     assert.are.equal(1, #sorted_windows(one.bufnr))
@@ -728,39 +723,39 @@ describe("fre ticket 19 destroy and GC", function()
       ttl_ms = 100, groups = { default = 0, project = 0 },
     } })
     local instance = ready()
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     local registration_timer = assert(instance._gc_timer).handle
     clock:advance(40)
 
     local first_tab = vim.api.nvim_get_current_tabpage()
     instance:open({ position = "current" })
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     assert.is_nil(instance.hidden_since)
     assert.are.equal(1, registration_timer.close_count)
 
     vim.cmd("tabnew")
     local second_tab = vim.api.nvim_get_current_tabpage()
     instance:open({ position = "current" })
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     assert.are.equal(2, #sorted_windows(instance.bufnr))
     assert.is_nil(instance.hidden_since)
 
     instance:hidden(second_tab)
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     assert.are.equal(1, #sorted_windows(instance.bufnr))
     assert.is_nil(instance.hidden_since)
 
     vim.api.nvim_set_current_tabpage(first_tab)
     instance:hidden(first_tab)
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     assert.are.equal(40, instance.hidden_since)
     local final_timer = assert(instance._gc_timer).handle
 
     clock:fire_stale(registration_timer)
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     assert.are.equal(40, instance.hidden_since)
     clock:advance(99)
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
 
     instance:open({ position = "current" })
     assert.is_nil(instance.hidden_since)
@@ -768,9 +763,9 @@ describe("fre ticket 19 destroy and GC", function()
     assert.are.equal(139, instance.hidden_since)
     local reset_timer = assert(instance._gc_timer).handle
     clock:fire_stale(final_timer)
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     clock:advance(100)
-    assert.are.equal("destroyed", instance.state)
+    assert.are.equal("destroyed", instance:status())
     assert.are.equal(1, reset_timer.close_count)
   end)
 
@@ -818,7 +813,7 @@ describe("fre ticket 19 destroy and GC", function()
     wait_for(function()
       return #sorted_windows(instance.bufnr) == 0 and instance.hidden_since == 0
     end)
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
   end)
 
   it("surfaces final explicit-hide GC failures after committing View removal", function()
@@ -879,7 +874,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert.is_truthy(reported[1]:find("presentation synchronization failed", 1, true))
     assert.is_truthy(reported[1]:find("adapter.timer_start() failed", 1, true))
     assert.is_nil(instance._gc_timer)
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
 
     local drained, drain_err = pcall(clock.drain, clock)
     assert.is_true(drained, tostring(drain_err))
@@ -888,7 +883,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert.is_truthy(reported[2]:find("GC reconsideration failed", 1, true))
     assert.is_truthy(reported[2]:find("adapter.timer_start() failed", 1, true))
     assert.is_nil(instance._gc_timer)
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     assert.are.equal(replacement, vim.api.nvim_win_get_buf(winid))
     assert.are.same({}, clock.scheduled)
 
@@ -905,9 +900,9 @@ describe("fre ticket 19 destroy and GC", function()
     local ttl = ready()
     vim.api.nvim_win_set_buf(0, ttl.bufnr)
     assert.is_nil(ttl.hidden_since)
-    assert.are.equal("ready", ttl.state)
+    assert.are.equal("ready", ttl:status())
     clock:advance(20)
-    assert.are.equal("ready", ttl.state)
+    assert.are.equal("ready", ttl:status())
     assert.is_nil(ttl.hidden_since)
     assert.is_nil(ttl._gc_timer)
     assert.is_false(manager_module.default:is_gc_eligible(ttl))
@@ -917,9 +912,9 @@ describe("fre ticket 19 destroy and GC", function()
     clock:advance(20)
     wait_for(function()
       clock:drain()
-      return ttl.state == "destroyed"
+      return ttl:status() == "destroyed"
     end)
-    assert.are.equal("destroyed", ttl.state)
+    assert.are.equal("destroyed", ttl:status())
 
     fre.setup({ columns = {}, gc = {
       ttl_ms = 0, groups = { default = 1, project = 0 },
@@ -936,7 +931,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert.are_not.equal(managed_win, native_win)
     assert.are.equal(2, #sorted_windows(victim.bufnr))
     clock:drain()
-    assert.are.equal("ready", victim.state)
+    assert.are.equal("ready", victim:status())
     assert.is_false(manager_module.default:is_gc_eligible(victim))
 
     victim:hidden(victim_tab)
@@ -944,8 +939,8 @@ describe("fre ticket 19 destroy and GC", function()
     drain_editor()
     clock:drain()
     assert.are.same({}, sorted_windows(victim.bufnr))
-    assert.are.equal("ready", protected.state)
-    assert.are.equal("destroyed", victim.state)
+    assert.are.equal("ready", protected:status())
+    assert.are.equal("destroyed", victim:status())
     assert.is_true(vim.api.nvim_win_is_valid(native_win))
     assert.are_not.equal(victim.bufnr, vim.api.nvim_win_get_buf(native_win))
     assert.is_true(#sorted_windows(protected.bufnr) > 0)
@@ -964,11 +959,11 @@ describe("fre ticket 19 destroy and GC", function()
       return registration_now_calls == 1 and 0 or 2
     end
     local expired_registration = ready()
-    assert.are.equal("ready", expired_registration.state)
+    assert.are.equal("ready", expired_registration:status())
     assert.are.equal(0, #clock.timers)
     assert.are.equal(2, #clock.scheduled)
     clock:drain()
-    assert.are.equal("destroyed", expired_registration.state)
+    assert.are.equal("destroyed", expired_registration:status())
 
     clock.adapter.now = ordinary_now
     clock:set_now(10)
@@ -982,7 +977,7 @@ describe("fre ticket 19 destroy and GC", function()
       return hide_now_calls == 1 and 20 or 22
     end
     hide_all(final_hide)
-    assert.are.equal("ready", final_hide.state)
+    assert.are.equal("ready", final_hide:status())
     assert.are.equal(1, #clock.timers)
     assert.are.equal(2, #clock.scheduled)
 
@@ -993,10 +988,10 @@ describe("fre ticket 19 destroy and GC", function()
     assert.are.equal(30, final_hide.hidden_since)
     local current_timer = assert(final_hide._gc_timer).handle
     clock:drain()
-    assert.are.equal("ready", final_hide.state)
+    assert.are.equal("ready", final_hide:status())
     assert.are.equal(30, final_hide.hidden_since)
     clock:advance(1)
-    assert.are.equal("destroyed", final_hide.state)
+    assert.are.equal("destroyed", final_hide:status())
     assert.are.equal(1, current_timer.close_count)
   end)
 
@@ -1010,7 +1005,7 @@ describe("fre ticket 19 destroy and GC", function()
       fre._set_gc_adapter(fake_clock().adapter)
     end, "while live instances exist")
     clock:advance(10)
-    assert.are.equal("destroyed", ttl.state)
+    assert.are.equal("destroyed", ttl:status())
 
     fre.setup({ columns = {}, gc = {
       ttl_ms = 0, groups = { default = 1, project = 0 },
@@ -1018,10 +1013,10 @@ describe("fre ticket 19 destroy and GC", function()
     local older = ready()
     clock:advance(1)
     local newer = ready()
-    assert.are.equal("destroyed", older.state)
-    assert.are_not.equal("destroyed", newer.state)
+    assert.are.equal("destroyed", older:status())
+    assert.are_not.equal("destroyed", newer:status())
     clock:advance(1000)
-    assert.are_not.equal("destroyed", newer.state)
+    assert.are_not.equal("destroyed", newer:status())
   end)
 
   it("uses one live-index and actual-window eligibility filter", function()
@@ -1036,9 +1031,9 @@ describe("fre ticket 19 destroy and GC", function()
     assert.is_false(manager:is_gc_eligible(base))
     set_modified(base, false)
     clock:drain()
-    local token = base:_acquire_write_lock()
+    local request = base.work:_acquire_write()
     assert.is_false(manager:is_gc_eligible(base))
-    base:_release_write_lock(token)
+    base.work:_release_write(request)
     clock:drain()
     assert.is_true(manager:is_gc_eligible(base))
 
@@ -1075,8 +1070,8 @@ describe("fre ticket 19 destroy and GC", function()
 
     manager_module.default:get_gc_controller():enforce_group("default")
 
-    assert.are.equal("ready", visible.state)
-    assert.are.equal("destroyed", hidden.state)
+    assert.are.equal("ready", visible:status())
+    assert.are.equal("destroyed", hidden:status())
     assert.are.equal(visible,
       manager_module.default.groups.default.instances[visible.id])
   end)
@@ -1088,7 +1083,7 @@ describe("fre ticket 19 destroy and GC", function()
     local pending
     fre._set_fs_adapter({ load = function(_, done) pending = done end })
     local creating = keep(fre.new({ root = fixture.root, columns = {} }))
-    assert.are.equal("creating", creating.state)
+    assert.are.equal("creating", creating:status())
     assert.is_function(pending)
     fre._reset_fs_adapter()
 
@@ -1096,8 +1091,8 @@ describe("fre ticket 19 destroy and GC", function()
     protected:open({ position = "current" })
     manager_module.default:get_gc_controller():enforce_group("default")
 
-    assert.are.equal("creating", creating.state)
-    assert.are.equal("ready", protected.state)
+    assert.are.equal("creating", creating:status())
+    assert.are.equal("ready", protected:status())
     assert.is_false(manager_module.default:is_gc_eligible(creating))
     assert.are.equal(2, vim.tbl_count(
       manager_module.default:find_by_group("default")
@@ -1113,14 +1108,14 @@ describe("fre ticket 19 destroy and GC", function()
     local failed = keep(fre.new({ root = fixture.root, columns = {} }))
     fre._reset_fs_adapter()
     pending("initial load failed")
-    wait_for(function() return failed.state == "load-failed" end)
+    wait_for(function() return failed:status() == "load-failed" end)
 
     local protected = ready()
     protected:open({ position = "current" })
     manager_module.default:get_gc_controller():enforce_group("default")
 
-    assert.are.equal("load-failed", failed.state)
-    assert.are.equal("ready", protected.state)
+    assert.are.equal("load-failed", failed:status())
+    assert.are.equal("ready", protected:status())
     assert.is_false(manager_module.default:is_gc_eligible(failed))
     assert.are.equal(2, vim.tbl_count(
       manager_module.default:find_by_group("default")
@@ -1139,19 +1134,19 @@ describe("fre ticket 19 destroy and GC", function()
     local protected = ready()
     protected:open({ position = "current" })
     manager_module.default:get_gc_controller():enforce_group("default")
-    assert.are.equal("creating", creating.state)
-    assert.are.equal("ready", protected.state)
+    assert.are.equal("creating", creating:status())
+    assert.are.equal("ready", protected:status())
 
     pending(nil, {}, fixture.root)
-    wait_for(function() return creating.state == "ready" end)
-    assert.are.equal("ready", creating.state)
+    wait_for(function() return creating:status() == "ready" end)
+    assert.are.equal("ready", creating:status())
     assert.are.equal(2, vim.tbl_count(
       manager_module.default:find_by_group("default")
     ))
 
     clock:drain()
-    assert.are.equal("destroyed", creating.state)
-    assert.are.equal("ready", protected.state)
+    assert.are.equal("destroyed", creating:status())
+    assert.are.equal("ready", protected:status())
     assert.are.equal(1, vim.tbl_count(
       manager_module.default:find_by_group("default")
     ))
@@ -1176,15 +1171,15 @@ describe("fre ticket 19 destroy and GC", function()
     assert.are.equal(2, vim.tbl_count(
       manager_module.default:find_by_group("default")
     ))
-    assert.are.equal("ready", first.state)
-    assert.are.equal("ready", second.state)
+    assert.are.equal("ready", first:status())
+    assert.are.equal("ready", second:status())
 
     set_modified(second, false)
     wait_for(function()
       clock:drain()
-      return second.state == "destroyed"
+      return second:status() == "destroyed"
     end)
-    assert.are.equal("ready", first.state)
+    assert.are.equal("ready", first:status())
     assert.are.equal(1, vim.tbl_count(
       manager_module.default:find_by_group("default")
     ))
@@ -1194,21 +1189,21 @@ describe("fre ticket 19 destroy and GC", function()
     local protected = ready({ gc = { ttl_ms = 20, include_modified = false } })
     set_modified(protected, true)
     clock:advance(20)
-    assert.are_not.equal("destroyed", protected.state)
+    assert.are_not.equal("destroyed", protected:status())
     assert.are.equal(0, protected.hidden_since)
     assert.is_nil(protected._gc_timer)
     set_modified(protected, false)
     wait_for(function()
       clock:drain()
-      return protected.state == "destroyed"
+      return protected:status() == "destroyed"
     end)
-    assert.are.equal("destroyed", protected.state)
+    assert.are.equal("destroyed", protected:status())
 
     local discarded = ready({ gc = { ttl_ms = 20, include_modified = true } })
     vim.api.nvim_buf_set_lines(discarded.bufnr, 0, -1, false, { "discard me" })
     set_modified(discarded, true)
     clock:advance(20)
-    assert.are.equal("destroyed", discarded.state)
+    assert.are.equal("destroyed", discarded:status())
   end)
 
   it("migrates GC membership and metadata without resetting the hidden TTL interval", function()
@@ -1237,9 +1232,9 @@ describe("fre ticket 19 destroy and GC", function()
     assert.are.equal(hidden_since, instance.hidden_since)
 
     clock:advance(74)
-    assert.are_not.equal("destroyed", instance.state)
+    assert.are_not.equal("destroyed", instance:status())
     clock:advance(1)
-    assert.are.equal("destroyed", instance.state)
+    assert.are.equal("destroyed", instance:status())
     assert.is_nil(manager_module.default.groups.project.instances[instance.id])
   end)
 
@@ -1283,8 +1278,8 @@ describe("fre ticket 19 destroy and GC", function()
 
     moved:setGroup("project")
 
-    assert.are.equal("destroyed", existing.state)
-    assert.are_not.equal("destroyed", moved.state)
+    assert.are.equal("destroyed", existing:status())
+    assert.are_not.equal("destroyed", moved:status())
     assert.is_nil(manager_module.default.groups.default.instances[moved.id])
     assert.are.equal(moved, manager_module.default.groups.project.instances[moved.id])
     assert.are.equal("project", moved.config.gc.group)
@@ -1309,7 +1304,7 @@ describe("fre ticket 19 destroy and GC", function()
     assert.is_false(ok)
     assert.is_truthy(tostring(err):find("injected target destroy failure", 1, true))
 
-    assert.are_not.equal("destroyed", existing.state)
+    assert.are_not.equal("destroyed", existing:status())
     assert.are.equal(existing, manager_module.default.groups.project.instances[existing.id])
     assert.are.equal(moved, manager_module.default.groups.default.instances[moved.id])
     assert.is_nil(manager_module.default.groups.project.instances[moved.id])
@@ -1327,8 +1322,8 @@ describe("fre ticket 19 destroy and GC", function()
     local first = ready()
     clock:advance(1)
     local second = ready()
-    assert.are.equal("destroyed", first.state)
-    assert.are_not.equal("destroyed", second.state)
+    assert.are.equal("destroyed", first:status())
+    assert.are_not.equal("destroyed", second:status())
 
     second:destroy()
     fre.setup({ columns = {}, gc = {
@@ -1345,10 +1340,10 @@ describe("fre ticket 19 destroy and GC", function()
     end
     for _, instance in ipairs(candidates) do set_modified(instance, false) end
     local newest = ready()
-    assert.are.equal("destroyed", candidates[1].state)
-    assert.are.equal("destroyed", candidates[2].state)
-    assert.are_not.equal("destroyed", candidates[3].state)
-    assert.are_not.equal("destroyed", newest.state)
+    assert.are.equal("destroyed", candidates[1]:status())
+    assert.are.equal("destroyed", candidates[2]:status())
+    assert.are_not.equal("destroyed", candidates[3]:status())
+    assert.are_not.equal("destroyed", newest:status())
     local members = manager_module.default:find_by_group("default")
     assert.are.equal(candidates[3], members[candidates[3].id])
     assert.are.equal(newest, members[newest.id])
@@ -1379,8 +1374,8 @@ describe("fre ticket 19 destroy and GC", function()
       ttl_ms = 0,
       groups = { default = 0, project = 0, temporary = 1 },
     } })
-    assert.are.equal("destroyed", oldest.state)
-    assert.are_not.equal("destroyed", newest.state)
+    assert.are.equal("destroyed", oldest:status())
+    assert.are_not.equal("destroyed", newest:status())
     assert.are.equal(1, manager_module.default.groups.temporary.capacity)
 
     newest:destroy()

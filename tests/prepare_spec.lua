@@ -4,6 +4,7 @@ local fre = require("fre")
 local mutation_prepare = require("fre.mutation.prepare")
 local path = require("fre.path")
 local row = require("fre.row")
+local Tree = require("fre.tree")
 local real_fs = require("fre.fs").default
 local fs = require("tests.helpers.fs")
 
@@ -22,10 +23,10 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -49,7 +50,7 @@ end
 
 local function set_lines(instance, replacement)
   local navigation = lines(instance)[1]
-  assert.are.equal("navigation", assert(buffer.decode(instance, 1)).row_kind)
+  assert.are.equal("navigation", assert(instance.buffer:decode(1)).row_kind)
   local next_lines = {}
   if replacement[1] ~= navigation then next_lines[1] = navigation end
   vim.list_extend(next_lines, replacement)
@@ -61,7 +62,7 @@ end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
     if decoded and decoded.row_kind == "entry"
         and decoded.entry.relative_path == relative then
       return row
@@ -77,7 +78,7 @@ end
 local function edited_line(instance, relative, target)
   local row = row_for(instance, relative)
   local physical = lines(instance)[row]
-  local decoded = buffer.decode(instance, row)
+  local decoded = instance.buffer:decode(row)
   return physical:sub(1, decoded.path_range.start_byte) .. target
     .. physical:sub(decoded.path_range.end_byte + 1)
 end
@@ -108,18 +109,13 @@ end
 
 local function state_snapshot(instance)
   local nodes = {}
-  for id, node in pairs(instance.nodes_by_id) do
+  for id, node in pairs(instance.tree.nodes_by_id) do
     nodes[id] = {
       ref = node,
       path = node.path,
       parent = node.parent,
       expanded = node.expanded,
       load_state = node.load_state,
-      visible_size = node.visible_size,
-      visible_start = node.visible_start,
-      visible_end = node.visible_end,
-      visible_range = node.visible_range and vim.deepcopy(node.visible_range) or nil,
-      row_extmark = node.row_extmark,
     }
   end
   return {
@@ -127,20 +123,19 @@ local function state_snapshot(instance)
     options = option_snapshot(instance.bufnr),
     modified = vim.bo[instance.bufnr].modified,
     tree = instance.tree,
-    root_node = instance.root_node,
-    nodes_by_id = instance.nodes_by_id,
-    nodes_by_path = instance.nodes_by_path,
-    view = instance.view,
-    baseline = vim.deepcopy(instance.view.baseline),
+    root_node = instance.tree.root,
+    nodes_by_id = instance.tree.nodes_by_id,
+    nodes_by_path = instance.tree.nodes_by_path,
+    view = instance.buffer.view,
+    baseline = vim.deepcopy(instance.buffer.view.baseline),
     visible_nodes = vim.deepcopy(vim.tbl_map(function(node) return node.id end,
-      instance.view.visible_nodes or {})),
-    extmarks = vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}),
-    needs_refresh = instance.needs_refresh,
-    sort = instance.current_sort,
-    hidden = instance.current_hidden_file,
-    execution = instance._execution,
-    actions = instance.actions,
-    state = instance.state,
+      instance.buffer.view.visible_nodes or {})),
+    projection_ranges = vim.deepcopy(instance.buffer.projection_ranges),
+    row_extmarks = vim.deepcopy(instance.buffer.row_extmarks),
+    hidden = instance.buffer:hidden_files(),
+    execution_active = instance.work:is_execution_active(),
+    write_active = instance.work:is_write_active(),
+    state = instance:status(),
     nodes = nodes,
   }
 end
@@ -150,33 +145,26 @@ local function assert_state(instance, expected)
   assert.are.same(expected.options, option_snapshot(instance.bufnr))
   assert.are.equal(expected.modified, vim.bo[instance.bufnr].modified)
   assert.are.equal(expected.tree, instance.tree)
-  assert.are.equal(expected.root_node, instance.root_node)
-  assert.are.equal(expected.nodes_by_id, instance.nodes_by_id)
-  assert.are.equal(expected.nodes_by_path, instance.nodes_by_path)
-  assert.are.equal(expected.view, instance.view)
-  assert.are.same(expected.baseline, instance.view.baseline)
+  assert.are.equal(expected.root_node, instance.tree.root)
+  assert.are.equal(expected.nodes_by_id, instance.tree.nodes_by_id)
+  assert.are.equal(expected.nodes_by_path, instance.tree.nodes_by_path)
+  assert.are.equal(expected.view, instance.buffer.view)
+  assert.are.same(expected.baseline, instance.buffer.view.baseline)
   assert.are.same(expected.visible_nodes, vim.tbl_map(function(node) return node.id end,
-    instance.view.visible_nodes or {}))
-  assert.are.same(expected.extmarks,
-    vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}))
-  assert.are.equal(expected.needs_refresh, instance.needs_refresh)
-  assert.are.equal(expected.sort, instance.current_sort)
-  assert.are.equal(expected.hidden, instance.current_hidden_file)
-  assert.are.equal(expected.execution, instance._execution)
-  assert.are.equal(expected.actions, instance.actions)
-  assert.are.equal(expected.state, instance.state)
+    instance.buffer.view.visible_nodes or {}))
+  assert.are.same(expected.projection_ranges, instance.buffer.projection_ranges)
+  assert.are.same(expected.row_extmarks, instance.buffer.row_extmarks)
+  assert.are.equal(expected.hidden, instance.buffer:hidden_files())
+  assert.are.equal(expected.execution_active, instance.work:is_execution_active())
+  assert.are.equal(expected.write_active, instance.work:is_write_active())
+  assert.are.equal(expected.state, instance:status())
   for id, value in pairs(expected.nodes) do
-    local node = instance.nodes_by_id[id]
+    local node = instance.tree.nodes_by_id[id]
     assert.are.equal(value.ref, node)
     assert.are.equal(value.path, node.path)
     assert.are.equal(value.parent, node.parent)
     assert.are.equal(value.expanded, node.expanded)
     assert.are.equal(value.load_state, node.load_state)
-    assert.are.equal(value.visible_size, node.visible_size)
-    assert.are.equal(value.visible_start, node.visible_start)
-    assert.are.equal(value.visible_end, node.visible_end)
-    assert.are.same(value.visible_range, node.visible_range)
-    assert.are.equal(value.row_extmark, node.row_extmark)
   end
 end
 
@@ -216,7 +204,7 @@ describe("fre ticket 10 prepare basic mutations", function()
 
   after_each(function()
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then instance:destroy() end
+      if instance:status() ~= "destroyed" then instance:destroy() end
     end
     fre._reset_mutation_adapter()
     fre._reset_fs_adapter()
@@ -229,7 +217,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     local instance = keep(fre.new({ root = fixture.root }))
     assert_error("instance is not ready", function() instance:prepare() end)
     initial_done("load failed")
-    wait_for(function() return instance.state == "load-failed" end)
+    wait_for(function() return instance:status() == "load-failed" end)
     assert_error("instance is not ready", function() instance:prepare() end)
   end)
 
@@ -288,7 +276,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     })
     local device = physical_line(instance, "device")
     local moved_keep = edited_line(instance, "keep.txt", "moved.txt")
-    local decoded = buffer.decode(instance, row_for(instance, "device"))
+    local decoded = instance.buffer:decode(row_for(instance, "device"))
 
     assert.are.equal("char", decoded.entry.kind)
     assert.are.same({ operations = {}, display = {} }, instance:prepare())
@@ -380,7 +368,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     local destination = wait_ready(keep(fre.new({ root = destination_root })))
     source:expand("folder")
     local device_path = path.resolve(source_directory, "device")
-    wait_for(function() return source.nodes_by_path[device_path] ~= nil end)
+    wait_for(function() return source.tree.nodes_by_path[device_path] ~= nil end)
 
     set_lines(destination, { edited_line(source, "folder", "copied-folder/") })
     local err = assert_error("row 2: unsupported snapshot kind char", function()
@@ -394,7 +382,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     local current = lines(instance)
     local replacement = {}
     for row, physical in ipairs(current) do
-      local decoded = buffer.decode(instance, row)
+      local decoded = instance.buffer:decode(row)
       if decoded.row_kind == "entry" and decoded.entry.relative_path == "a.txt" then
         replacement[#replacement + 1] = edited_line(instance, "a.txt", "renamed.txt")
       elseif decoded.row_kind == "entry" and decoded.entry.relative_path == "keep.txt" then
@@ -428,11 +416,11 @@ describe("fre ticket 10 prepare basic mutations", function()
     local instance = ready({ ["dir/child.txt"] = "x", [".hidden.txt"] = "h" })
     instance:expand("dir")
     wait_for(function() return instance:get_pos("dir/child.txt") ~= nil end)
-    assert.is_not_nil(instance.nodes_by_path[fixture:path("dir", "child.txt")])
+    assert.is_not_nil(instance.tree.nodes_by_path[fixture:path("dir", "child.txt")])
     instance:collapse("dir")
-    assert.is_nil(instance.view.baseline[instance.nodes_by_path[fixture:path("dir", "child.txt")].id])
-    assert.is_not_nil(instance.nodes_by_path[fixture:path(".hidden.txt")])
-    assert.is_nil(instance.view.baseline[instance.nodes_by_path[fixture:path(".hidden.txt")].id])
+    assert.is_nil(instance.buffer.view.baseline[instance.tree.nodes_by_path[fixture:path("dir", "child.txt")].id])
+    assert.is_not_nil(instance.tree.nodes_by_path[fixture:path(".hidden.txt")])
+    assert.is_nil(instance.buffer.view.baseline[instance.tree.nodes_by_path[fixture:path(".hidden.txt")].id])
     assert.are.same({ operations = {}, display = {} }, instance:prepare())
   end)
 
@@ -473,7 +461,7 @@ describe("fre ticket 10 prepare basic mutations", function()
 
     set_lines(instance, { original })
     local row = row_for(instance, "a.txt")
-    instance.nodes_by_id[buffer.decode(instance, row).node_id].kind = "other"
+    instance.tree.nodes_by_id[instance.buffer:decode(row).node_id].kind = "other"
     set_lines(instance, { edited_line(instance, "a.txt", "renamed.txt") })
     assert_error("row 2: unsupported snapshot kind other for a.txt", function() instance:prepare() end)
   end)
@@ -583,36 +571,40 @@ describe("fre ticket 10 prepare basic mutations", function()
     local root = { id = 1, path = "C:/Project", kind = "directory" }
     local a = { id = 2, path = "C:/Project/A.txt", kind = "file", name = "A.txt" }
     local b = { id = 3, path = "C:/Project/B.txt", kind = "file", name = "B.txt" }
+    local tree = Tree.new(root.path, 777, function(_, left, right) return left.name < right.name end)
+    tree.root = root
+    tree.nodes_by_id = { [1] = root, [2] = a, [3] = b }
+    tree.nodes_by_path = { [root.path] = root, [a.path] = a, [b.path] = b }
     local fake = {
       id = 777,
       bufnr = bufnr,
       root = root.path,
-      root_node = root,
-      state = "ready",
+      ready = true,
       config = { columns = {} },
-      nodes_by_id = { [1] = root, [2] = a, [3] = b },
-      view = {
-        baseline = { [2] = a.path, [3] = b.path },
-        visible_nodes = { a, b },
-      },
+      tree = tree,
     }
-    function fake:_entry(node)
-      return {
-        instance_id = self.id,
-        node_id = node.id,
-        absolute_path = node.path,
-        relative_path = assert(path.relative(self.root, node.path)),
-        name = node.name,
-        kind = node.kind,
-      }
-    end
-    local marker_widths = { instance = 3, node = 3 }
-    fake.manager = {
-      find_by_id = function(_, id) return id == fake.id and fake or nil end,
+    local marker_widths = { instance = 3, node = 3, generation = 1 }
+    fake.buffer = buffer.new({
+      id = fake.id, root = fake.root, bufnr = fake.bufnr, config = fake.config, tree = tree,
       get_marker_widths = function() return marker_widths end,
+      can_reproject = function() return false end,
+      resolve_buffer_by_id = function(id) return id == fake.id and fake.buffer or nil end,
+      destroyed = function() return false end,
+      destroying = function() return false end,
+      list_views = function() return {} end,
+      apply_window = function() end,
+      sync_views = function() end,
+      request_write = function() end,
+      request_destroy = function() end,
+      reconsider_gc = function() end,
+      report_async_error = function() end,
+    })
+    fake.buffer.view = {
+      baseline = { [2] = a.path, [3] = b.path },
+      visible_nodes = { a, b },
     }
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
-      row.marker(fake.manager, fake.id, a.id) .. "b.txt",
+      row.marker(fake.buffer, fake.id, a.id) .. "b.txt",
     })
     local plan = mutation_prepare.prepare(fake)
     assert.are.same({
@@ -623,11 +615,11 @@ describe("fre ticket 10 prepare basic mutations", function()
       },
     }, plan.operations)
 
-    fake.nodes_by_id[3] = nil
-    fake.view.baseline[3] = nil
-    fake.view.visible_nodes = { a }
+    fake.tree.nodes_by_id[3] = nil
+    fake.buffer.view.baseline[3] = nil
+    fake.buffer.view.visible_nodes = { a }
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
-      row.marker(fake.manager, fake.id, a.id) .. "a.txt",
+      row.marker(fake.buffer, fake.id, a.id) .. "a.txt",
     })
     plan = mutation_prepare.prepare(fake)
     assert.are.same({

@@ -19,10 +19,10 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -46,7 +46,7 @@ end
 
 local function set_lines(instance, replacement)
   local navigation = lines(instance)[1]
-  assert.are.equal("navigation", assert(buffer.decode(instance, 1)).row_kind)
+  assert.are.equal("navigation", assert(instance.buffer:decode(1)).row_kind)
   local next_lines = {}
   if replacement[1] ~= navigation then next_lines[1] = navigation end
   vim.list_extend(next_lines, replacement)
@@ -58,7 +58,7 @@ end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
     if decoded and decoded.row_kind == "entry"
         and decoded.entry.relative_path == relative then
       return row
@@ -74,7 +74,7 @@ end
 local function edited_line(instance, relative, target)
   local row = row_for(instance, relative)
   local physical = lines(instance)[row]
-  local decoded = buffer.decode(instance, row)
+  local decoded = instance.buffer:decode(row)
   return physical:sub(1, decoded.path_range.start_byte) .. target
     .. physical:sub(decoded.path_range.end_byte + 1)
 end
@@ -107,7 +107,7 @@ end
 local function expand(instance, relative)
   instance:expand(relative)
   wait_for(function()
-    local node = instance.nodes_by_path[vim.fs.joinpath(instance.root, relative)]
+    local node = instance.tree.nodes_by_path[vim.fs.joinpath(instance.root, relative)]
     return node and node.loaded
   end)
 end
@@ -133,8 +133,8 @@ end
 
 local function wait_unlocked(instance)
   wait_for(function()
-    return (not instance.actions or not instance.actions.write)
-      and instance._refresh_request == nil and instance._execution == nil
+    return not instance.work:is_write_active()
+      and not instance.work:is_execution_active() and not instance.sync:is_busy()
   end)
 end
 
@@ -149,7 +149,7 @@ end
 local function projected_paths(instance)
   local result = {}
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
@@ -172,7 +172,7 @@ describe("fre ticket 13 cross-instance copy", function()
     fre._reset_fs_adapter()
     vim.notify = original_notify
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then pcall(instance.destroy, instance) end
+      if instance:status() ~= "destroyed" then pcall(instance.destroy, instance) end
     end
     fixture:cleanup()
   end)
@@ -185,7 +185,7 @@ describe("fre ticket 13 cross-instance copy", function()
     assert.are.equal(source_entry.node_id, target_entry.node_id)
 
     set_lines(target, { edited_line(source, "source.txt", "copied.txt") })
-    local decoded = buffer.decode(target, 2)
+    local decoded = target.buffer:decode(2)
     assert.are.equal(source.id, decoded.source_instance.id)
     assert.are.equal(source_entry.absolute_path, decoded.entry.absolute_path)
     assert.are.same({
@@ -209,12 +209,12 @@ describe("fre ticket 13 cross-instance copy", function()
     local target = ready(make_root("target", { ["keep.txt"] = "keep" }), {
       columns = target_columns,
     })
-    assert.are.equal(2, #source.view.column_widths)
-    assert.are.equal(1, #target.view.column_widths)
+    assert.are.equal(2, #source.buffer.view.column_widths)
+    assert.are.equal(1, #target.buffer.view.column_widths)
 
     local foreign = edited_line(source, "a.txt", "imported.txt")
     set_lines(target, { physical_line(target, "keep.txt"), foreign })
-    local decoded = buffer.decode(target, 3)
+    local decoded = target.buffer:decode(3)
     assert.are.same({ "source_kind", "source_again" }, {
       decoded.fields[1].id, decoded.fields[2].id,
     })
@@ -272,7 +272,7 @@ describe("fre ticket 13 cross-instance copy", function()
     local removed_row = row_for(removed, "c.txt")
     local removed_entry = removed:get_entry(removed_row)
     local removed_line = edited_line(removed, "c.txt", "removed-copy.txt")
-    removed.nodes_by_id[removed_entry.node_id] = nil
+    removed.tree.nodes_by_id[removed_entry.node_id] = nil
     set_lines(target, { "", "", removed_line })
     assert_error(4, "unknown node", function() target:prepare() end)
   end)
@@ -371,7 +371,7 @@ describe("fre ticket 13 cross-instance copy", function()
       columns = { token_column("target", "TARGET-") },
     })
     local source_before = lines(source)
-    local source_nodes = source.nodes_by_id
+    local source_nodes = source.tree.nodes_by_id
     local replacement = {
       edited_line(source, "file.txt", "copied-file.txt"),
       edited_line(source, "folder", "copied-folder/"),
@@ -414,16 +414,16 @@ describe("fre ticket 13 cross-instance copy", function()
       assert.are.equal(assert(vim.uv.fs_readlink(link)),
         assert(vim.uv.fs_readlink(fixture:path("target", "copied-link"))))
     end
-    assert.are.equal("succeeded", target._last_write_result.execution.state)
+    assert.are.equal("succeeded", target.work:last_write_result().execution.state)
     assert.are.same(source_before, lines(source))
-    assert.are.equal(source_nodes, source.nodes_by_id)
+    assert.are.equal(source_nodes, source.tree.nodes_by_id)
     assert.is_false(vim.bo[source.bufnr].modified)
 
     local target_paths = projected_paths(target)
     assert.is_truthy(vim.tbl_contains(target_paths, "copied-file.txt"))
     assert.is_truthy(vim.tbl_contains(target_paths, "copied-folder/"))
     for row = 1, vim.api.nvim_buf_line_count(target.bufnr) do
-      local decoded = buffer.decode(target, row)
+      local decoded = target.buffer:decode(row)
       if decoded.row_kind == "entry" then
         assert.are.equal(target.id, decoded.instance_id)
         assert.are.equal(target.id, decoded.entry.instance_id)
@@ -431,7 +431,7 @@ describe("fre ticket 13 cross-instance copy", function()
       end
     end
     for row = 1, #lines(source) do
-      assert.are.equal(source.id, buffer.decode(source, row).instance_id)
+      assert.are.equal(source.id, source.buffer:decode(row).instance_id)
     end
   end)
 end)

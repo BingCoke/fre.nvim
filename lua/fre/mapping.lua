@@ -33,28 +33,33 @@ local function visual_range(mode, row, col)
   }
 end
 
-function M.context(expected_instance, opts)
+local function owner_for(buffer)
+  local instance = manager_module.default:find_by_buf(buffer.bufnr)
+  if not instance or instance.buffer ~= buffer then
+    fail("current buffer is not a live Fre instance", 2)
+  end
+  return instance
+end
+
+function M.context(expected_buffer, opts)
   opts = opts or {}
   local bufnr = vim.api.nvim_get_current_buf()
+  local buffer
   local instance
-  if expected_instance ~= nil then
-    instance = expected_instance
-    if bufnr ~= instance.bufnr then
+  if expected_buffer ~= nil then
+    buffer = expected_buffer
+    if bufnr ~= buffer.bufnr then
       fail("current buffer does not match the mapped Fre instance", 2)
     end
-    if instance._destroyed
-        or instance.state == "destroying" or instance.state == "destroyed"
-        or not vim.api.nvim_buf_is_valid(instance.bufnr)
-        or instance.manager:find_by_buf(bufnr) ~= instance then
-      fail("current buffer is not a live Fre instance", 2)
-    end
+    instance = owner_for(buffer)
   else
     instance = manager_module.default:find_by_buf(bufnr)
-    if not instance or instance._destroyed
-        or instance.state == "destroying" or instance.state == "destroyed"
-        or not vim.api.nvim_buf_is_valid(instance.bufnr) then
-      fail("current buffer is not a live Fre instance", 2)
-    end
+    if not instance then fail("current buffer is not a live Fre instance", 2) end
+    buffer = instance.buffer
+  end
+  if instance:is_destroying() or instance:is_destroyed()
+      or not vim.api.nvim_buf_is_valid(buffer.bufnr) then
+    fail("current buffer is not a live Fre instance", 2)
   end
 
   local winid = vim.api.nvim_get_current_win()
@@ -64,10 +69,10 @@ function M.context(expected_instance, opts)
   local row, col = cursor[1], cursor[2]
   local decoded
   if opts.allow_undecodable_row then
-    local ok, value = pcall(buffer.decode, instance, row)
+    local ok, value = pcall(buffer.decode, buffer, row)
     if ok then decoded = value end
   else
-    decoded = buffer.decode(instance, row)
+    decoded = buffer:decode(row)
   end
   return {
     instance = instance,
@@ -124,15 +129,15 @@ local function overlay(base, override)
   return result
 end
 
-function M.setup(instance)
-  if instance._mapping_installed then fail("instance mappings are already installed", 2) end
+function M.setup(buffer)
+  if buffer.mapping_installed then fail("buffer mappings are already installed", 2) end
   local actions = require("fre.actions")
   local allow_undecodable_row = {
     [actions.jump_to_path] = true,
     [actions.collapse_all] = true,
   }
-  local base = instance.config.use_mapping_default and mapping_base() or {}
-  local installed_maps = overlay(base, copy_maps(instance.config.mapping))
+  local base = buffer.config.use_mapping_default and mapping_base() or {}
+  local installed_maps = overlay(base, copy_maps(buffer.config.mapping))
   local installed = {}
   local ok, err = pcall(function()
     for mode, mode_map in pairs(installed_maps) do
@@ -140,9 +145,9 @@ function M.setup(instance)
         vim.keymap.set(mode, lhs, function()
           local context_opts = allow_undecodable_row[handler]
             and { allow_undecodable_row = true } or nil
-          return handler(M.context(instance, context_opts))
+          return handler(M.context(buffer, context_opts))
         end, {
-          buffer = instance.bufnr,
+          buffer = buffer.bufnr,
           nowait = true,
           silent = true,
         })
@@ -153,21 +158,21 @@ function M.setup(instance)
   if not ok then
     for index = #installed, 1, -1 do
       local item = installed[index]
-      pcall(vim.keymap.del, item.mode, item.lhs, { buffer = instance.bufnr })
+      pcall(vim.keymap.del, item.mode, item.lhs, { buffer = buffer.bufnr })
     end
     error(err, 0)
   end
-  instance._installed_mappings = installed
-  instance._mapping_installed = true
+  buffer.installed_mappings = installed
+  buffer.mapping_installed = true
 end
 
-function M.teardown(instance)
-  for index = #(instance._installed_mappings or {}), 1, -1 do
-    local item = instance._installed_mappings[index]
-    pcall(vim.keymap.del, item.mode, item.lhs, { buffer = instance.bufnr })
+function M.teardown(buffer)
+  for index = #(buffer.installed_mappings or {}), 1, -1 do
+    local item = buffer.installed_mappings[index]
+    pcall(vim.keymap.del, item.mode, item.lhs, { buffer = buffer.bufnr })
   end
-  instance._installed_mappings = nil
-  instance._mapping_installed = nil
+  buffer.installed_mappings = nil
+  buffer.mapping_installed = nil
 end
 
 return M

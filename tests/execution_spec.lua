@@ -16,8 +16,8 @@ local function wait_for(predicate)
 end
 
 local function wait_ready(instance)
-  wait_for(function() return instance.state ~= "creating" end)
-  assert.are.equal("ready", instance.state)
+  wait_for(function() return instance:status() ~= "creating" end)
+  assert.are.equal("ready", instance:status())
 end
 
 local function wait_terminal(execution)
@@ -86,8 +86,8 @@ describe("fre plan execution", function()
     fre._reset_mutation_adapter()
     fre._reset_fs_adapter()
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then
-        local execution = instance._execution
+      if instance:status() ~= "destroyed" then
+        local execution = instance.work and instance.work:active_execution()
         if execution then
           local state = execution:get_status().state
           if state == "running" then execution:cancel() end
@@ -96,7 +96,7 @@ describe("fre plan execution", function()
             return value == "succeeded" or value == "failed" or value == "canceled"
           end, 10)
         end
-        if instance.state ~= "destroyed" then instance:destroy() end
+        if instance:status() ~= "destroyed" then instance:destroy() end
       end
     end
     fixture:cleanup()
@@ -440,21 +440,21 @@ describe("fre plan execution", function()
     })
     fre._set_mutation_adapter(complete_adapter(calls))
     local creating = keep(fre.new({ root = fixture.root }))
-    assert.are.equal("creating", creating.state)
+    assert.are.equal("creating", creating:status())
     assert.are.equal("succeeded", wait_terminal(creating:execute({ operations = {
       { type = "create_file", path = "creating-direct" },
     } })).state)
-    assert.are.equal("creating", creating.state)
+    assert.are.equal("creating", creating:status())
     load_callbacks[1](nil, {}, fixture.root)
     wait_ready(creating)
 
     local failed = keep(fre.new({ root = fixture.root }))
     load_callbacks[2]("load failed")
-    wait_for(function() return failed.state == "load-failed" end)
+    wait_for(function() return failed:status() == "load-failed" end)
     assert.are.equal("succeeded", wait_terminal(failed:execute({ operations = {
       { type = "create_directory", path = "failed-direct" },
     } })).state)
-    assert.are.equal("load-failed", failed.state)
+    assert.are.equal("load-failed", failed:status())
   end)
 
   it("does not alter Fre tree, buffer, refresh, lock, or UI state", function()
@@ -464,32 +464,32 @@ describe("fre plan execution", function()
     wait_ready(instance)
     local outside = fixture:path("trusted-outside.txt")
     local before = {
-      state = instance.state,
+      state = instance:status(),
       lines = lines(instance.bufnr),
       tree = instance.tree,
-      root_node = instance.root_node,
-      result = vim.deepcopy(instance.result),
-      needs_refresh = instance.needs_refresh,
+      root_node = instance.tree.root,
+      result = vim.deepcopy(instance:result_value()),
+      needs_refresh = instance.sync:is_dirty(),
       modified = vim.bo[instance.bufnr].modified,
       modifiable = vim.bo[instance.bufnr].modifiable,
       current_buf = vim.api.nvim_get_current_buf(),
-      actions = instance.actions,
+      write_active = instance.work:is_write_active(),
     }
     assert.are.equal("succeeded", wait_terminal(instance:execute({
       display = { "not inspected" },
       operations = { { type = "create_file", path = outside } },
     })).state)
     assert.is_not_nil(vim.uv.fs_lstat(outside))
-    assert.are.equal(before.state, instance.state)
+    assert.are.equal(before.state, instance:status())
     assert.are.same(before.lines, lines(instance.bufnr))
     assert.are.equal(before.tree, instance.tree)
-    assert.are.equal(before.root_node, instance.root_node)
-    assert.are.same(before.result, instance.result)
-    assert.are.equal(before.needs_refresh, instance.needs_refresh)
+    assert.are.equal(before.root_node, instance.tree.root)
+    assert.are.same(before.result, instance:result_value())
+    assert.are.equal(before.needs_refresh, instance.sync:is_dirty())
     assert.are.equal(before.modified, vim.bo[instance.bufnr].modified)
     assert.are.equal(before.modifiable, vim.bo[instance.bufnr].modifiable)
     assert.are.equal(before.current_buf, vim.api.nvim_get_current_buf())
-    assert.are.equal(before.actions, instance.actions)
+    assert.are.equal(before.write_active, instance.work:is_write_active())
   end)
 
   it("performs ordinary real file and directory whole-entry mutations", function()

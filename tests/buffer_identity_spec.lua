@@ -23,7 +23,7 @@ local function ready(entries, root)
   end
   local instance = keep(fre.new({ root = root or fixture.root }))
   wait_for(function()
-    return instance.state == "ready"
+    return instance:status() == "ready"
   end)
   return instance
 end
@@ -34,7 +34,7 @@ end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     if decoded.row_kind == "entry" and decoded.entry.relative_path == relative then
       return row
     end
@@ -83,7 +83,7 @@ describe("fre stable row identity", function()
 
   after_each(function()
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then
+      if instance:status() ~= "destroyed" then
         instance:destroy()
       end
     end
@@ -97,7 +97,7 @@ describe("fre stable row identity", function()
 
     local instance = ready({ ["a.txt"] = "x" })
     local entry_row = row_for(instance, "a.txt")
-    local decoded = buffer.decode(instance, entry_row)
+    local decoded = instance.buffer:decode(entry_row)
     local first = instance:get_entry(entry_row)
     local marker = decoded.marker
     local physical = lines(instance)[entry_row]
@@ -136,8 +136,8 @@ describe("fre stable row identity", function()
   it("reports malformed and unknown markers with their row numbers", function()
     local instance = ready({ ["a.txt"] = "x" })
     local malformed = unit_separator .. "fre:" .. instance.id .. ":"
-    local unknown_instance = row.marker(instance.manager, 999, 2) .. "foreign.txt"
-    local unknown_node = row.marker(instance.manager, instance.id, 999) .. "missing.txt"
+    local unknown_instance = row.marker(instance.buffer, 999, 2) .. "foreign.txt"
+    local unknown_node = row.marker(instance.buffer, instance.id, 999) .. "missing.txt"
     set_lines(instance, 0, -1, { malformed, unknown_instance, unknown_node })
 
     assert_row_error(1, "malformed reserved row marker", function()
@@ -155,7 +155,7 @@ describe("fre stable row identity", function()
     local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b" })
     local row = row_for(instance, "a.txt")
     local original = lines(instance)[row]
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     local path_start = decoded.path_range.start_byte
     set_lines(instance, row - 1, row, { original:sub(1, path_start) .. "renamed.txt" })
 
@@ -176,7 +176,7 @@ describe("fre stable row identity", function()
     local original = lines(instance)[row]
     set_lines(instance, row - 1, row - 1, { original })
 
-    local expected_col = assert(buffer.decode(instance, row)).path_range.start_byte
+    local expected_col = assert(instance.buffer:decode(row)).path_range.start_byte
     assert.are.same({ row + 1, expected_col }, instance:get_pos("a.txt"))
   end)
 
@@ -214,7 +214,7 @@ describe("fre stable row identity", function()
     assert.is_truthy(creating_pos:find("fre: instance is not ready", 1, true))
 
     pending("load exploded")
-    wait_for(function() return instance.state == "load-failed" end)
+    wait_for(function() return instance:status() == "load-failed" end)
     local failed_entry = error_text(function() instance:get_entry(1) end)
     local failed_pos = error_text(function() instance:get_pos("a.txt") end)
     assert.is_truthy(failed_entry:find("fre: instance is not ready", 1, true))
@@ -242,7 +242,7 @@ describe("fre stable row identity", function()
     local instance = ready({ ["a.txt"] = "x" })
     instance:open()
     local entry_row = row_for(instance, "a.txt")
-    local decoded = assert(buffer.decode(instance, entry_row))
+    local decoded = assert(instance.buffer:decode(entry_row))
     local boundary = decoded.navigable_range.start_byte
 
     vim.api.nvim_win_set_cursor(0, { entry_row, 0 })

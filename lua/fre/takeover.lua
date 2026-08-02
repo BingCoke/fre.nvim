@@ -62,7 +62,7 @@ function Takeover:_check(bufnr, winid)
       or vim.api.nvim_win_get_buf(winid) ~= bufnr then return nil end
 
   local owned = self.manager:find_by_buf(bufnr)
-  if owned and not owned._destroyed and owned.state ~= "destroyed" then return nil end
+  if owned and not owned:is_destroying() and not owned:is_destroyed() then return nil end
   local has_reserved_variable = pcall(vim.api.nvim_buf_get_var, bufnr, "fre")
   if has_reserved_variable then return nil end
 

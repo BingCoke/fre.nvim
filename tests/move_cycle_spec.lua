@@ -6,6 +6,7 @@ local mutation_fs = require("fre.mutation.fs")
 local mutation_prepare = require("fre.mutation.prepare")
 local path = require("fre.path")
 local row = require("fre.row")
+local Tree = require("fre.tree")
 local fs = require("tests.helpers.fs")
 
 local fixture
@@ -25,10 +26,10 @@ local function ready(entries)
   fixture:tree(entries or {})
   local instance = keep(fre.new({ root = fixture.root, columns = {} }))
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -38,7 +39,7 @@ end
 
 local function set_lines(instance, replacement)
   local navigation = lines(instance)[1]
-  assert.are.equal("navigation", assert(buffer.decode(instance, 1)).row_kind)
+  assert.are.equal("navigation", assert(instance.buffer:decode(1)).row_kind)
   local next_lines = {}
   if replacement[1] ~= navigation then next_lines[1] = navigation end
   vim.list_extend(next_lines, replacement)
@@ -50,7 +51,7 @@ end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
     if decoded and decoded.row_kind == "entry"
         and decoded.entry.relative_path == relative then
       return row
@@ -66,7 +67,7 @@ end
 local function edited_line(instance, relative, target)
   local row = row_for(instance, relative)
   local physical = lines(instance)[row]
-  local decoded = buffer.decode(instance, row)
+  local decoded = instance.buffer:decode(row)
   return physical:sub(1, decoded.path_range.start_byte) .. target
     .. physical:sub(decoded.path_range.end_byte + 1)
 end
@@ -74,7 +75,7 @@ end
 local function expand(instance, relative)
   instance:expand(relative)
   wait_for(function()
-    local node = instance.nodes_by_path[fixture:path(relative)]
+    local node = instance.tree.nodes_by_path[fixture:path(relative)]
     return node and node.loaded
   end)
 end
@@ -96,7 +97,7 @@ end
 local function projected_paths(instance)
   local result = {}
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
@@ -108,8 +109,8 @@ end
 
 local function wait_unlocked(instance)
   wait_for(function()
-    return (not instance.actions or not instance.actions.write)
-      and instance._refresh_request == nil and instance._execution == nil
+    return not instance.work:is_write_active()
+      and not instance.work:is_execution_active() and not instance.sync:is_busy()
   end)
 end
 
@@ -150,30 +151,35 @@ local function fake_plan(root_path, definitions)
     visible[#visible + 1] = node
     replacement[#replacement + 1] = row.marker(nil, 900, id, marker_widths) .. definition.target
   end
+  local tree = Tree.new(root_path, 900, function(_, left, right) return left.name < right.name end)
+  tree.root = root
+  tree.nodes_by_id = nodes_by_id
+  tree.nodes_by_path = {}
+  for _, node in pairs(nodes_by_id) do tree.nodes_by_path[node.path] = node end
   local fake = {
     id = 900,
     bufnr = bufnr,
     root = root_path,
-    root_node = root,
-    state = "ready",
+    ready = true,
     config = { columns = {} },
-    nodes_by_id = nodes_by_id,
-    view = { baseline = baseline, visible_nodes = visible },
+    tree = tree,
   }
-  function fake:_entry(node)
-    return {
-      instance_id = self.id,
-      node_id = node.id,
-      absolute_path = node.path,
-      relative_path = assert(path.relative(self.root, node.path)),
-      name = node.name,
-      kind = node.kind,
-    }
-  end
-  fake.manager = {
-    find_by_id = function(_, id) return id == fake.id and fake or nil end,
+  fake.buffer = buffer.new({
+    id = fake.id, root = fake.root, bufnr = fake.bufnr, config = fake.config, tree = tree,
     get_marker_widths = function() return marker_widths end,
-  }
+    can_reproject = function() return false end,
+    resolve_buffer_by_id = function(id) return id == fake.id and fake.buffer or nil end,
+    destroyed = function() return false end,
+    destroying = function() return false end,
+    list_views = function() return {} end,
+    apply_window = function() end,
+    sync_views = function() end,
+    request_write = function() end,
+    request_destroy = function() end,
+    reconsider_gc = function() end,
+    report_async_error = function() end,
+  })
+  fake.buffer.view = { baseline = baseline, visible_nodes = visible }
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, replacement)
   local ok, plan_or_error = pcall(mutation_prepare.prepare, fake)
   vim.api.nvim_buf_delete(bufnr, { force = true })
@@ -198,7 +204,7 @@ describe("fre ticket 14 move cycle lowering", function()
     fre._reset_fs_adapter()
     vim.notify = original_notify
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then pcall(instance.destroy, instance) end
+      if instance:status() ~= "destroyed" then pcall(instance.destroy, instance) end
     end
     fixture:cleanup()
   end)
@@ -210,7 +216,7 @@ describe("fre ticket 14 move cycle lowering", function()
       edited_line(instance, "b.txt", "a.txt"),
     })
     local before_lines = lines(instance)
-    local before_view = instance.view
+    local before_view = instance.buffer.view
     local temporary = fixture:path(".a.txt.fre-tmp-move-cycle-1")
     local expected = {
       operations = {
@@ -228,7 +234,7 @@ describe("fre ticket 14 move cycle lowering", function()
     assert.are.same(expected, first)
     assert.are.same(expected, instance:prepare())
     assert.are.same(before_lines, lines(instance))
-    assert.are.equal(before_view, instance.view)
+    assert.are.equal(before_view, instance.buffer.view)
     first.operations[1].to = "caller-mutated"
     assert.are.same(expected, instance:prepare())
     assert.are.equal(vim.fs.dirname(fixture:path("a.txt")), vim.fs.dirname(temporary))
@@ -452,7 +458,7 @@ describe("fre ticket 14 move cycle lowering", function()
     assert.are.equal("a payload", read_file(fixture:path("z", "inside", "file.txt")))
     assert.is_nil(vim.uv.fs_lstat(fixture:path("a")))
     assert.is_nil(vim.uv.fs_lstat(fixture:path("b")))
-    assert.are.equal("succeeded", instance._last_write_result.execution.state)
+    assert.are.equal("succeeded", instance.work:last_write_result().execution.state)
   end)
 
   it("keeps a distinct directory producer as the nested target container", function()
@@ -572,8 +578,8 @@ describe("fre ticket 14 move cycle lowering", function()
     assert.are.equal("z", read_file(fixture:path("x.txt")))
     assert.are.equal("x", read_file(fixture:path("y.txt")))
     assert.are.equal("y", read_file(fixture:path("z.txt")))
-    assert.are.equal("succeeded", instance._last_write_result.execution.state)
-    assert.is_false(instance.needs_refresh)
+    assert.are.equal("succeeded", instance.work:last_write_result().execution.state)
+    assert.is_false(instance.sync:is_dirty())
     for _, relative in ipairs(projected_paths(instance)) do
       assert.is_falsy(relative:find("fre%-tmp"))
     end
@@ -601,7 +607,7 @@ describe("fre ticket 14 move cycle lowering", function()
     assert.are.equal("a", read_file(fixture:path("b.txt")))
     assert.are.equal("occupied", read_file(fixture:path(occupied)))
     assert.is_nil(vim.uv.fs_lstat(fallback))
-    assert.are.equal("succeeded", instance._last_write_result.execution.state)
+    assert.are.equal("succeeded", instance.work:last_write_result().execution.state)
   end)
 
 
@@ -619,7 +625,7 @@ describe("fre ticket 14 move cycle lowering", function()
     ui.decide(true)
     wait_unlocked(instance)
     assert.are.equal("case contents", read_file(fixture:path("case.txt")))
-    assert.are.equal("succeeded", instance._last_write_result.execution.state)
+    assert.are.equal("succeeded", instance.work:last_write_result().execution.state)
     assert.is_truthy(vim.tbl_contains(projected_paths(instance), "case.txt"))
   end)
 
@@ -656,9 +662,10 @@ describe("fre ticket 14 move cycle lowering", function()
     assert.is_nil(vim.uv.fs_lstat(fixture:path("a.txt")))
     assert.are.equal("b", read_file(fixture:path("b.txt")))
     assert.are.equal("a", read_file(temporary))
-    assert.are.equal("failed", instance._last_write_result.execution.state)
-    assert.are.equal(1, instance._last_write_result.execution.completed)
-    assert.is_false(instance.needs_refresh)
+    local result = instance.work:last_write_result()
+    assert.are.equal("failed", result.execution.state)
+    assert.are.equal(1, result.execution.completed)
+    assert.is_false(instance.sync:is_dirty())
     assert.is_falsy(vim.tbl_contains(projected_paths(instance), "a.txt"))
   end)
 
@@ -702,8 +709,9 @@ describe("fre ticket 14 move cycle lowering", function()
     assert.is_nil(vim.uv.fs_lstat(fixture:path("a.txt")))
     assert.are.equal("b", read_file(fixture:path("b.txt")))
     assert.are.equal("a", read_file(temporary))
-    assert.are.equal("canceled", instance._last_write_result.execution.state)
-    assert.are.equal(1, instance._last_write_result.execution.completed)
-    assert.is_false(instance.needs_refresh)
+    local result = instance.work:last_write_result()
+    assert.are.equal("canceled", result.execution.state)
+    assert.are.equal(1, result.execution.completed)
+    assert.is_false(instance.sync:is_dirty())
   end)
 end)

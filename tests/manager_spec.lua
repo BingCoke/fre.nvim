@@ -5,6 +5,8 @@ local function instance(manager, bufnr, group)
     id = manager:allocate_id(),
     bufnr = bufnr,
     config = { gc = { group = group or "default" } },
+    is_destroyed = function() return false end,
+    is_destroying = function() return false end,
   }
 end
 

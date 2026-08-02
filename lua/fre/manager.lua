@@ -62,10 +62,11 @@ function Manager:_schedule_marker_width_refresh()
     self._marker_width_refresh_scheduled = false
     local generation = self._marker_widths.generation
     for _, instance in pairs(self.instances_by_id) do
-      if type(instance._on_marker_width_changed) == "function" then
-        local ok, err = pcall(instance._on_marker_width_changed, instance, generation)
-        if not ok and type(instance._report_async_error) == "function" then
-          pcall(instance._report_async_error, instance, err)
+      local target = instance.buffer
+      if target and type(target.on_marker_width_changed) == "function" then
+        local ok, err = pcall(target.on_marker_width_changed, target, generation)
+        if not ok and type(target.report_async_error) == "function" then
+          pcall(target.report_async_error, err)
         end
       end
     end
@@ -355,7 +356,7 @@ function Manager:remove(instance_or_id)
     return nil
   end
 
-  if not instance._destroyed then self._gc:stop(instance) end
+  if not instance:is_destroyed() and not instance:is_destroying() then self._gc:stop(instance) end
 
   self.instances_by_id[instance.id] = nil
   for bufnr, indexed in next, self.instances_by_buf do

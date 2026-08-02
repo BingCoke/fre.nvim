@@ -71,11 +71,10 @@ function Controller:_fail(entry, err)
   self:_close_entry(entry)
   local ok = pcall(self.adapter.schedule, function()
     if self.destroyed or self.failed[entry.path] ~= entry then return end
-    self.instance:_on_watch_error(entry, err)
+    self.on_error({ path = entry.path, node_id = entry.node_id }, err)
   end)
   if not ok then
-    -- There is no safe Neovim reporting path when the injected scheduler itself fails.
-    self.instance.needs_refresh = true
+    self.on_error({ path = entry.path, node_id = entry.node_id }, err)
   end
 end
 
@@ -88,7 +87,9 @@ function Controller:_debounce(entry)
     self.adapter.debounce_ms or 100, function()
       if not self:_current(entry) or entry.debounce_generation ~= generation then return end
       pcall(self.adapter.timer_stop, entry.timer)
-      self:_schedule(entry, function() self.instance:_on_watch_event(entry) end)
+      self:_schedule(entry, function()
+        self.on_event({ path = entry.path, node_id = entry.node_id })
+      end)
     end)
   if err then self:_fail(entry, "debounce timer: " .. tostring(err)) end
 end
@@ -97,7 +98,6 @@ function Controller:_start(spec)
   local entry = {
     path = spec.path,
     node_id = spec.node_id,
-    tree_generation = spec.tree_generation,
     generation = self.next_generation,
     debounce_generation = 0,
     active = true,
@@ -138,7 +138,6 @@ function Controller:sync(specs, opts)
       self:_close_entry(entry)
     else
       entry.node_id = spec.node_id
-      entry.tree_generation = spec.tree_generation
     end
   end
 
@@ -170,8 +169,9 @@ function Controller:paths()
   return result
 end
 
-function M.new(instance, adapter)
-  adapter = adapter or M.default
+function M.new(options)
+  options = options or {}
+  local adapter = options.adapter or M.default
   for _, method in ipairs({
     "new_fs_event", "fs_event_start", "new_timer", "timer_start",
     "timer_stop", "close", "schedule",
@@ -181,8 +181,9 @@ function M.new(instance, adapter)
     end
   end
   return setmetatable({
-    instance = instance,
     adapter = adapter,
+    on_error = assert(options.on_error),
+    on_event = assert(options.on_event),
     entries = {},
     failed = {},
     next_generation = 1,

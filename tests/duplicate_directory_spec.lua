@@ -20,10 +20,10 @@ local function ready(entries)
   fixture:tree(entries or {})
   local instance = keep(fre.new({ root = fixture.root, columns = {} }))
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -33,7 +33,7 @@ end
 
 local function set_lines(instance, replacement)
   local navigation = lines(instance)[1]
-  assert.are.equal("navigation", assert(buffer.decode(instance, 1)).row_kind)
+  assert.are.equal("navigation", assert(instance.buffer:decode(1)).row_kind)
   local next_lines = {}
   if replacement[1] ~= navigation then next_lines[1] = navigation end
   vim.list_extend(next_lines, replacement)
@@ -45,7 +45,7 @@ end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
     if decoded and decoded.row_kind == "entry"
         and decoded.entry.relative_path == relative then
       return row
@@ -61,7 +61,7 @@ end
 local function edited_line(instance, relative, target)
   local row = row_for(instance, relative)
   local physical = lines(instance)[row]
-  local decoded = buffer.decode(instance, row)
+  local decoded = instance.buffer:decode(row)
   return physical:sub(1, decoded.path_range.start_byte) .. target
     .. physical:sub(decoded.path_range.end_byte + 1)
 end
@@ -69,7 +69,7 @@ end
 local function expand(instance, relative)
   instance:expand(relative)
   wait_for(function()
-    local node = instance.nodes_by_path[fixture:path(relative)]
+    local node = instance.tree.nodes_by_path[fixture:path(relative)]
     return node and node.loaded
   end)
 end
@@ -86,8 +86,8 @@ end
 
 local function wait_unlocked(instance)
   wait_for(function()
-    return (not instance.actions or not instance.actions.write)
-      and instance._refresh_request == nil and instance._execution == nil
+    return not instance.work:is_write_active()
+      and not instance.work:is_execution_active() and not instance.sync:is_busy()
   end)
 end
 
@@ -117,7 +117,7 @@ end
 local function projected_paths(instance)
   local result = {}
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
@@ -140,7 +140,7 @@ describe("fre ticket 12 duplicate and directory semantics", function()
     fre._reset_fs_adapter()
     vim.notify = original_notify
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then pcall(instance.destroy, instance) end
+      if instance:status() ~= "destroyed" then pcall(instance.destroy, instance) end
     end
     fixture:cleanup()
   end)
@@ -245,7 +245,7 @@ describe("fre ticket 12 duplicate and directory semantics", function()
     for _, case in ipairs(cases) do
       local instance = ready({ ["dir/child.txt"] = "child", ["dir/.hidden.txt"] = "hidden" })
       expand(instance, "dir")
-      assert.is_not_nil(instance.nodes_by_path[fixture:path("dir", ".hidden.txt")])
+      assert.is_not_nil(instance.tree.nodes_by_path[fixture:path("dir", ".hidden.txt")])
       instance:collapse("dir")
       set_lines(instance, case.lines(instance))
       assert.are.same({ case.operation() }, instance:prepare().operations)
@@ -275,7 +275,7 @@ describe("fre ticket 12 duplicate and directory semantics", function()
       })
       local instance = ready({})
       expand(instance, "dir")
-      assert.are.equal(case.kind, instance.nodes_by_path[fixture:path("dir", "special")].kind)
+      assert.are.equal(case.kind, instance.tree.nodes_by_path[fixture:path("dir", "special")].kind)
       instance:collapse("dir")
       local original = physical_line(instance, "dir")
       local moved = edited_line(instance, "dir", "moved/")
@@ -590,7 +590,7 @@ describe("fre ticket 12 duplicate and directory semantics", function()
     assert.is_nil(vim.uv.fs_lstat(fixture:path("a.txt")))
     assert.is_nil(vim.uv.fs_lstat(fixture:path("dir")))
     assert.are.same({ "moved/" }, projected_paths(instance))
-    assert.are.equal("succeeded", instance._last_write_result.execution.state)
+    assert.are.equal("succeeded", instance.work:last_write_result().execution.state)
   end)
 
   it("duplicates files and whole directories through write then reconciles to truth", function()
@@ -613,7 +613,7 @@ describe("fre ticket 12 duplicate and directory semantics", function()
     assert.are.equal("child", read_file(fixture:path("copied-dir", "child.txt")))
     assert.is_nil(vim.uv.fs_lstat(fixture:path("dir")))
     assert.are.same({ "copied-dir/", "moved-dir/", "a-copy.txt", "a.txt" }, projected_paths(instance))
-    assert.are.equal("succeeded", instance._last_write_result.execution.state)
+    assert.are.equal("succeeded", instance.work:last_write_result().execution.state)
   end)
 
   it("extracts a descendant before a real directory move and reconciles both results", function()

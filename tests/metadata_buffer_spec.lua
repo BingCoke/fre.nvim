@@ -2,6 +2,7 @@ local fre = require("fre")
 local buffer = require("fre.buffer")
 local columns = require("fre.columns")
 local row = require("fre.row")
+local Tree = require("fre.tree")
 local fs = require("tests.helpers.fs")
 
 local instances = {}
@@ -14,10 +15,10 @@ end
 
 local function wait_ready(instance)
   assert.is_true(vim.wait(1500, function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end, 10))
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -33,7 +34,7 @@ end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     if decoded.row_kind == "entry" and decoded.entry.relative_path == relative then
       return row
     end
@@ -80,7 +81,7 @@ describe("fre metadata buffer rows", function()
 
   after_each(function()
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then instance:destroy() end
+      if instance:status() ~= "destroyed" then instance:destroy() end
     end
     fre._reset_fs_adapter()
     fixture:cleanup()
@@ -90,12 +91,12 @@ describe("fre metadata buffer rows", function()
     local instance = ready({ ["dir"] = true, ["file.txt"] = "x" })
     local physical = lines(instance)
     assert.are.equal(3, #physical)
-    local navigation = assert(buffer.decode(instance, 1))
+    local navigation = assert(instance.buffer:decode(1))
     assert.are.equal("navigation", navigation.row_kind)
     assert.are.equal("../", navigation.path)
 
     for row = 2, 3 do
-      local decoded = buffer.decode(instance, row)
+      local decoded = instance.buffer:decode(row)
       local marker = decoded.marker
       assert.are.equal(marker, physical[row]:sub(1, #marker))
       assert.are.same({ "icon", "permissions", "size", "mtime" }, {
@@ -143,12 +144,12 @@ describe("fre metadata buffer rows", function()
     local instance = ready({ ["a.txt"] = "a", ["bbbbb.txt"] = "b" }, {
       columns = descriptors,
     })
-    assert.are.same({ 4, 3, 5 }, instance.view.column_widths)
+    assert.are.same({ 4, 3, 5 }, instance.buffer.view.column_widths)
 
     local first_row = row_for(instance, "a.txt")
     local second_row = row_for(instance, "bbbbb.txt")
-    local first = buffer.decode(instance, first_row)
-    local second = buffer.decode(instance, second_row)
+    local first = instance.buffer:decode(first_row)
+    local second = instance.buffer:decode(second_row)
     assert.are.same({ "L", "C", "R" }, {
       first.column_values.left, first.column_values.center, first.column_values.right,
     })
@@ -171,7 +172,7 @@ describe("fre metadata buffer rows", function()
     instance:open({ position = "current" })
 
     local function path_mark(row)
-      local decoded = assert(buffer.decode(instance, row))
+      local decoded = assert(instance.buffer:decode(row))
       for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
         instance.bufnr, -1, 0, -1, { details = true }
       )) do
@@ -195,7 +196,7 @@ describe("fre metadata buffer rows", function()
     assert.is_nil(path_mark(row_for(instance, "plain.txt")))
 
     local hidden_row = row_for(instance, ".env")
-    vim.api.nvim_win_set_cursor(0, { hidden_row, buffer.decode(instance, hidden_row).path_range.start_byte })
+    vim.api.nvim_win_set_cursor(0, { hidden_row, instance.buffer:decode(hidden_row).path_range.start_byte })
     vim.cmd.normal({ args = { "yyp" }, bang = true })
     assert.is_true(vim.wait(1000, function()
       local count = 0
@@ -223,7 +224,7 @@ describe("fre metadata buffer rows", function()
     local instance = ready({ ["plain.txt"] = "x" }, { columns = { descriptor } })
     local entry_row = row_for(instance, "plain.txt")
     local physical = lines(instance)[entry_row]
-    local decoded = assert(buffer.decode(instance, entry_row))
+    local decoded = assert(instance.buffer:decode(entry_row))
     local path_start = decoded.path_range.start_byte
     local prefix = physical:sub(1, path_start)
     parse_calls = 0
@@ -244,14 +245,14 @@ describe("fre metadata buffer rows", function()
 
     set_line(instance, entry_row, prefix .. ".hidden")
     assert.is_true(vim.wait(1000, function()
-      return not instance._highlight_update_scheduled
+      return not instance.buffer.highlight_update_scheduled
         and path_group() == "FreHiddenPath"
     end, 10))
     assert.are.equal(0, parse_calls)
 
     set_line(instance, entry_row, prefix .. "plain.txt")
     assert.is_true(vim.wait(1000, function()
-      return not instance._highlight_update_scheduled and path_group() == nil
+      return not instance.buffer.highlight_update_scheduled and path_group() == nil
     end, 10))
     assert.are.equal(0, parse_calls)
   end)
@@ -262,22 +263,26 @@ describe("fre metadata buffer rows", function()
       id = 2, path = "C:/Project/plain.txt", kind = "file", name = "plain.txt",
     }
     local marker_widths = { instance = 3, node = 3, generation = 1 }
-    local fake = {
-      id = 777, root = root.path, root_node = root,
-      config = { columns = {} }, nodes_by_id = { [1] = root, [2] = node },
-    }
-    fake.manager = {
+    local tree = Tree.new(root.path, 777, function(_, left, right) return left.name < right.name end)
+    tree.root = root
+    tree.nodes_by_id = { [1] = root, [2] = node }
+    tree.nodes_by_path = { [root.path] = root, [node.path] = node }
+    local fake = buffer.new({
+      id = 777, root = root.path, bufnr = vim.api.nvim_create_buf(false, true),
+      config = { columns = {} }, tree = tree,
       get_marker_widths = function() return marker_widths end,
-      find_by_id = function(_, id) return id == fake.id and fake or nil end,
-    }
-    function fake:_entry(current)
-      return {
-        instance_id = self.id, node_id = current.id, absolute_path = current.path,
-        relative_path = current == root and "" or "plain.txt",
-        name = current.name, kind = current.kind,
-      }
-    end
-
+      can_reproject = function() return false end,
+      resolve_buffer_by_id = function() return nil end,
+      destroyed = function() return false end,
+      destroying = function() return false end,
+      list_views = function() return {} end,
+      apply_window = function() end,
+      sync_views = function() end,
+      request_write = function() end,
+      request_destroy = function() end,
+      reconsider_gc = function() end,
+      report_async_error = function() end,
+    })
     local prepared = row.prepare(fake, { nodes = { node } }, function() return "plain.txt" end)
     fake.view = prepared
     local template = assert(prepared.row_templates[node.id])
@@ -316,7 +321,7 @@ describe("fre metadata buffer rows", function()
         entries = {}
         local navigation_count = 0
         for _, mark in ipairs(icon_marks()) do
-          local decoded = buffer.decode(instance, mark[2] + 1)
+          local decoded = instance.buffer:decode(mark[2] + 1)
           if not decoded or mark[4].end_col <= mark[3] then return false end
           if decoded.row_kind == "entry" then
             entries[#entries + 1] = mark
@@ -332,31 +337,31 @@ describe("fre metadata buffer rows", function()
     assert_icon_marks(1)
     local original_row = row_for(instance, "a.txt")
     vim.api.nvim_win_set_cursor(0, {
-      original_row, buffer.decode(instance, original_row).visible_range.start_byte,
+      original_row, instance.buffer:decode(original_row).visible_range.start_byte,
     })
     vim.cmd.normal({ args = { "yyp" }, bang = true })
     assert.are.equal(3, #lines(instance))
     local marks = assert_icon_marks(2)
     for _, mark in ipairs(marks) do
-      local decoded = buffer.decode(instance, mark[2] + 1)
+      local decoded = instance.buffer:decode(mark[2] + 1)
       assert.are.equal(decoded.column_ranges[1].start_byte, mark[3])
       assert.are.equal(decoded.column_ranges[1].start_byte + #glyph, mark[4].end_col)
     end
 
     local copied_row = original_row + 1
     vim.api.nvim_win_set_cursor(0, {
-      copied_row, buffer.decode(instance, copied_row).visible_range.start_byte,
+      copied_row, instance.buffer:decode(copied_row).visible_range.start_byte,
     })
     vim.cmd.normal({ args = { "yyp" }, bang = true })
     assert.are.equal(4, #lines(instance))
     assert_icon_marks(3)
 
-    local copied = buffer.decode(instance, copied_row)
+    local copied = instance.buffer:decode(copied_row)
     set_line(instance, copied_row, lines(instance)[copied_row]:sub(1, copied.path_range.start_byte) .. "copy.lua")
     assert_icon_marks(3)
     for _ = 1, 3 do
       vim.api.nvim_win_set_cursor(
-        0, { copied_row, buffer.decode(instance, copied_row).visible_range.start_byte }
+        0, { copied_row, instance.buffer:decode(copied_row).visible_range.start_byte }
       )
       vim.cmd.normal({ args = { "ddp" }, bang = true })
     end
@@ -392,7 +397,7 @@ describe("fre metadata buffer rows", function()
         local entry_count, navigation_count = 0, 0
         for _, mark in ipairs(highlight_marks()) do
           if mark[4].end_col <= mark[3] then return false end
-          local decoded = buffer.decode(instance, mark[2] + 1)
+          local decoded = instance.buffer:decode(mark[2] + 1)
           if decoded.row_kind == "entry" then
             entry_count = entry_count + 1
           elseif decoded.row_kind == "navigation" then
@@ -435,7 +440,7 @@ describe("fre metadata buffer rows", function()
     })
     local instance = ready({ ["a.txt"] = "x" }, { columns = { icon } })
     local before_lines = lines(instance)
-    local before_view = instance.view
+    local before_view = instance.buffer.view
 
     local function highlight_state()
       local result = {}
@@ -454,7 +459,7 @@ describe("fre metadata buffer rows", function()
     end
 
     local before_highlights = highlight_state()
-    local prepared = buffer.prepare(instance, instance.view.projection)
+    local prepared = instance.buffer:prepare(instance.buffer.view.projection)
     local original_set_extmark = vim.api.nvim_buf_set_extmark
     local injected = false
     vim.api.nvim_buf_set_extmark = function(bufnr, namespace, row, col, opts)
@@ -466,7 +471,7 @@ describe("fre metadata buffer rows", function()
     end
 
     local test_ok, test_err = xpcall(function()
-      local commit_ok, commit_err = pcall(buffer.commit, instance, prepared)
+      local commit_ok, commit_err = pcall(instance.buffer.commit, instance.buffer, prepared)
       assert.is_false(commit_ok)
       assert.is_truthy(tostring(commit_err):find(
         "injected highlight commit failure", 1, true
@@ -477,15 +482,59 @@ describe("fre metadata buffer rows", function()
 
     assert.is_true(injected)
     assert.are.same(before_lines, lines(instance))
-    assert.are.equal(before_view, instance.view)
+    assert.are.equal(before_view, instance.buffer.view)
     assert.are.same(before_highlights, highlight_state())
   end)
+
+  it("restores Buffer metadata when undo-history cleanup fails after publication", function()
+    local instance = ready({ ["a.txt"] = "x" })
+    instance.buffer.pending_initial_cursor[999999] = true
+    instance.buffer.marker_width_stale = true
+    local before_lines = lines(instance)
+    local before_view = instance.buffer.view
+    local before_ranges = vim.deepcopy(instance.buffer.projection_ranges)
+    local before_pending = vim.deepcopy(instance.buffer.pending_initial_cursor)
+    local prepared = instance.buffer:prepare(instance.buffer.view.projection)
+    prepared.projection = vim.deepcopy(prepared.projection)
+    prepared.projection.ranges[999999] = { start_row = 9, end_row = 9, size = 1 }
+    prepared.lines[#prepared.lines + 1] = "candidate-only"
+
+    local original_set_lines = vim.api.nvim_buf_set_lines
+    local injected = false
+    vim.api.nvim_buf_set_lines = function(bufnr, first, last, strict, replacement)
+      local line_count = vim.api.nvim_buf_line_count(bufnr)
+      if not injected and bufnr == instance.bufnr and first == line_count
+          and last == line_count and #replacement == 1 then
+        injected = true
+        error("injected undo cleanup failure")
+      end
+      return original_set_lines(bufnr, first, last, strict, replacement)
+    end
+
+    local test_ok, test_err = xpcall(function()
+      local commit_ok, commit_err = pcall(instance.buffer.commit, instance.buffer, prepared)
+      assert.is_false(commit_ok)
+      assert.is_truthy(tostring(commit_err):find("injected undo cleanup failure", 1, true))
+    end, debug.traceback)
+    vim.api.nvim_buf_set_lines = original_set_lines
+    if not test_ok then error(test_err) end
+
+    assert.is_true(injected)
+    assert.are.equal(before_view, instance.buffer.view)
+    assert.are.same(before_ranges, instance.buffer.projection_ranges)
+    assert.is_true(instance.buffer.marker_width_stale)
+    assert.are.same(before_pending, instance.buffer.pending_initial_cursor)
+    assert.are.same(before_lines, lines(instance))
+    vim.api.nvim_buf_call(instance.bufnr, function() vim.cmd("silent! undo") end)
+    assert.are.same(before_lines, lines(instance))
+  end)
+
 
   it("conceals physical identity on screen while preserving it in ordinary yanks", function()
     local instance = ready({ ["a.txt"] = "x" })
     instance:open({ position = "current" })
     local row = row_for(instance, "a.txt")
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
     local marker = decoded.marker
     vim.api.nvim_win_set_cursor(0, { row, decoded.visible_range.start_byte })
     vim.cmd.normal({ args = { "yy" }, bang = true })
@@ -515,7 +564,7 @@ describe("fre metadata buffer rows", function()
     local instance = ready({ ["file.txt"] = "x" })
     local row = row_for(instance, "file.txt")
     local original = lines(instance)[row]
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
 
     local separator = decoded.separator_ranges[1]
     local whitespace_edit = original:sub(1, separator.start_byte)
@@ -604,8 +653,11 @@ describe("fre metadata buffer rows", function()
         equals = function() return true end,
       })
       local instance = keep(fre.new({ root = root, columns = { descriptor } }))
-      assert.is_true(vim.wait(1500, function() return instance.state == "load-failed" end, 10))
-      assert.is_truthy(tostring(instance.error):find(output.fragment, 1, true), tostring(instance.error))
+      assert.is_true(vim.wait(1500, function() return instance:status() == "load-failed" end, 10))
+      assert.is_truthy(tostring(instance:failure()):find(output.fragment, 1, true), tostring(instance:failure()))
+      assert.are.equal(0, #instance.tree:root_node().children_order)
+      assert.is_nil(instance.tree:root_node().children_by_name["a.txt"])
+      assert.are.equal("unloaded", instance.tree:root_node().load_state)
     end
   end)
 
@@ -613,7 +665,7 @@ describe("fre metadata buffer rows", function()
     local instance = ready({ ["a.txt"] = "x" })
     instance:open()
     local row = row_for(instance, "a.txt")
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
     assert.is_true(decoded.navigable_range.start_byte < decoded.path_range.start_byte)
 
     vim.api.nvim_win_set_cursor(0, { row, 0 })
@@ -678,7 +730,7 @@ describe("fre metadata buffer rows", function()
     local instance = wait_ready(keep(fre.new({ root = fixture.root })))
     local symlink_row
     for row = 1, #lines(instance) do
-      local decoded = buffer.decode(instance, row)
+      local decoded = instance.buffer:decode(row)
       if decoded.row_kind == "entry" and decoded.entry.name == "link.txt" then
         symlink_row = decoded
         break

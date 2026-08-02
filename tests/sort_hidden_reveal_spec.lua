@@ -19,10 +19,10 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -35,7 +35,7 @@ end
 local function projected_paths(instance)
   local result = {}
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
@@ -100,39 +100,38 @@ end
 
 local function projection_snapshot(instance)
   local orders = {}
-  local visibility = {}
-  for _, node in pairs(instance.nodes_by_id) do
+  local visibility = vim.deepcopy(instance.buffer.projection_ranges)
+  local row_extmarks = vim.deepcopy(instance.buffer.row_extmarks)
+  for _, node in pairs(instance.tree.nodes_by_id) do
     if node.kind == "directory" then
       local ids = {}
       for _, child in ipairs(node.children_order or {}) do ids[#ids + 1] = child.id end
       orders[node.id] = ids
     end
-    visibility[node.id] = {
-      node.visible_size, node.visible_start, node.visible_end,
-      node.visible_range and vim.deepcopy(node.visible_range) or nil,
-    }
   end
   return {
     lines = lines(instance),
-    baseline = vim.deepcopy(instance.view.baseline),
-    widths = vim.deepcopy(instance.view.column_widths),
+    baseline = vim.deepcopy(instance.buffer.view.baseline),
+    widths = vim.deepcopy(instance.buffer.view.column_widths),
     extmarks = vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}),
-    generation = instance.view.projection_generation,
+    generation = instance.buffer.view.projection_generation,
     orders = orders,
     visibility = visibility,
+    row_extmarks = row_extmarks,
   }
 end
 
 local function assert_projection_snapshot(instance, expected)
   assert.are.same(expected.lines, lines(instance))
-  assert.are.same(expected.baseline, instance.view.baseline)
-  assert.are.same(expected.widths, instance.view.column_widths)
+  assert.are.same(expected.baseline, instance.buffer.view.baseline)
+  assert.are.same(expected.widths, instance.buffer.view.column_widths)
   assert.are.same(expected.extmarks,
     vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}))
-  assert.are.equal(expected.generation, instance.view.projection_generation)
+  assert.are.equal(expected.generation, instance.buffer.view.projection_generation)
   local actual = projection_snapshot(instance)
   assert.are.same(expected.orders, actual.orders)
   assert.are.same(expected.visibility, actual.visibility)
+  assert.are.same(expected.row_extmarks, actual.row_extmarks)
 end
 
 local function assert_public_entry(entry)
@@ -161,7 +160,7 @@ describe("fre ticket 07 sort hidden and reveal", function()
     pcall(vim.cmd, "silent! tabonly")
     pcall(vim.cmd, "silent! only")
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then instance:destroy() end
+      if instance:status() ~= "destroyed" then instance:destroy() end
     end
     fre._reset_fs_adapter()
     fixture:cleanup()
@@ -248,8 +247,8 @@ describe("fre ticket 07 sort hidden and reveal", function()
         assert.is_truthy(call.b.relative_path:find("^dir/"))
       end
     end
-    assert.are.equal("dir", instance.nodes_by_path[fixture:path("dir")].name)
-    assert.are.equal("a.txt", instance.nodes_by_path[fixture:path("dir", "a.txt")].name)
+    assert.are.equal("dir", instance.tree.nodes_by_path[fixture:path("dir")].name)
+    assert.are.equal("a.txt", instance.tree.nodes_by_path[fixture:path("dir", "a.txt")].name)
   end)
 
   it("retains dynamic sort state and atomically reorders every loaded parent", function()
@@ -269,7 +268,7 @@ describe("fre ticket 07 sort hidden and reveal", function()
       return instance:get_pos("a/two.txt") ~= nil and instance:get_pos("b/two.txt") ~= nil
     end)
     local ids = {}
-    for absolute, node in pairs(instance.nodes_by_path) do ids[absolute] = node.id end
+    for absolute, node in pairs(instance.tree.nodes_by_path) do ids[absolute] = node.id end
 
     local before_error = projection_snapshot(instance)
     local original_notify = vim.notify
@@ -278,7 +277,7 @@ describe("fre ticket 07 sort hidden and reveal", function()
     local failing = function() error("comparator exploded") end
     instance._last_async_error = nil
     instance:set_sort(failing)
-    assert.are.equal(failing, instance.current_sort)
+    assert.are.equal(failing, instance.tree:get_comparator())
     wait_for(function()
       return instance._last_async_error
         and instance._last_async_error:find("comparator exploded", 1, true)
@@ -289,7 +288,7 @@ describe("fre ticket 07 sort hidden and reveal", function()
     explode_render = true
     instance._last_async_error = nil
     instance:set_sort(reverse)
-    assert.are.equal(reverse, instance.current_sort)
+    assert.are.equal(reverse, instance.tree:get_comparator())
     wait_for(function()
       return instance._last_async_error
         and instance._last_async_error:find("projection exploded", 1, true)
@@ -307,26 +306,26 @@ describe("fre ticket 07 sort hidden and reveal", function()
         projected_paths(instance))
     end)
     for absolute, id in pairs(ids) do
-      assert.are.equal(id, instance.nodes_by_path[absolute].id)
+      assert.are.equal(id, instance.tree.nodes_by_path[absolute].id)
     end
   end)
 
   it("validates setters and rejects them before changing modified drafts or state", function()
     local instance = ready({ [".hidden"] = "h", ["a.txt"] = "a" })
-    local original_sort = instance.current_sort
-    local original_hidden = instance.current_hidden_file
+    local original_sort = instance.tree:get_comparator()
+    local original_hidden = instance.buffer:hidden_files()
     local physical = lines(instance)
     set_line(instance, 1, physical[1] .. " draft")
     local draft = lines(instance)
 
     local err = error_text(function() instance:set_sort(function() return false end) end)
     assert.is_truthy(err:find("buffer is modified", 1, true))
-    assert.are.equal(original_sort, instance.current_sort)
+    assert.are.equal(original_sort, instance.tree:get_comparator())
     err = error_text(function() instance:set_hidden_file(true) end)
     assert.is_truthy(err:find("buffer is modified", 1, true))
     err = error_text(function() instance:toggle_hidden_file() end)
     assert.is_truthy(err:find("buffer is modified", 1, true))
-    assert.are.equal(original_hidden, instance.current_hidden_file)
+    assert.are.equal(original_hidden, instance.buffer:hidden_files())
     assert.are.same(draft, lines(instance))
     assert.is_true(vim.bo[instance.bufnr].modified)
 
@@ -345,33 +344,33 @@ describe("fre ticket 07 sort hidden and reveal", function()
       ["a"] = "a",
     }, { columns = { descriptor } })
     assert.are.same({ "visible/", "a" }, projected_paths(instance))
-    assert.are.equal(#"visible", instance.view.column_widths[1])
+    assert.are.equal(#"visible", instance.buffer.view.column_widths[1])
 
     instance:set_hidden_file(true)
-    assert.are.equal(#".wide-hidden-root-name.txt", instance.view.column_widths[1])
+    assert.are.equal(#".wide-hidden-root-name.txt", instance.buffer.view.column_widths[1])
     instance:expand(".cache")
     wait_for(function() return instance:get_pos(".cache/very-long-hidden-child.txt") ~= nil end)
-    local hidden_dir = instance.nodes_by_path[fixture:path(".cache")]
-    local hidden_child = instance.nodes_by_path[fixture:path(".cache", "very-long-hidden-child.txt")]
+    local hidden_dir = instance.tree.nodes_by_path[fixture:path(".cache")]
+    local hidden_child = instance.tree.nodes_by_path[fixture:path(".cache", "very-long-hidden-child.txt")]
     local dir_id, child_id = hidden_dir.id, hidden_child.id
     assert.is_true(hidden_dir.expanded)
-    assert.are.equal(#"very-long-hidden-child.txt", instance.view.column_widths[1])
+    assert.are.equal(#"very-long-hidden-child.txt", instance.buffer.view.column_widths[1])
 
     instance:toggle_hidden_file()
     assert.are.same({ "visible/", "a" }, projected_paths(instance))
-    assert.are.equal(#"visible", instance.view.column_widths[1])
-    assert.are.equal(hidden_dir, instance.nodes_by_id[dir_id])
-    assert.are.equal(hidden_child, instance.nodes_by_id[child_id])
+    assert.are.equal(#"visible", instance.buffer.view.column_widths[1])
+    assert.are.equal(hidden_dir, instance.tree.nodes_by_id[dir_id])
+    assert.are.equal(hidden_child, instance.tree.nodes_by_id[child_id])
     assert.is_true(hidden_dir.expanded)
-    assert.is_nil(instance.view.baseline[dir_id])
-    assert.is_nil(instance.view.baseline[child_id])
+    assert.is_nil(instance.buffer.view.baseline[dir_id])
+    assert.is_nil(instance.buffer.view.baseline[child_id])
 
     instance:set_hidden_file(true)
     assert.is_not_nil(instance:get_pos(".cache/very-long-hidden-child.txt"))
-    assert.are.equal(dir_id, instance.nodes_by_path[fixture:path(".cache")].id)
+    assert.are.equal(dir_id, instance.tree.nodes_by_path[fixture:path(".cache")].id)
     assert.are.equal(child_id,
-      instance.nodes_by_path[fixture:path(".cache", "very-long-hidden-child.txt")].id)
-    assert.is_true(instance.nodes_by_id[dir_id].expanded)
+      instance.tree.nodes_by_path[fixture:path(".cache", "very-long-hidden-child.txt")].id)
+    assert.is_true(instance.tree.nodes_by_id[dir_id].expanded)
   end)
 
   it("reveals nested snapshot paths without invoking window primitives", function()
@@ -382,8 +381,8 @@ describe("fre ticket 07 sort hidden and reveal", function()
 
     instance:reveal(fixture:path("a", "b", "target.txt"))
     wait_for(function() return instance:get_pos("a/b/target.txt") ~= nil end)
-    assert.is_true(instance.nodes_by_path[fixture:path("a")].expanded)
-    assert.is_true(instance.nodes_by_path[fixture:path("a", "b")].expanded)
+    assert.is_true(instance.tree.nodes_by_path[fixture:path("a")].expanded)
+    assert.is_true(instance.tree.nodes_by_path[fixture:path("a", "b")].expanded)
     assert.are.equal(0, open_calls)
     assert.are.equal(0, toggle_calls)
   end)
@@ -404,10 +403,10 @@ describe("fre ticket 07 sort hidden and reveal", function()
 
     err = error_text(function() instance:reveal(".secret/file.txt") end)
     assert.is_truthy(err:find("enable hidden files", 1, true))
-    assert.is_false(instance.nodes_by_path[fixture:path(".secret")].expanded)
+    assert.is_false(instance.tree.nodes_by_path[fixture:path(".secret")].expanded)
     err = error_text(function() instance:reveal("visible/.target") end)
     assert.is_truthy(err:find("enable hidden files", 1, true))
-    assert.is_false(instance.nodes_by_path[fixture:path("visible")].expanded)
+    assert.is_false(instance.tree.nodes_by_path[fixture:path("visible")].expanded)
 
     local original_notify = vim.notify
     vim.notify = function() end
@@ -489,7 +488,7 @@ describe("fre ticket 07 sort hidden and reveal", function()
     local physical = lines(instance)
     set_line(instance, 1, physical[1] .. " draft")
     local draft = lines(instance)
-    local directory = instance.nodes_by_path[fixture:path("dir")]
+    local directory = instance.tree.nodes_by_path[fixture:path("dir")]
 
     instance:reveal("a.txt")
     assert.are.same(instance:get_pos("a.txt"), vim.api.nvim_win_get_cursor(0))

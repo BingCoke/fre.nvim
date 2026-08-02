@@ -23,10 +23,10 @@ local function ready(entries, configured_columns)
     columns = configured_columns or {},
   }))
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -38,7 +38,7 @@ end
 
 local function entry_at(instance, winid)
   local cursor = vim.api.nvim_win_get_cursor(winid)
-  local decoded = assert(buffer.decode(instance, cursor[1]))
+  local decoded = assert(instance.buffer:decode(cursor[1]))
   return decoded.entry
 end
 
@@ -58,7 +58,7 @@ end
 
 local function cursor_state(instance, winid)
   local cursor = vim.api.nvim_win_get_cursor(winid)
-  local decoded = assert(buffer.decode(instance, cursor[1]))
+  local decoded = assert(instance.buffer:decode(cursor[1]))
   return decoded, assert(row.cursor_anchor(decoded, cursor[2]))
 end
 
@@ -99,7 +99,7 @@ describe("fre semantic cursor preservation", function()
 
   after_each(function()
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then instance:destroy() end
+      if instance:status() ~= "destroyed" then instance:destroy() end
     end
     pcall(vim.cmd, "silent! tabonly")
     pcall(vim.cmd, "silent! only")
@@ -154,7 +154,7 @@ describe("fre semantic cursor preservation", function()
     local first_tab = vim.api.nvim_get_current_tabpage()
     local first = open_current(instance)
     local first_target = assert(instance:get_pos("item-25.txt"))[1]
-    local first_decoded = assert(buffer.decode(instance, first_target))
+    local first_decoded = assert(instance.buffer:decode(first_target))
     local first_anchor = { field_id = "tag", zone = "content", display_offset = 2 }
     vim.api.nvim_win_set_cursor(first, {
       first_target, assert(row.cursor_column(first_decoded, first_anchor)),
@@ -167,7 +167,7 @@ describe("fre semantic cursor preservation", function()
     local second_tab = vim.api.nvim_get_current_tabpage()
     local second = open_current(instance)
     local second_target = assert(instance:get_pos("item-35.txt"))[1]
-    local second_decoded = assert(buffer.decode(instance, second_target))
+    local second_decoded = assert(instance.buffer:decode(second_target))
     local second_anchor = { field_id = "path", zone = "content", display_offset = 4 }
     vim.api.nvim_win_set_cursor(second, {
       second_target, assert(row.cursor_column(second_decoded, second_anchor)),
@@ -175,14 +175,14 @@ describe("fre semantic cursor preservation", function()
     vim.api.nvim_win_call(second, function() vim.cmd("normal! zt") end)
     local second_row = vim.api.nvim_win_get_cursor(second)[1]
     local second_topline = saved_view(second).topline
-    local old_width = instance.view.column_widths[1]
+    local old_width = instance.buffer.view.column_widths[1]
     local focused_tab = vim.api.nvim_get_current_tabpage()
     local focused_win = vim.api.nvim_get_current_win()
 
     instance:expand("a-dir")
     wait_for(function() return instance:get_pos("a-dir/child.txt") ~= nil end)
 
-    assert.is_true(instance.view.column_widths[1] > old_width)
+    assert.is_true(instance.buffer.view.column_widths[1] > old_width)
     local restored_first, restored_first_anchor = cursor_state(instance, first)
     local restored_second, restored_second_anchor = cursor_state(instance, second)
     assert.are.equal("item-25.txt", restored_first.entry.relative_path)
@@ -211,7 +211,7 @@ describe("fre semantic cursor preservation", function()
 
     assert.are.equal("dir", entry_at(instance, winid).relative_path)
     local cursor = vim.api.nvim_win_get_cursor(winid)
-    local decoded = assert(buffer.decode(instance, cursor[1]))
+    local decoded = assert(instance.buffer:decode(cursor[1]))
     assert.is_true(cursor[2] >= decoded.navigable_range.start_byte)
     assert.is_true(cursor[2] <= decoded.navigable_range.end_byte)
     assert.are.same(instance:get_pos("dir"), cursor)
@@ -226,7 +226,7 @@ describe("fre semantic cursor preservation", function()
     assert.is_nil(complete_refresh(instance))
 
     local cursor = vim.api.nvim_win_get_cursor(winid)
-    local decoded = assert(buffer.decode(instance, cursor[1]))
+    local decoded = assert(instance.buffer:decode(cursor[1]))
     assert.are.equal("entry", decoded.row_kind)
     assert.are.equal("remain.txt", decoded.entry.relative_path)
     assert.is_true(cursor[2] >= decoded.navigable_range.start_byte)
@@ -249,7 +249,7 @@ describe("fre semantic cursor preservation", function()
     vim.api.nvim_win_set_cursor(good, instance:get_pos("item-15.txt"))
     local focused_tab = vim.api.nvim_get_current_tabpage()
     local focused_win = vim.api.nvim_get_current_win()
-    local generation = instance.view.projection_generation
+    local generation = instance.buffer.view.projection_generation
 
     local set_cursor = vim.api.nvim_win_set_cursor
     local injected = false
@@ -266,8 +266,8 @@ describe("fre semantic cursor preservation", function()
 
     assert.is_true(injected)
     assert.is_true(ok, tostring(err))
-    assert.is_true(instance.current_hidden_file)
-    assert.are.equal(generation + 1, instance.view.projection_generation)
+    assert.is_true(instance.buffer:hidden_files())
+    assert.are.equal(generation + 1, instance.buffer.view.projection_generation)
     assert.are.same(
       vim.api.nvim_win_get_cursor(manual), vim.api.nvim_win_get_cursor(bad)
     )

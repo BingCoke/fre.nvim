@@ -31,14 +31,14 @@ local function format_id(value, width)
   return string.format("%0" .. tostring(width) .. "d", value)
 end
 
-function M.marker(manager, instance_id, node_id, widths)
+function M.marker(buffer, instance_id, node_id, widths)
   if not valid_integer(instance_id, false) then
     fail("instance marker ID must be a positive integer", 3)
   end
   if not valid_integer(node_id, true) then
     fail("node marker ID must be a non-negative integer", 3)
   end
-  widths = widths or manager:get_marker_widths()
+  widths = widths or buffer:marker_widths()
   validate_width(widths.instance, "instance")
   validate_width(widths.node, "node")
   if #tostring(instance_id) > widths.instance then
@@ -68,8 +68,8 @@ local function decode_decimal(text, row_number, label, allow_zero, current_width
   return value
 end
 
-function M.decode_marker(manager, row_number, line, widths)
-  widths = widths or manager:get_marker_widths()
+function M.decode_marker(buffer, row_number, line, widths)
+  widths = widths or buffer:marker_widths()
   validate_width(widths.instance, "instance")
   validate_width(widths.node, "node")
   local instance_text, node_text, suffix_index = line:match(
@@ -77,13 +77,13 @@ function M.decode_marker(manager, row_number, line, widths)
   )
   if not suffix_index then fail_row(row_number, "malformed reserved row marker") end
   local instance_id = decode_decimal(
-    instance_text, row_number, "instance", false, widths.instance
+    instance_text, row_number, "buffer", false, widths.instance
   )
   local node_id = decode_decimal(node_text, row_number, "node", true, widths.node)
   local marker_end = suffix_index - 1
   local marker_text = line:sub(1, marker_end)
   local observed_widths = { instance = #instance_text, node = #node_text }
-  if marker_text ~= M.marker(manager, instance_id, node_id, observed_widths) then
+  if marker_text ~= M.marker(buffer, instance_id, node_id, observed_widths) then
     fail_row(row_number, "non-canonical row marker")
   end
   return {
@@ -110,13 +110,13 @@ local function trim_range(text, offset)
   }
 end
 
-local function marker_source(instance, instance_id, row_number)
-  if instance_id == instance.id then return instance end
-  local source = instance.manager:find_by_id(instance_id)
+local function marker_source(buffer, instance_id, row_number)
+  if instance_id == buffer.id then return buffer end
+  local source = buffer.resolve_buffer_by_id(instance_id)
   if not source then
     fail_row(row_number, "marker references unknown instance " .. tostring(instance_id))
   end
-  if source._destroyed or source.state == "destroying" or source.state == "destroyed" then
+  if source.destroyed() then
     fail_row(row_number, "marker references destroyed instance " .. tostring(instance_id))
   end
   return source
@@ -134,8 +134,9 @@ local function navigation_context(ctx, navigation_kind)
   return ctx
 end
 
-local function navigation_callback_entry(source, navigation_kind)
-  local entry = source:_entry(source.root_node)
+local function navigation_callback_entry(source, navigation_kind, tree)
+  tree = tree or source.tree
+  local entry = tree:entry(tree:root_node())
   local label
   if navigation_kind == "parent" then
     label = ".."
@@ -216,14 +217,15 @@ local function resolve_layout(descriptors, suffix, marker_end, layout)
 end
 
 local function parse_columns(row_number, source, node, suffix, marker_end, opts)
+  local tree = opts.tree or source.tree
   local descriptors = source.config.columns or {}
   local values, ranges, separators, fields = {}, {}, {}, {}
   local navigation_kind = opts.navigation_kind
   local callback_entry
   if navigation_kind then
-    callback_entry = navigation_callback_entry(source, navigation_kind)
+    callback_entry = navigation_callback_entry(source, navigation_kind, tree)
   else
-    callback_entry = source:_entry(node)
+    callback_entry = tree:entry(node)
   end
   local layout = active_layout(source, opts.layout_override)
   local resolved = resolve_layout(descriptors, suffix, marker_end, layout)
@@ -333,7 +335,7 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
   }
 end
 
-function M.decode(instance, row_number, line, opts)
+function M.decode(buffer, row_number, line, opts)
   opts = opts or {}
   if line == nil then return nil end
   if line:sub(1, 1) ~= US then
@@ -346,37 +348,38 @@ function M.decode(instance, row_number, line, opts)
       navigable_range = path_range,
     }
   end
+  local tree = opts.tree or buffer.tree
 
-  local marker_widths = instance.manager:get_marker_widths()
-  local decoded_marker = M.decode_marker(instance.manager, row_number, line, marker_widths)
-  local source = marker_source(instance, decoded_marker.instance_id, row_number)
+  local marker_widths = buffer:marker_widths()
+  local decoded_marker = M.decode_marker(buffer, row_number, line, marker_widths)
+  local source = marker_source(buffer, decoded_marker.instance_id, row_number)
   local node, entry, navigation_kind
   if decoded_marker.node_id == 0 then
-    node = source.root_node
-    if not node then fail_row(row_number, "navigation marker references an invalid instance") end
+    node = (source == buffer and tree or source.tree):root_node()
+    if not node then fail_row(row_number, "navigation marker references an invalid buffer") end
     if path.parent(source.root) then
       navigation_kind = "parent"
     else
       navigation_kind = "root"
     end
   else
-    node = source.nodes_by_id[decoded_marker.node_id]
+    node = (source == buffer and tree or source.tree):node_by_id(decoded_marker.node_id)
     if not node then
-      if source == instance then
+      if source == buffer then
         fail_row(row_number, "marker references unknown local node " .. tostring(decoded_marker.node_id))
       end
       fail_row(row_number, "marker references unknown node " .. tostring(decoded_marker.node_id)
         .. " in instance " .. tostring(decoded_marker.instance_id))
     end
-    if source ~= instance and (node.id ~= decoded_marker.node_id or type(node.path) ~= "string"
-        or type(source.nodes_by_path) ~= "table" or source.nodes_by_path[node.path] ~= node) then
+    if source ~= buffer and (node.id ~= decoded_marker.node_id or type(node.path) ~= "string"
+        or source.tree:node_by_path(node.path) ~= node) then
       fail_row(row_number, "marker references invalid node " .. tostring(decoded_marker.node_id)
         .. " in instance " .. tostring(decoded_marker.instance_id))
     end
-    if source == instance then
-      entry = source:_entry(node)
+    if source == buffer then
+      entry = (source == buffer and tree or source.tree):entry(node)
     else
-      local entry_ok, entry_or_error = pcall(source._entry, source, node)
+      local entry_ok, entry_or_error = pcall(source.tree.entry, source.tree, node)
       if not entry_ok then
         fail_row(row_number, "marker references invalid node " .. tostring(decoded_marker.node_id)
           .. " in instance " .. tostring(decoded_marker.instance_id)
@@ -393,6 +396,7 @@ function M.decode(instance, row_number, line, opts)
       node_id = decoded_marker.node_id,
       validate_metadata = opts.validate_metadata ~= false,
       layout_override = opts.layout_override,
+      tree = source == buffer and tree or nil,
     }
   )
   local proposed_path, path_range = trim_range(parsed.path_suffix, parsed.path_offset)
@@ -421,7 +425,7 @@ function M.decode(instance, row_number, line, opts)
     node_id = decoded_marker.node_id,
     source_instance = source,
     source_node = source_node,
-    foreign = source ~= instance,
+    foreign = source ~= buffer,
     entry = entry,
     proposed_path = proposed_path,
     path = proposed_path,
@@ -456,7 +460,7 @@ local function add_unchanged_decoration(result, line, decoration)
   end
 end
 
-function M.decorations(instance, row_number, line)
+function M.decorations(buffer, row_number, line)
   if type(line) ~= "string" then return {} end
   if line:sub(1, 1) ~= US then
     local proposed_path, path_range = trim_range(line, 0)
@@ -471,8 +475,8 @@ function M.decorations(instance, row_number, line)
     } }
   end
 
-  local identity = M.decode_marker(instance.manager, row_number, line)
-  local source = marker_source(instance, identity.instance_id, row_number)
+  local identity = M.decode_marker(buffer, row_number, line)
+  local source = marker_source(buffer, identity.instance_id, row_number)
   local layout = source.view
   local template = template_for(layout, identity.node_id)
   if not template or template.instance_id ~= identity.instance_id then return {} end
@@ -480,13 +484,13 @@ function M.decorations(instance, row_number, line)
   local node
   local navigation_kind = template.navigation_kind
   if identity.node_id == 0 then
-    node = source.root_node
+    node = source.tree:root_node()
     if not node or not navigation_kind then return {} end
   else
-    node = source.nodes_by_id[identity.node_id]
+    node = source.tree:node_by_id(identity.node_id)
     if not node or node.id ~= identity.node_id then return {} end
-    if source ~= instance and (type(node.path) ~= "string"
-        or type(source.nodes_by_path) ~= "table" or source.nodes_by_path[node.path] ~= node) then
+    if source ~= buffer and (type(node.path) ~= "string"
+        or source.tree:node_by_path(node.path) ~= node) then
       return {}
     end
   end
@@ -655,33 +659,34 @@ function M.cursor_column(decoded, anchor)
   return content.start_byte + byte_for_display_offset(text, anchor.display_offset)
 end
 
-function M.matches_identity(instance, line, instance_id, node_id)
+function M.matches_identity(buffer, line, instance_id, node_id)
   if type(line) ~= "string" or line:sub(1, 1) ~= US then return false end
-  local ok, decoded = pcall(M.decode_marker, instance.manager, 0, line)
+  local ok, decoded = pcall(M.decode_marker, buffer, 0, line)
   return ok and decoded.instance_id == instance_id and decoded.node_id == node_id
 end
 
-function M.prepare(instance, projection, render_path, opts)
+function M.prepare(buffer, projection, render_path, opts)
   opts = opts or {}
   render_path = render_path or function(node)
     return node.kind == "directory" and node.name .. "/" or node.name
   end
+  local tree = opts.tree or buffer.tree
   local nodes = projection.nodes or projection
-  local descriptors = instance.config.columns or {}
-  local marker_widths = instance.manager:get_marker_widths()
+  local descriptors = buffer.config.columns or {}
+  local marker_widths = buffer:marker_widths()
   local rendered, widths = {}, {}
   for index = 1, #descriptors do widths[index] = 0 end
 
   local function add_rendered(node, rendered_path, navigation_kind)
     local callback_entry
     if navigation_kind then
-      callback_entry = navigation_callback_entry(instance, navigation_kind)
+      callback_entry = navigation_callback_entry(buffer, navigation_kind, tree)
     else
-      callback_entry = instance:_entry(node)
+      callback_entry = tree:entry(node)
     end
     local fields = {}
     for index, descriptor in ipairs(descriptors) do
-      local ctx = instance:_column_context(
+      local ctx = buffer:_column_context(
         node, callback_entry, descriptor, index, index == #descriptors
       )
       if navigation_kind then ctx = navigation_context(ctx, navigation_kind) end
@@ -713,7 +718,7 @@ function M.prepare(instance, projection, render_path, opts)
   end
 
   local navigation_kind
-  if path.parent(instance.root) then
+  if path.parent(buffer.root) then
     navigation_kind = "parent"
   else
     navigation_kind = "root"
@@ -724,15 +729,15 @@ function M.prepare(instance, projection, render_path, opts)
   else
     navigation_path = "/"
   end
-  add_rendered(instance.root_node, navigation_path, navigation_kind)
+  add_rendered(tree:root_node(), navigation_path, navigation_kind)
   for _, node in ipairs(nodes) do add_rendered(node, render_path(node), nil) end
 
   local lines, baseline, highlights, row_templates = {}, {}, {}, {}
   for row_number, item in ipairs(rendered) do
-    local marker_text = M.marker(instance.manager, instance.id, item.node_id, marker_widths)
+    local marker_text = M.marker(buffer, buffer.id, item.node_id, marker_widths)
     local physical = {}
     local template = {
-      instance_id = instance.id,
+      instance_id = buffer.id,
       node_id = item.node_id,
       marker_range = { start_byte = 0, end_byte = #marker_text },
       fields = {},
@@ -809,13 +814,14 @@ function M.prepare(instance, projection, render_path, opts)
 
   if opts.validate then
     local validation_layout = {
-      source_instance_id = instance.id,
+      source_instance_id = buffer.id,
       column_widths = widths,
       row_templates = row_templates,
     }
     for row_number, item in ipairs(rendered) do
-      local decoded = M.decode(instance, row_number, lines[row_number], {
+      local decoded = M.decode(buffer, row_number, lines[row_number], {
         layout_override = validation_layout,
+        tree = tree,
       })
       if item.synthetic then
         if not decoded.synthetic or decoded.navigation_kind ~= item.navigation_kind

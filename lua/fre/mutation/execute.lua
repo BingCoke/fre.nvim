@@ -174,7 +174,7 @@ local execution_mt = {
   __metatable = false,
 }
 
-function M.start(instance, plan, handlers_value, adapter, on_terminal)
+function M.start(plan, handlers_value, adapter, on_terminal)
   if type(plan) ~= "table" then fail("execute plan must be a table", 3) end
   if type(plan.operations) ~= "table" then
     fail("execute plan.operations must be a table", 3)

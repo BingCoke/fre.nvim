@@ -610,7 +610,7 @@ execution:cancel()
 
 - Fre 为 root 和当前活动的展开目录建立非递归 `vim.uv` watcher。
 - 事件按目录 debounce，并只刷新相关直接子项边界。
-- buffer 已修改、实例隐藏或写入锁定时，事件只设置 `instance.needs_refresh`，不会覆盖当前内容。
+- buffer 已修改、实例隐藏或写入锁定时，事件只记录待刷新状态，不会覆盖当前内容。
 - 隐藏实例再次显示时，会在安全条件下执行一次完整刷新。
 - watcher 行为和可靠性仍受操作系统及 libuv 限制。
 

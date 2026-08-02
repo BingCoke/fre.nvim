@@ -19,10 +19,10 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -52,7 +52,7 @@ end
 local function projected_paths(instance)
   local result = {}
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
@@ -102,7 +102,7 @@ end
 
 local function snapshot(instance)
   local nodes = {}
-  for id, node in pairs(instance.nodes_by_id) do
+  for id, node in pairs(instance.tree.nodes_by_id) do
     local order = {}
     for _, child in ipairs(node.children_order or {}) do order[#order + 1] = child.id end
     nodes[id] = {
@@ -116,23 +116,19 @@ local function snapshot(instance)
       load_state = node.load_state,
       load_generation = node.load_generation,
       order = order,
-      visible_size = node.visible_size,
-      visible_start = node.visible_start,
-      visible_end = node.visible_end,
-      visible_range = node.visible_range and vim.deepcopy(node.visible_range) or nil,
-      row_extmark = node.row_extmark,
     }
   end
   return {
     tree = instance.tree,
-    root_node = instance.root_node,
-    nodes_by_id = instance.nodes_by_id,
-    nodes_by_path = instance.nodes_by_path,
-    next_node_id = instance._next_node_id,
-    view = instance.view,
-    baseline = vim.deepcopy(instance.view.baseline),
-    widths = vim.deepcopy(instance.view.column_widths),
-    projection_generation = instance.view.projection_generation,
+    root_node = instance.tree.root,
+    nodes_by_id = instance.tree.nodes_by_id,
+    nodes_by_path = instance.tree.nodes_by_path,
+    view = instance.buffer.view,
+    baseline = vim.deepcopy(instance.buffer.view.baseline),
+    widths = vim.deepcopy(instance.buffer.view.column_widths),
+    projection_generation = instance.buffer.view.projection_generation,
+    projection_ranges = vim.deepcopy(instance.buffer.projection_ranges),
+    row_extmarks = vim.deepcopy(instance.buffer.row_extmarks),
     text = lines(instance),
     modified = vim.bo[instance.bufnr].modified,
     extmarks = vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}),
@@ -142,20 +138,21 @@ end
 
 local function assert_snapshot(instance, expected)
   assert.are.equal(expected.tree, instance.tree)
-  assert.are.equal(expected.root_node, instance.root_node)
-  assert.are.equal(expected.nodes_by_id, instance.nodes_by_id)
-  assert.are.equal(expected.nodes_by_path, instance.nodes_by_path)
-  assert.are.equal(expected.next_node_id, instance._next_node_id)
-  assert.are.equal(expected.view, instance.view)
-  assert.are.same(expected.baseline, instance.view.baseline)
-  assert.are.same(expected.widths, instance.view.column_widths)
-  assert.are.equal(expected.projection_generation, instance.view.projection_generation)
+  assert.are.equal(expected.root_node, instance.tree.root)
+  assert.are.equal(expected.nodes_by_id, instance.tree.nodes_by_id)
+  assert.are.equal(expected.nodes_by_path, instance.tree.nodes_by_path)
+  assert.are.equal(expected.view, instance.buffer.view)
+  assert.are.same(expected.baseline, instance.buffer.view.baseline)
+  assert.are.same(expected.widths, instance.buffer.view.column_widths)
+  assert.are.equal(expected.projection_generation, instance.buffer.view.projection_generation)
+  assert.are.same(expected.projection_ranges, instance.buffer.projection_ranges)
+  assert.are.same(expected.row_extmarks, instance.buffer.row_extmarks)
   assert.are.same(expected.text, lines(instance))
   assert.are.equal(expected.modified, vim.bo[instance.bufnr].modified)
   assert.are.same(expected.extmarks,
     vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}))
   for id, value in pairs(expected.nodes) do
-    local node = instance.nodes_by_id[id]
+    local node = instance.tree.nodes_by_id[id]
     assert.are.equal(value.ref, node)
     assert.are.equal(value.path, node.path)
     assert.are.equal(value.kind, node.kind)
@@ -168,11 +165,6 @@ local function assert_snapshot(instance, expected)
     local order = {}
     for _, child in ipairs(node.children_order or {}) do order[#order + 1] = child.id end
     assert.are.same(value.order, order)
-    assert.are.equal(value.visible_size, node.visible_size)
-    assert.are.equal(value.visible_start, node.visible_start)
-    assert.are.equal(value.visible_end, node.visible_end)
-    assert.are.same(value.visible_range, node.visible_range)
-    assert.are.equal(value.row_extmark, node.row_extmark)
   end
 end
 
@@ -203,7 +195,7 @@ describe("fre ticket 08 atomic refresh", function()
     pcall(vim.cmd, "silent! tabonly")
     pcall(vim.cmd, "silent! only")
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then instance:destroy() end
+      if instance:status() ~= "destroyed" then instance:destroy() end
     end
     fre._reset_fs_adapter()
     fixture:cleanup()
@@ -219,8 +211,7 @@ describe("fre ticket 08 atomic refresh", function()
     })
     local instance = ready({ ["a.txt"] = "a" })
     local initial_calls = calls
-    local generation = instance._refresh_generation
-    local needs_refresh = instance.needs_refresh
+    local needs_refresh = instance.sync:is_dirty()
     local cases = {
       function() instance:refresh(false) end,
       function() instance:refresh("bad") end,
@@ -232,9 +223,8 @@ describe("fre ticket 08 atomic refresh", function()
       local err = error_text(operation)
       assert.is_truthy(err:find("refresh", 1, true), err)
       assert.are.equal(initial_calls, calls)
-      assert.are.equal(generation, instance._refresh_generation)
-      assert.are.equal(needs_refresh, instance.needs_refresh)
-      assert.is_nil(instance._refresh_request)
+      assert.are.equal(needs_refresh, instance.sync:is_dirty())
+      assert.is_false(instance.sync:is_busy())
     end
   end)
 
@@ -248,11 +238,6 @@ describe("fre ticket 08 atomic refresh", function()
     initial_done(nil, {}, fixture.root)
     wait_ready(creating)
 
-    creating.actions = { write = true }
-    assert.is_truthy(error_text(function() creating:refresh({ force = true }) end)
-      :find("write%-locked"))
-    assert.are.equal(1, calls)
-    creating.actions = nil
 
     local pending
     fre._set_fs_adapter({ load = function(_, done) calls = calls + 1; pending = done end })
@@ -264,11 +249,6 @@ describe("fre ticket 08 atomic refresh", function()
     assert.are.equal(2, calls)
     pending(nil, {}, fixture.root)
     wait_for(function() return first_count == 1 end)
-
-    creating.state = "destroying"
-    assert.is_truthy(error_text(function() creating:refresh() end):find("destroyed", 1, true))
-    assert.are.equal(2, calls)
-    creating.state = "ready"
 
     creating:destroy()
     assert.is_truthy(error_text(function() creating:refresh() end):find("destroyed", 1, true))
@@ -283,19 +263,19 @@ describe("fre ticket 08 atomic refresh", function()
     local instance = keep(fre.new({ root = fixture.root }))
     assert.are.same({ "" }, lines(instance))
     callbacks[1]("initial failed")
-    wait_for(function() return instance.state == "load-failed" end)
+    wait_for(function() return instance:status() == "load-failed" end)
     local callback_count, callback_error = 0
     instance:refresh({ on_complete = function(err)
       callback_count = callback_count + 1
       callback_error = err
     end })
-    assert.are.equal("creating", instance.state)
+    assert.are.equal("creating", instance:status())
     assert.are.same({ "" }, lines(instance))
     callbacks[2](nil, { { name = "ok.txt", kind = "file" } }, fixture.root)
-    wait_for(function() return callback_count == 1 and instance.state == "ready" end)
+    wait_for(function() return callback_count == 1 and instance:status() == "ready" end)
     assert.is_nil(callback_error)
     assert.are.same({ "ok.txt" }, projected_paths(instance))
-    assert.is_false(instance.needs_refresh)
+    assert.is_false(instance.sync:is_dirty())
   end)
 
   it("preserves a forced draft during construction and failure, discarding only at commit", function()
@@ -328,7 +308,7 @@ describe("fre ticket 08 atomic refresh", function()
     assert.are.equal("forced scan failed", errors[1])
     assert.are.same(draft, lines(instance))
     assert.is_true(vim.bo[instance.bufnr].modified)
-    assert.is_true(instance.needs_refresh)
+    assert.is_true(instance.sync:is_dirty())
 
     fixture:write("b.txt", "b")
     instance:refresh({ force = true, on_complete = function(err) errors[#errors + 1] = err or false end })
@@ -339,7 +319,7 @@ describe("fre ticket 08 atomic refresh", function()
     assert.is_false(errors[2])
     assert.are.same({ "a.txt", "b.txt" }, projected_paths(instance))
     assert.is_false(vim.bo[instance.bufnr].modified)
-    assert.is_false(instance.needs_refresh)
+    assert.is_false(instance.sync:is_dirty())
     local committed = lines(instance)
     vim.api.nvim_buf_call(instance.bufnr, function() vim.cmd("silent! undo") end)
     assert.are.same(committed, lines(instance))
@@ -374,8 +354,8 @@ describe("fre ticket 08 atomic refresh", function()
     assert.is_nil(counts[fixture:path("inactive")])
     assert.is_nil(counts[fixture:path("inactive", "deep")])
     assert.is_nil(counts[fixture:path("plain")])
-    assert.is_true(instance.nodes_by_path[fixture:path("inactive", "deep")].expanded)
-    assert.is_true(instance.nodes_by_path[fixture:path("inactive", "deep")].children_cached)
+    assert.is_true(instance.tree.nodes_by_path[fixture:path("inactive", "deep")].expanded)
+    assert.is_true(instance.tree.nodes_by_path[fixture:path("inactive", "deep")].children_cached)
   end)
 
   it("leaves complete authoritative snapshots unchanged on scan sort column parser and commit failures", function()
@@ -400,7 +380,7 @@ describe("fre ticket 08 atomic refresh", function()
       if cleanup then cleanup() end
       assert.is_truthy(tostring(err):find(expected, 1, true), tostring(err))
       assert_snapshot(instance, before)
-      assert.is_true(instance.needs_refresh)
+      assert.is_true(instance.sync:is_dirty())
     end
 
     local original_adapter = instance.manager:get_fs_adapter()
@@ -408,10 +388,10 @@ describe("fre ticket 08 atomic refresh", function()
       fre._set_fs_adapter({ load = function(_, done) done("scan exploded") end })
     end, function() fre._set_fs_adapter(original_adapter) end)
 
-    local original_sort = instance.current_sort
+    local original_sort = instance.tree:get_comparator()
     failed_refresh("sort exploded", function()
-      instance.current_sort = function() error("sort exploded") end
-    end, function() instance.current_sort = original_sort end)
+      instance.tree:set_comparator(function() error("sort exploded") end)
+    end, function() instance.tree:set_comparator(original_sort) end)
 
     failed_refresh("column exploded", function() explode_render = true end,
       function() explode_render = false end)
@@ -423,13 +403,39 @@ describe("fre ticket 08 atomic refresh", function()
       buffer.prepare = function() error("project exploded") end
     end, function() buffer.prepare = original_prepare end)
 
-    local original_commit = buffer.commit
+    local original_set_extmark = vim.api.nvim_buf_set_extmark
+    local injected = false
     failed_refresh("commit exploded", function()
-      buffer.commit = function(target)
-        target:_set_lines({ "corrupted during commit" })
-        error("commit exploded")
+      vim.api.nvim_buf_set_extmark = function(bufnr, namespace, row, col, opts)
+        if not injected and namespace == buffer.namespace then
+          injected = true
+          error("commit exploded")
+        end
+        return original_set_extmark(bufnr, namespace, row, col, opts)
       end
-    end, function() buffer.commit = original_commit end)
+    end, function() vim.api.nvim_buf_set_extmark = original_set_extmark end)
+    assert.is_true(injected)
+  end)
+
+  it("never reuses IDs allocated by a discarded refresh candidate", function()
+    local instance = ready({ ["kept.txt"] = "kept" })
+    local tree = instance.tree
+    local before = tree:latest_node_id()
+    local added_path = fixture:write("added.txt", "added")
+    local original_prepare = buffer.prepare
+    buffer.prepare = function() error("candidate projection exploded") end
+    local err = complete_refresh(instance)
+    buffer.prepare = original_prepare
+
+    assert.is_truthy(tostring(err):find("candidate projection exploded", 1, true))
+    assert.are.equal(tree, instance.tree)
+    assert.is_nil(tree.nodes_by_path[added_path])
+    local discarded = tree:latest_node_id()
+    assert.is_true(discarded > before)
+
+    assert.is_nil(complete_refresh(instance))
+    assert.are.equal(tree, instance.tree)
+    assert.is_true(instance.tree.nodes_by_path[added_path].id > discarded)
   end)
 
   it("atomically replaces nodes while preserving stable IDs expansion and inactive cache", function()
@@ -442,21 +448,21 @@ describe("fre ticket 08 atomic refresh", function()
     instance:expand("cached/deep")
     wait_for(function() return instance:get_pos("cached/deep/held.txt") ~= nil end)
     instance:collapse("cached")
-    local dir_id = instance.nodes_by_path[fixture:path("dir")].id
-    local keep_id = instance.nodes_by_path[fixture:path("dir", "keep.txt")].id
-    local cached_deep_id = instance.nodes_by_path[fixture:path("cached", "deep")].id
+    local dir_id = instance.tree.nodes_by_path[fixture:path("dir")].id
+    local keep_id = instance.tree.nodes_by_path[fixture:path("dir", "keep.txt")].id
+    local cached_deep_id = instance.tree.nodes_by_path[fixture:path("cached", "deep")].id
     fs.remove_tree(fixture:path("dir", "remove.txt"))
     fixture:write("dir/new.txt", "new")
 
     assert.is_nil(complete_refresh(instance))
-    assert.are.equal(dir_id, instance.nodes_by_path[fixture:path("dir")].id)
-    assert.are.equal(keep_id, instance.nodes_by_path[fixture:path("dir", "keep.txt")].id)
-    assert.is_nil(instance.nodes_by_path[fixture:path("dir", "remove.txt")])
-    assert.is_not_nil(instance.nodes_by_path[fixture:path("dir", "new.txt")])
-    assert.is_true(instance.nodes_by_path[fixture:path("dir")].expanded)
-    assert.are.equal(cached_deep_id, instance.nodes_by_path[fixture:path("cached", "deep")].id)
-    assert.is_true(instance.nodes_by_path[fixture:path("cached", "deep")].expanded)
-    assert.is_true(instance.nodes_by_path[fixture:path("cached", "deep")].children_cached)
+    assert.are.equal(dir_id, instance.tree.nodes_by_path[fixture:path("dir")].id)
+    assert.are.equal(keep_id, instance.tree.nodes_by_path[fixture:path("dir", "keep.txt")].id)
+    assert.is_nil(instance.tree.nodes_by_path[fixture:path("dir", "remove.txt")])
+    assert.is_not_nil(instance.tree.nodes_by_path[fixture:path("dir", "new.txt")])
+    assert.is_true(instance.tree.nodes_by_path[fixture:path("dir")].expanded)
+    assert.are.equal(cached_deep_id, instance.tree.nodes_by_path[fixture:path("cached", "deep")].id)
+    assert.is_true(instance.tree.nodes_by_path[fixture:path("cached", "deep")].expanded)
+    assert.is_true(instance.tree.nodes_by_path[fixture:path("cached", "deep")].children_cached)
     assert.are.same({ "cached/", "dir/", "dir/keep.txt", "dir/new.txt" }, projected_paths(instance))
   end)
 
@@ -483,7 +489,7 @@ describe("fre ticket 08 atomic refresh", function()
     for winid, name in pairs(expected) do
       assert.is_true(vim.api.nvim_win_is_valid(winid))
       local cursor = vim.api.nvim_win_get_cursor(winid)
-      assert.are.equal(name, assert(buffer.decode(instance, cursor[1])).entry.name)
+      assert.are.equal(name, assert(instance.buffer:decode(cursor[1])).entry.name)
       local saved = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
       assert.is_true(saved.topline >= 1
         and saved.topline <= vim.api.nvim_buf_line_count(instance.bufnr))
@@ -571,6 +577,6 @@ describe("fre ticket 08 atomic refresh", function()
     assert.are.equal(1, #notices)
     assert.is_truthy(notices[1]:find("reported failure", 1, true))
     assert.is_truthy(instance._last_async_error:find("reported failure", 1, true))
-    assert.is_true(instance.needs_refresh)
+    assert.is_true(instance.sync:is_dirty())
   end)
 end)

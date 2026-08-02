@@ -3,39 +3,220 @@ local path = require("fre.path")
 local window = require("fre.window")
 local view = require("fre.view")
 
-local M = {}
-
-local row_namespace = vim.api.nvim_create_namespace("fre-row-identity")
-local highlight_namespace = vim.api.nvim_create_namespace("fre-column-highlights")
-
 local function fail(message, level)
   error("fre: " .. message, level or 3)
 end
 
-local function get_line(instance, row)
-  if type(row) ~= "number" or row % 1 ~= 0 then fail("row must be a 1-based integer", 4) end
-  if row < 1 or not vim.api.nvim_buf_is_valid(instance.bufnr) then return nil end
-  local count = vim.api.nvim_buf_line_count(instance.bufnr)
-  if row > count then return nil end
-  return vim.api.nvim_buf_get_lines(instance.bufnr, row - 1, row, false)[1]
+local Buffer = {}
+local M = {}
+Buffer.__index = M
+setmetatable(M, { __index = Buffer })
+
+function Buffer.new(options)
+  if type(options) ~= "table" then fail("buffer options are required", 2) end
+  local self = setmetatable({
+    id = options.id,
+    root = options.root,
+    bufnr = options.bufnr,
+    config = options.config,
+    tree = options.tree,
+    get_marker_widths = assert(options.get_marker_widths),
+    can_reproject = assert(options.can_reproject),
+    resolve_buffer_by_id = assert(options.resolve_buffer_by_id),
+    destroyed = assert(options.destroyed),
+    destroying = assert(options.destroying),
+    list_views = assert(options.list_views),
+    apply_window = assert(options.apply_window),
+    sync_views = assert(options.sync_views),
+    request_write = assert(options.request_write),
+    request_destroy = assert(options.request_destroy),
+    reconsider_gc = assert(options.reconsider_gc),
+    report_async_error = assert(options.report_async_error),
+    view = { baseline = {}, marker_generation = 0 },
+    hidden_file = options.hidden_file == true,
+    row_extmarks = {},
+    projection_ranges = {},
+    pending_initial_cursor = {},
+    marker_width_stale = false,
+  }, Buffer)
+  return self
 end
 
-local function set_node_extmark(instance, node, row)
-  if node.row_extmark then
-    pcall(vim.api.nvim_buf_del_extmark, instance.bufnr, row_namespace, node.row_extmark)
+M.new = Buffer.new
+
+function Buffer:marker_widths()
+  return self.get_marker_widths()
+end
+
+function M:on_marker_width_changed(generation)
+  self.marker_width_stale = true
+  if not self.can_reproject() then return end
+  if not vim.api.nvim_buf_is_valid(self.bufnr) or vim.bo[self.bufnr].modified then return end
+
+  local current_generation = self:marker_widths().generation
+  local view_generation = self.view and self.view.marker_generation or 0
+  if view_generation >= generation and view_generation >= current_generation then
+    self.marker_width_stale = false
+    return
   end
-  node.row_extmark = vim.api.nvim_buf_set_extmark(instance.bufnr, row_namespace, row - 1, 0, {
+
+  local ok, result = pcall(self.render, self)
+  if not ok or result == false then
+    local err = ok and "buffer projection commit failed" or result
+    self.marker_width_stale = true
+    self.report_async_error("marker width reprojection failed: " .. tostring(err))
+    return
+  end
+  view_generation = self.view and self.view.marker_generation or 0
+  self.marker_width_stale = view_generation < self:marker_widths().generation
+end
+
+function M:clear_initial_cursors()
+  self.pending_initial_cursor = {}
+end
+
+function M:hidden_files()
+  return self.hidden_file
+end
+
+function M:set_hidden_files(enabled)
+  enabled = enabled == true
+  if self.hidden_file == enabled then return true end
+  local previous = self.hidden_file
+  self.hidden_file = enabled
+  local ok, result = pcall(self.render, self)
+  if ok and result ~= false then return true end
+  self.hidden_file = previous
+  self:projection()
+  if not ok then error(result, 0) end
+  fail("buffer projection commit failed", 2)
+end
+
+function M:committed_entries()
+  return {
+    baseline = self.view.baseline or {},
+    visible_nodes = self.view.visible_nodes or {},
+  }
+end
+
+function M:position(node)
+  if type(node) ~= "table" then node = self.tree:node_by_id(node) end
+  if not node or not self.view.baseline or self.view.baseline[node.id] == nil then return nil end
+  local hint = self:hint_row(node)
+  if hint and self:row_matches_identity(hint, self.id, node.id) then
+    local decoded = self:decode(hint)
+    return { hint, decoded.path_range.start_byte }
+  end
+  local matches = self:find_identity_rows(self.id, node.id)
+  if #matches == 0 then return nil end
+  local row_number = matches[1]
+  self:rebind(node, row_number)
+  local decoded = self:decode(row_number)
+  return { row_number, decoded.path_range.start_byte }
+end
+
+function M:_column_context(node, entry, descriptor, index, is_last)
+  local mtime = node.mtime
+  if type(mtime) == "table" then
+    mtime = { sec = tonumber(mtime.sec) or 0, nsec = tonumber(mtime.nsec) or 0 }
+  else
+    mtime = { sec = tonumber(mtime) or 0, nsec = 0 }
+  end
+  return {
+    entry = entry, descriptor = descriptor, config = descriptor,
+    column_index = index, is_last = is_last,
+    instance = { id = self.id, bufnr = self.bufnr, root = self.root },
+    metadata = {
+      kind = node.kind, mode = tonumber(node.mode) or 0,
+      size = node.stat and tonumber(node.stat.size) or nil, mtime = mtime,
+    },
+  }
+end
+
+function M:replace_lines(first, last, lines)
+  if not vim.api.nvim_buf_is_valid(self.bufnr) then return false end
+  local views = {}
+  for _, winid in ipairs(vim.fn.win_findbuf(self.bufnr)) do
+    if vim.api.nvim_win_is_valid(winid) then
+      views[winid] = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
+    end
+  end
+  local was_modifiable = vim.bo[self.bufnr].modifiable
+  vim.bo[self.bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(self.bufnr, first, last, false, lines)
+  vim.bo[self.bufnr].modified = false
+  vim.bo[self.bufnr].modifiable = was_modifiable
+  for winid, saved in pairs(views) do
+    if vim.api.nvim_win_is_valid(winid) and vim.api.nvim_win_get_buf(winid) == self.bufnr then
+      pcall(vim.api.nvim_win_call, winid, vim.fn.winrestview, saved)
+    end
+  end
+  return true
+end
+
+function M:set_lines(lines)
+  return self:replace_lines(0, -1, lines)
+end
+
+function M:display_name(node)
+  local relative = assert(path.relative(self.root, node.path))
+  if node.kind == "directory" then return relative .. "/" end
+  return relative
+end
+
+function M:projection(tree)
+  tree = tree or self.tree
+  return tree:project(function(node)
+    return self.hidden_file or node.name:sub(1, 1) ~= "."
+  end)
+end
+
+function M:prepare_projection(validate, tree)
+  tree = tree or self.tree
+  local projection = self:projection(tree)
+  return self:prepare(projection, function(node) return self:display_name(node) end, {
+    validate = validate == true, tree = tree,
+  })
+end
+
+function M:render(tree)
+  local projection = self:projection(tree)
+  return self:project(projection, function(node) return self:display_name(node) end)
+end
+
+
+local row_namespace = vim.api.nvim_create_namespace("fre-row-identity")
+local highlight_namespace = vim.api.nvim_create_namespace("fre-column-highlights")
+
+
+local function get_line(buffer, row)
+  if type(row) ~= "number" or row % 1 ~= 0 then fail("row must be a 1-based integer", 4) end
+  if row < 1 or not vim.api.nvim_buf_is_valid(buffer.bufnr) then return nil end
+  local count = vim.api.nvim_buf_line_count(buffer.bufnr)
+  if row > count then return nil end
+  return vim.api.nvim_buf_get_lines(buffer.bufnr, row - 1, row, false)[1]
+end
+
+local function extmark_state(buffer)
+  return buffer.row_extmarks
+end
+
+local function set_node_extmark(buffer, node, row)
+  local marks = extmark_state(buffer)
+  local previous = marks[node.id]
+  if previous then pcall(vim.api.nvim_buf_del_extmark, buffer.bufnr, row_namespace, previous) end
+  marks[node.id] = vim.api.nvim_buf_set_extmark(buffer.bufnr, row_namespace, row - 1, 0, {
     right_gravity = true,
   })
 end
 
-function M.constrain_cursor(instance, winid)
+function M.constrain_cursor(buffer, winid)
   winid = winid or vim.api.nvim_get_current_win()
   if not vim.api.nvim_win_is_valid(winid)
-      or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return end
+      or vim.api.nvim_win_get_buf(winid) ~= buffer.bufnr then return end
   local cursor = vim.api.nvim_win_get_cursor(winid)
   local row_number = cursor[1]
-  local ok, decoded = pcall(M.decode, instance, row_number, {
+  local ok, decoded = pcall(M.decode, buffer, row_number, {
     allow_empty_path = true,
     validate_metadata = false,
   })
@@ -46,59 +227,58 @@ function M.constrain_cursor(instance, winid)
   if cursor[2] ~= col then vim.api.nvim_win_set_cursor(winid, { row_number, col }) end
 end
 
-function M.place_initial_cursor(instance, winid)
-  if not instance._pending_initial_cursor then instance._pending_initial_cursor = {} end
+function M.place_initial_cursor(buffer, winid)
+  if not buffer.pending_initial_cursor then buffer.pending_initial_cursor = {} end
   if not winid or not vim.api.nvim_win_is_valid(winid)
-      or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then
-    if winid then instance._pending_initial_cursor[winid] = nil end
+      or vim.api.nvim_win_get_buf(winid) ~= buffer.bufnr then
+    if winid then buffer.pending_initial_cursor[winid] = nil end
     return false
   end
-  local ok, decoded = pcall(M.decode, instance, 1, {
+  local ok, decoded = pcall(M.decode, buffer, 1, {
     allow_empty_path = true,
     validate_metadata = false,
   })
   if ok and decoded and decoded.marked and decoded.synthetic
-      and decoded.instance_id == instance.id and decoded.node_id == 0 then
+      and decoded.instance_id == buffer.id and decoded.node_id == 0 then
     vim.api.nvim_win_set_cursor(winid, { 1, decoded.path_range.start_byte })
-    instance._pending_initial_cursor[winid] = nil
+    buffer.pending_initial_cursor[winid] = nil
     return true
   end
-  instance._pending_initial_cursor[winid] = true
+  buffer.pending_initial_cursor[winid] = true
   return false
 end
 
-function M.decode(instance, row_number, opts)
-  return row.decode(instance, row_number, get_line(instance, row_number), opts)
+function M.decode(buffer, row_number, opts)
+  return row.decode(buffer, row_number, get_line(buffer, row_number), opts)
 end
 
-function M.prepare(instance, projection, render_path, opts)
-  return row.prepare(instance, projection, render_path, opts)
+function M.prepare(buffer, projection, render_path, opts)
+  return row.prepare(buffer, projection, render_path, opts)
 end
 
-function M.row_matches_identity(instance, row_number, instance_id, node_id)
-  local line = get_line(instance, row_number)
-  return line ~= nil and row.matches_identity(instance, line, instance_id, node_id)
+function M.row_matches_identity(buffer, row_number, instance_id, node_id)
+  local line = get_line(buffer, row_number)
+  return line ~= nil and row.matches_identity(buffer, line, instance_id, node_id)
 end
 
-function M.find_identity_rows(instance, instance_id, node_id)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return {} end
+function M.find_identity_rows(buffer, instance_id, node_id)
+  if not vim.api.nvim_buf_is_valid(buffer.bufnr) then return {} end
   local result = {}
-  local lines = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false)
+  local lines = vim.api.nvim_buf_get_lines(buffer.bufnr, 0, -1, false)
   for index, line in ipairs(lines) do
-    if row.matches_identity(instance, line, instance_id, node_id) then
+    if row.matches_identity(buffer, line, instance_id, node_id) then
       result[#result + 1] = index
     end
   end
   return result
 end
 
-function M.rebind(instance, node, row) set_node_extmark(instance, node, row) end
+function M.rebind(buffer, node, row) set_node_extmark(buffer, node, row) end
 
-function M.hint_row(instance, node)
-  if not node.row_extmark or not vim.api.nvim_buf_is_valid(instance.bufnr) then return nil end
-  local position = vim.api.nvim_buf_get_extmark_by_id(
-    instance.bufnr, row_namespace, node.row_extmark, {}
-  )
+function M.hint_row(buffer, node)
+  local mark = extmark_state(buffer)[node.id]
+  if not mark or not vim.api.nvim_buf_is_valid(buffer.bufnr) then return nil end
+  local position = vim.api.nvim_buf_get_extmark_by_id(buffer.bufnr, row_namespace, mark, {})
   if #position == 0 then return nil end
   return position[1] + 1
 end
@@ -111,18 +291,18 @@ local function same_widths(left, right)
   return true
 end
 
-local function set_lines_raw(instance, first, last, lines)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return false end
-  local was_modifiable = vim.bo[instance.bufnr].modifiable
-  vim.bo[instance.bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(instance.bufnr, first, last, false, lines)
-  vim.bo[instance.bufnr].modified = false
-  vim.bo[instance.bufnr].modifiable = was_modifiable
+local function set_lines_raw(buffer, first, last, lines)
+  if not vim.api.nvim_buf_is_valid(buffer.bufnr) then return false end
+  local was_modifiable = vim.bo[buffer.bufnr].modifiable
+  vim.bo[buffer.bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(buffer.bufnr, first, last, false, lines)
+  vim.bo[buffer.bufnr].modified = false
+  vim.bo[buffer.bufnr].modifiable = was_modifiable
   return true
 end
 
-local function clear_undo_history(instance)
-  local bufnr = instance.bufnr
+local function clear_undo_history(buffer)
+  local bufnr = buffer.bufnr
   local was_modifiable = vim.bo[bufnr].modifiable
   local undolevels = vim.bo[bufnr].undolevels
   local ok, err = pcall(function()
@@ -144,17 +324,17 @@ local function clear_undo_history(instance)
   if not modifiable_ok then error(modifiable_err, 0) end
 end
 
-local function managed_windows(instance)
+local function managed_windows(buffer)
   local windows = {}
-  for _, inspected in ipairs(view.list(instance)) do
+  for _, inspected in ipairs(buffer.list_views()) do
     windows[inspected.winid] = inspected.tabpage
   end
   return windows
 end
 
-local function capture_windows(instance)
+local function capture_windows(buffer)
   local windows = {}
-  for winid in pairs(managed_windows(instance)) do
+  for winid in pairs(managed_windows(buffer)) do
     pcall(function()
       local saved_view = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
       local cursor = vim.api.nvim_win_get_cursor(winid)
@@ -164,14 +344,14 @@ local function capture_windows(instance)
   return windows
 end
 
-local function navigation_path(instance)
-  return path.parent(instance.root) or instance.root
+local function navigation_path(buffer)
+  return path.parent(buffer.root) or buffer.root
 end
 
-local function ancestor_paths(instance, absolute_path)
+local function ancestor_paths(buffer, absolute_path)
   local result = { absolute_path }
   local current = absolute_path
-  while path.contains(instance.root, current) and not path.equal(current, instance.root) do
+  while path.contains(buffer.root, current) and not path.equal(current, buffer.root) do
     current = path.parent(current)
     if not current then break end
     result[#result + 1] = current
@@ -179,18 +359,18 @@ local function ancestor_paths(instance, absolute_path)
   return result
 end
 
-local function capture_view_cursors(instance)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return {} end
-  local baseline = instance.view and instance.view.baseline or {}
+local function capture_view_cursors(buffer)
+  if not vim.api.nvim_buf_is_valid(buffer.bufnr) then return {} end
+  local baseline = buffer.view and buffer.view.baseline or {}
   local snapshots = {}
-  for winid, tabpage in pairs(managed_windows(instance)) do
+  for winid, tabpage in pairs(managed_windows(buffer)) do
     pcall(function()
       local saved_view = vim.api.nvim_win_call(winid, vim.fn.winsaveview)
       local cursor = vim.api.nvim_win_get_cursor(winid)
-      local line = get_line(instance, cursor[1])
-      local decoded = row.decode_marker(instance.manager, cursor[1], line)
-      if decoded.instance_id ~= instance.id then return end
-      local semantic_ok, semantic = pcall(row.decode, instance, cursor[1], line, {
+      local line = get_line(buffer, cursor[1])
+      local decoded = row.decode_marker(buffer, cursor[1], line)
+      if decoded.instance_id ~= buffer.id then return end
+      local semantic_ok, semantic = pcall(row.decode, buffer, cursor[1], line, {
         allow_empty_path = true,
         validate_metadata = false,
       })
@@ -200,13 +380,13 @@ local function capture_view_cursors(instance)
       end
       local is_navigation = decoded.node_id == 0
       local absolute_path = is_navigation
-        and navigation_path(instance) or baseline[decoded.node_id]
+        and navigation_path(buffer) or baseline[decoded.node_id]
       if type(absolute_path) ~= "string" or absolute_path == "" then return end
       snapshots[#snapshots + 1] = {
         winid = winid,
         tabpage = tabpage,
         navigation = is_navigation,
-        paths = ancestor_paths(instance, absolute_path),
+        paths = ancestor_paths(buffer, absolute_path),
         old_row = cursor[1],
         old_topline = saved_view.topline,
         column = cursor[2],
@@ -218,9 +398,9 @@ local function capture_view_cursors(instance)
   return snapshots
 end
 
-local function restore_view_cursors(instance, snapshots, prepared)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return end
-  local count = vim.api.nvim_buf_line_count(instance.bufnr)
+local function restore_view_cursors(buffer, snapshots, prepared)
+  if not vim.api.nvim_buf_is_valid(buffer.bufnr) then return end
+  local count = vim.api.nvim_buf_line_count(buffer.bufnr)
   if count < 1 then return end
   local rows_by_path = {}
   local row_offset = prepared.row_offset or 0
@@ -233,17 +413,17 @@ local function restore_view_cursors(instance, snapshots, prepared)
   local first_entry_row
   if visible_nodes[1] then
     local candidate = row_offset + 1
-    local decoded_ok, decoded = pcall(M.decode, instance, candidate)
+    local decoded_ok, decoded = pcall(M.decode, buffer, candidate)
     if decoded_ok and decoded and decoded.row_kind == "entry"
-        and decoded.instance_id == instance.id then
+        and decoded.instance_id == buffer.id then
       first_entry_row = candidate
     end
   end
   local navigation_row
   if row_offset > 0 then
-    local decoded_ok, decoded = pcall(M.decode, instance, 1)
+    local decoded_ok, decoded = pcall(M.decode, buffer, 1)
     if decoded_ok and decoded and decoded.row_kind == "navigation"
-        and decoded.instance_id == instance.id then
+        and decoded.instance_id == buffer.id then
       navigation_row = 1
     end
   end
@@ -251,7 +431,7 @@ local function restore_view_cursors(instance, snapshots, prepared)
     local natural_view
     local ok = pcall(function()
       if not vim.api.nvim_win_is_valid(saved.winid)
-          or vim.api.nvim_win_get_buf(saved.winid) ~= instance.bufnr then return end
+          or vim.api.nvim_win_get_buf(saved.winid) ~= buffer.bufnr then return end
       local row_number
       if saved.navigation then
         row_number = navigation_row
@@ -265,12 +445,12 @@ local function restore_view_cursors(instance, snapshots, prepared)
       if not row_number then return end
       row_number = math.max(1, math.min(row_number, count))
       local line = vim.api.nvim_buf_get_lines(
-        instance.bufnr, row_number - 1, row_number, false
+        buffer.bufnr, row_number - 1, row_number, false
       )[1] or ""
       local col = math.max(0, math.min(saved.column or 0, #line))
       local semantic_mapped = false
       if saved.anchor then
-        local decoded_ok, decoded = pcall(row.decode, instance, row_number, line, {
+        local decoded_ok, decoded = pcall(row.decode, buffer, row_number, line, {
           allow_empty_path = true,
           validate_metadata = false,
         })
@@ -297,7 +477,7 @@ local function restore_view_cursors(instance, snapshots, prepared)
           restored.curswant = vim.fn.winsaveview().curswant
         end
         vim.fn.winrestview(restored)
-        M.constrain_cursor(instance, saved.winid)
+        M.constrain_cursor(buffer, saved.winid)
       end)
     end)
     if not ok and natural_view then
@@ -308,16 +488,16 @@ local function restore_view_cursors(instance, snapshots, prepared)
   end
 end
 
-local function restore_windows(instance, windows)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return end
+local function restore_windows(buffer, windows)
+  if not vim.api.nvim_buf_is_valid(buffer.bufnr) then return end
   for winid, saved in pairs(windows or {}) do
     pcall(function()
       if not vim.api.nvim_win_is_valid(winid)
-          or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then return end
-      local count = vim.api.nvim_buf_line_count(instance.bufnr)
+          or vim.api.nvim_win_get_buf(winid) ~= buffer.bufnr then return end
+      local count = vim.api.nvim_buf_line_count(buffer.bufnr)
       local row_number = math.max(1, math.min(saved.cursor[1], count))
       local line = vim.api.nvim_buf_get_lines(
-        instance.bufnr, row_number - 1, row_number, false
+        buffer.bufnr, row_number - 1, row_number, false
       )[1] or ""
       local restored = vim.deepcopy(saved.view)
       restored.lnum = row_number
@@ -328,44 +508,47 @@ local function restore_windows(instance, windows)
   end
 end
 
-function M.snapshot(instance)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return nil end
+local function snapshot(buffer)
+  if not vim.api.nvim_buf_is_valid(buffer.bufnr) then return nil end
   local node_extmarks = {}
-  for _, node in pairs(instance.nodes_by_id or {}) do
-    node_extmarks[node] = node.row_extmark
+  for _, node in buffer.tree:iter_nodes() do
+    node_extmarks[node.id] = buffer.row_extmarks[node.id]
   end
   return {
-    lines = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false),
-    modified = vim.bo[instance.bufnr].modified,
-    modifiable = vim.bo[instance.bufnr].modifiable,
+    lines = vim.api.nvim_buf_get_lines(buffer.bufnr, 0, -1, false),
+    modified = vim.bo[buffer.bufnr].modified,
+    modifiable = vim.bo[buffer.bufnr].modifiable,
     extmarks = vim.api.nvim_buf_get_extmarks(
-      instance.bufnr, row_namespace, 0, -1, { details = true }
+      buffer.bufnr, row_namespace, 0, -1, { details = true }
     ),
     highlights = vim.api.nvim_buf_get_extmarks(
-      instance.bufnr, highlight_namespace, 0, -1, { details = true }
+      buffer.bufnr, highlight_namespace, 0, -1, { details = true }
     ),
     node_extmarks = node_extmarks,
-    windows = capture_windows(instance),
+    windows = capture_windows(buffer),
+    projection_ranges = buffer.projection_ranges,
+    marker_width_stale = buffer.marker_width_stale,
+    pending_initial_cursor = vim.deepcopy(buffer.pending_initial_cursor),
   }
 end
 
-function M.restore(instance, snapshot)
-  if not snapshot or not vim.api.nvim_buf_is_valid(instance.bufnr) then return false end
-  vim.bo[instance.bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(instance.bufnr, 0, -1, false, snapshot.lines)
-  vim.api.nvim_buf_clear_namespace(instance.bufnr, row_namespace, 0, -1)
-  for _, node in pairs(instance.nodes_by_id or {}) do node.row_extmark = nil end
+local function restore(buffer, snapshot)
+  if not snapshot or not vim.api.nvim_buf_is_valid(buffer.bufnr) then return false end
+  vim.bo[buffer.bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(buffer.bufnr, 0, -1, false, snapshot.lines)
+  vim.api.nvim_buf_clear_namespace(buffer.bufnr, row_namespace, 0, -1)
+  buffer.row_extmarks = {}
   for _, mark in ipairs(snapshot.extmarks) do
     local details = mark[4] or {}
-    vim.api.nvim_buf_set_extmark(instance.bufnr, row_namespace, mark[2], mark[3], {
+    vim.api.nvim_buf_set_extmark(buffer.bufnr, row_namespace, mark[2], mark[3], {
       id = mark[1],
       right_gravity = details.right_gravity ~= false,
     })
   end
-  vim.api.nvim_buf_clear_namespace(instance.bufnr, highlight_namespace, 0, -1)
+  vim.api.nvim_buf_clear_namespace(buffer.bufnr, highlight_namespace, 0, -1)
   for _, mark in ipairs(snapshot.highlights or {}) do
     local details = mark[4] or {}
-    vim.api.nvim_buf_set_extmark(instance.bufnr, highlight_namespace, mark[2], mark[3], {
+    vim.api.nvim_buf_set_extmark(buffer.bufnr, highlight_namespace, mark[2], mark[3], {
       end_row = details.end_row,
       end_col = details.end_col,
       hl_group = details.hl_group,
@@ -373,24 +556,25 @@ function M.restore(instance, snapshot)
       undo_restore = false,
     })
   end
-  for node, mark in pairs(snapshot.node_extmarks) do node.row_extmark = mark end
-  vim.bo[instance.bufnr].modified = snapshot.modified
-  vim.bo[instance.bufnr].modifiable = snapshot.modifiable
-  restore_windows(instance, snapshot.windows)
+  for id, mark in pairs(snapshot.node_extmarks or {}) do buffer.row_extmarks[id] = mark end
+  buffer.projection_ranges = snapshot.projection_ranges
+  buffer.marker_width_stale = snapshot.marker_width_stale
+  buffer.pending_initial_cursor = snapshot.pending_initial_cursor
+  vim.bo[buffer.bufnr].modified = snapshot.modified
+  vim.bo[buffer.bufnr].modifiable = snapshot.modifiable
+  restore_windows(buffer, snapshot.windows)
   return true
 end
 
-function M.commit(instance, prepared)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then return false end
-  local captured, cursor_snapshots = pcall(capture_view_cursors, instance)
+function M.commit(buffer, prepared)
+  if not vim.api.nvim_buf_is_valid(buffer.bufnr) then return false end
+  local captured, cursor_snapshots = pcall(capture_view_cursors, buffer)
   if not captured then cursor_snapshots = {} end
-  local snapshot = M.snapshot(instance)
-  local previous_view = instance.view or {}
-  local old_nodes = {}
-  for _, node in pairs(instance.nodes_by_id or {}) do old_nodes[#old_nodes + 1] = node end
+  local snapshot = snapshot(buffer)
+  local previous_view = buffer.view or {}
   local ok, result = pcall(function()
     local previous_widths = previous_view.column_widths
-    local current = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false)
+    local current = vim.api.nvim_buf_get_lines(buffer.bufnr, 0, -1, false)
     local patch
     if same_widths(previous_widths, prepared.column_widths) then
       local prefix = 0
@@ -410,7 +594,7 @@ function M.commit(instance, prepared)
         for index = prefix + 1, #prepared.lines - suffix do
           replacement[#replacement + 1] = prepared.lines[index]
         end
-        if not set_lines_raw(instance, prefix, #current - suffix, replacement) then
+        if not set_lines_raw(buffer, prefix, #current - suffix, replacement) then
           return false
         end
         patch = {
@@ -419,21 +603,21 @@ function M.commit(instance, prepared)
         }
       end
     else
-      if not set_lines_raw(instance, 0, -1, prepared.lines) then return false end
+      if not set_lines_raw(buffer, 0, -1, prepared.lines) then return false end
       patch = { kind = "full", start_row = 1, old_end_row = -1, new_end_row = #prepared.lines }
     end
 
-    vim.api.nvim_buf_clear_namespace(instance.bufnr, row_namespace, 0, -1)
-    for _, node in ipairs(old_nodes) do node.row_extmark = nil end
+    vim.api.nvim_buf_clear_namespace(buffer.bufnr, row_namespace, 0, -1)
+    buffer.row_extmarks = {}
     local row_offset = prepared.row_offset or 0
     for row, node in ipairs(prepared.visible_nodes) do
       local buffer_row = row + row_offset
-      set_node_extmark(instance, node, buffer_row)
+      set_node_extmark(buffer, node, buffer_row)
     end
-    vim.api.nvim_buf_clear_namespace(instance.bufnr, highlight_namespace, 0, -1)
+    vim.api.nvim_buf_clear_namespace(buffer.bufnr, highlight_namespace, 0, -1)
     for _, highlight in ipairs(prepared.highlights or {}) do
       vim.api.nvim_buf_set_extmark(
-        instance.bufnr, highlight_namespace, highlight.row, highlight.start_col, {
+        buffer.bufnr, highlight_namespace, highlight.row, highlight.start_col, {
           end_col = highlight.end_col,
           hl_group = highlight.hl_group,
           priority = 100,
@@ -441,7 +625,7 @@ function M.commit(instance, prepared)
         }
       )
     end
-    instance.view = {
+    buffer.view = {
       baseline = prepared.baseline,
       marker_widths = prepared.marker_widths,
       marker_generation = prepared.marker_generation,
@@ -453,23 +637,28 @@ function M.commit(instance, prepared)
       last_patch = patch,
       projection_generation = (previous_view.projection_generation or 0) + 1,
     }
-    vim.bo[instance.bufnr].modified = false
-    pcall(restore_view_cursors, instance, cursor_snapshots, prepared)
+    buffer.projection_ranges = prepared.projection and prepared.projection.ranges or {}
+    vim.bo[buffer.bufnr].modified = false
+    pcall(restore_view_cursors, buffer, cursor_snapshots, prepared)
     local pending = {}
-    for winid in pairs(instance._pending_initial_cursor or {}) do
+    for winid in pairs(buffer.pending_initial_cursor or {}) do
       pending[#pending + 1] = winid
     end
-    for _, winid in ipairs(pending) do M.place_initial_cursor(instance, winid) end
-    instance._marker_width_stale = prepared.marker_generation
-      < instance.manager:get_marker_widths().generation
-    clear_undo_history(instance)
+    for _, winid in ipairs(pending) do M.place_initial_cursor(buffer, winid) end
+    buffer.marker_width_stale = prepared.marker_generation
+      < buffer:marker_widths().generation
+    clear_undo_history(buffer)
     return true
   end)
   if not ok or result == false then
-    instance.view = previous_view
-    local restore_ok, restore_err = pcall(M.restore, instance, snapshot)
+    buffer.view = previous_view
+    local restore_ok, restore_err = pcall(restore, buffer, snapshot)
     if not restore_ok then
       error(tostring(result) .. "; rollback failed: " .. tostring(restore_err), 0)
+    end
+    local history_ok, history_err = pcall(clear_undo_history, buffer)
+    if not history_ok then
+      error(tostring(result) .. "; rollback undo cleanup failed: " .. tostring(history_err), 0)
     end
     if not ok then error(result, 0) end
     return false
@@ -477,30 +666,30 @@ function M.commit(instance, prepared)
   return true
 end
 
-function M.project(instance, projection, render_path)
-  local prepared = M.prepare(instance, projection, render_path)
-  return M.commit(instance, prepared)
+function M.project(buffer, projection, render_path)
+  local prepared = M.prepare(buffer, projection, render_path)
+  return M.commit(buffer, prepared)
 end
 
-local function redecorate_rows(instance, first_row, last_row)
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) or last_row < first_row then return end
-  local count = vim.api.nvim_buf_line_count(instance.bufnr)
+local function redecorate_rows(buffer, first_row, last_row)
+  if not vim.api.nvim_buf_is_valid(buffer.bufnr) or last_row < first_row then return end
+  local count = vim.api.nvim_buf_line_count(buffer.bufnr)
   first_row = math.max(1, first_row)
   last_row = math.min(count, last_row)
   if last_row < first_row then return end
   vim.api.nvim_buf_clear_namespace(
-    instance.bufnr, highlight_namespace, first_row - 1, last_row
+    buffer.bufnr, highlight_namespace, first_row - 1, last_row
   )
   local lines = vim.api.nvim_buf_get_lines(
-    instance.bufnr, first_row - 1, last_row, false
+    buffer.bufnr, first_row - 1, last_row, false
   )
   for offset, line in ipairs(lines) do
     local row_number = first_row + offset - 1
-    local ok, decorations = pcall(row.decorations, instance, row_number, line)
+    local ok, decorations = pcall(row.decorations, buffer, row_number, line)
     for _, template in ipairs(ok and decorations or {}) do
       if line:sub(template.start_col + 1, template.end_col) == template.text then
         vim.api.nvim_buf_set_extmark(
-          instance.bufnr, highlight_namespace, first_row + offset - 2,
+          buffer.bufnr, highlight_namespace, first_row + offset - 2,
           template.start_col, {
             end_col = template.end_col,
             hl_group = template.hl_group,
@@ -513,115 +702,110 @@ local function redecorate_rows(instance, first_row, last_row)
   end
 end
 
-local function apply_pending_highlight_update(instance)
-  instance._highlight_update_scheduled = false
-  local pending = instance._highlight_pending
-  instance._highlight_pending = nil
-  if not pending or instance._highlight_disabled or instance._destroyed
-      or instance.state == "destroying" or instance.state == "destroyed"
-      or not vim.api.nvim_buf_is_valid(instance.bufnr) then
+local function apply_pending_highlight_update(buffer)
+  buffer.highlight_update_scheduled = false
+  local pending = buffer.highlight_pending
+  buffer.highlight_pending = nil
+  if not pending or buffer.highlight_disabled or buffer.destroyed()
+      or buffer.destroying()
+      or not vim.api.nvim_buf_is_valid(buffer.bufnr) then
     return
   end
 
   local ok, err = pcall(function()
     if pending.full then
-      vim.api.nvim_buf_clear_namespace(instance.bufnr, highlight_namespace, 0, -1)
+      vim.api.nvim_buf_clear_namespace(buffer.bufnr, highlight_namespace, 0, -1)
       redecorate_rows(
-        instance, 1, vim.api.nvim_buf_line_count(instance.bufnr)
+        buffer, 1, vim.api.nvim_buf_line_count(buffer.bufnr)
       )
     else
-      redecorate_rows(instance, pending.first_row, pending.last_row)
+      redecorate_rows(buffer, pending.first_row, pending.last_row)
     end
   end)
   if ok then
-    instance._highlight_error_reported = nil
-  elseif not instance._highlight_error_reported then
-    instance._highlight_error_reported = true
-    instance:_report_async_error("column highlight update failed: " .. tostring(err))
+    buffer.highlight_error_reported = nil
+  elseif not buffer.highlight_error_reported then
+    buffer.highlight_error_reported = true
+    buffer.report_async_error("column highlight update failed: " .. tostring(err))
   end
 end
 
-local function queue_highlight_update(instance, first_line, old_last_line, new_last_line)
-  local pending = instance._highlight_pending
+local function queue_highlight_update(buffer, first_line, old_last_line, new_last_line)
+  local pending = buffer.highlight_pending
   if pending then
     -- Multiple edits before the scheduled pass can shift every prior range.
     pending.full = true
   else
-    instance._highlight_pending = {
+    buffer.highlight_pending = {
       full = old_last_line > new_last_line,
       first_row = first_line + 1,
       last_row = new_last_line,
     }
   end
-  if instance._highlight_update_scheduled then return end
-  instance._highlight_update_scheduled = true
-  vim.schedule(function() apply_pending_highlight_update(instance) end)
+  if buffer.highlight_update_scheduled then return end
+  buffer.highlight_update_scheduled = true
+  vim.schedule(function() apply_pending_highlight_update(buffer) end)
 end
 
-local function attach_highlight_updates(instance)
-  instance._highlight_disabled = false
-  instance._highlight_pending = nil
-  instance._highlight_update_scheduled = false
-  local attached = vim.api.nvim_buf_attach(instance.bufnr, false, {
+local function attach_highlight_updates(buffer)
+  buffer.highlight_disabled = false
+  buffer.highlight_pending = nil
+  buffer.highlight_update_scheduled = false
+  local attached = vim.api.nvim_buf_attach(buffer.bufnr, false, {
     on_lines = function(_, bufnr, _, first_line, old_last_line, new_last_line)
-      if instance._highlight_disabled or instance._destroyed
-          or instance.state == "destroying" or instance.state == "destroyed" then
+      if buffer.highlight_disabled or buffer.destroyed()
+          or buffer.destroying() then
         return true
       end
-      if bufnr ~= instance.bufnr then return true end
-      queue_highlight_update(instance, first_line, old_last_line, new_last_line)
+      if bufnr ~= buffer.bufnr then return true end
+      queue_highlight_update(buffer, first_line, old_last_line, new_last_line)
     end,
     on_detach = function()
-      instance._highlight_attached = false
-      instance._highlight_pending = nil
-      instance._highlight_update_scheduled = false
+      buffer.highlight_attached = false
+      buffer.highlight_pending = nil
+      buffer.highlight_update_scheduled = false
     end,
   })
   if not attached then fail("could not attach column highlight updates", 3) end
-  instance._highlight_attached = true
+  buffer.highlight_attached = true
 end
 
-local function externally_deleted(instance)
-  if instance.state == "destroyed" or instance._external_delete_cleanup_scheduled then return end
-  instance._external_delete_cleanup_scheduled = true
+local function externally_deleted(buffer)
+  if buffer.destroyed() or buffer.external_delete_cleanup_scheduled then return end
+  buffer.external_delete_cleanup_scheduled = true
   local ok, err = pcall(vim.schedule, function()
-    if instance.state == "destroyed" then
-      instance._external_delete_cleanup_scheduled = nil
+    if buffer.destroyed() then
+      buffer.external_delete_cleanup_scheduled = nil
       return
     end
-
-    if instance.state ~= "destroying" then
-      local start_ok, start_err = pcall(instance._start_destroy, instance)
-      if not start_ok then
-        if type(instance._report_async_error) == "function" then
-          instance:_report_async_error(
-            "external buffer deletion cleanup start failed: " .. tostring(start_err)
-          )
-        end
-        if instance.state ~= "destroying" then
-          instance._external_delete_cleanup_scheduled = nil
-          return
-        end
+    local was_destroying = buffer.destroying()
+    local destroy_ok, destroy_err = pcall(buffer.request_destroy)
+    if not destroy_ok and not was_destroying and buffer.destroying() then
+      buffer.report_async_error(
+        "external buffer deletion cleanup failed: " .. tostring(destroy_err)
+      )
+      local finish_ok, finish_err = pcall(buffer.request_destroy)
+      if not finish_ok then
+        buffer.report_async_error(
+          "external buffer deletion cleanup failed: " .. tostring(finish_err)
+        )
       end
-    end
-
-    local finish_ok, finish_err = pcall(instance._finish_destroy, instance)
-    if not finish_ok and type(instance._report_async_error) == "function" then
-      instance:_report_async_error(
-        "external buffer deletion cleanup finish failed: " .. tostring(finish_err)
+    elseif not destroy_ok then
+      buffer.report_async_error(
+        "external buffer deletion cleanup failed: " .. tostring(destroy_err)
       )
     end
-    instance._external_delete_cleanup_scheduled = nil
+    buffer.external_delete_cleanup_scheduled = nil
   end)
   if not ok then
-    instance._external_delete_cleanup_scheduled = nil
-    instance:_report_async_error(
+    buffer.external_delete_cleanup_scheduled = nil
+    buffer.report_async_error(
       "external buffer deletion cleanup scheduling failed: " .. tostring(err)
     )
   end
 end
 
-function M.setup(instance)
+function M.setup(buffer)
   vim.api.nvim_set_hl(0, "FreStableMarker", { default = true, link = "Conceal" })
   vim.api.nvim_set_hl(0, "FreDirectoryIcon", { default = true, link = "Directory" })
   vim.api.nvim_set_hl(0, "FreSymlinkIcon", { default = true, link = "Special" })
@@ -629,20 +813,20 @@ function M.setup(instance)
   vim.api.nvim_set_hl(0, "FreUnsupportedIcon", { default = true, link = "DiagnosticWarn" })
   vim.api.nvim_set_hl(0, "FreDirectoryPath", { default = true, link = "Directory" })
   vim.api.nvim_set_hl(0, "FreHiddenPath", { default = true, link = "Comment" })
-  vim.api.nvim_buf_call(instance.bufnr, function()
+  vim.api.nvim_buf_call(buffer.bufnr, function()
     vim.cmd("runtime! syntax/fre.vim")
   end)
-  attach_highlight_updates(instance)
+  attach_highlight_updates(buffer)
 
-  local group_name = "FreBuffer" .. tostring(instance.bufnr)
-  instance._buffer_augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
+  local group_name = "FreBuffer" .. tostring(buffer.bufnr)
+  buffer.buffer_augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
   vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
-    group = instance._buffer_augroup, buffer = instance.bufnr,
-    callback = function() externally_deleted(instance) end,
+    group = buffer.buffer_augroup, buffer = buffer.bufnr,
+    callback = function() externally_deleted(buffer) end,
   })
 
   vim.api.nvim_create_autocmd("BufWriteCmd", {
-    group = instance._buffer_augroup, buffer = instance.bufnr,
+    group = buffer.buffer_augroup, buffer = buffer.bufnr,
     callback = function(args)
       local winid = vim.api.nvim_get_current_win()
       local row, col = 1, 0
@@ -650,8 +834,8 @@ function M.setup(instance)
         local cursor = vim.api.nvim_win_get_cursor(winid)
         row, col = cursor[1], cursor[2]
       end
-      require("fre.actions").write({
-        instance = instance,
+      buffer.request_write({
+        buffer = buffer,
         bufnr = args.buf,
         winid = winid,
         tabpage = vim.api.nvim_get_current_tabpage(),
@@ -663,52 +847,54 @@ function M.setup(instance)
   })
 
   vim.api.nvim_create_autocmd("BufWinEnter", {
-    group = instance._buffer_augroup, buffer = instance.bufnr,
+    group = buffer.buffer_augroup, buffer = buffer.bufnr,
     callback = function()
       local winid = vim.api.nvim_get_current_win()
-      window.apply(instance, winid)
-      view.sync(instance, { report = true })
-      M.place_initial_cursor(instance, winid)
+      buffer.apply_window(buffer, winid)
+      buffer.sync_views(buffer, { report = true })
+      M.place_initial_cursor(buffer, winid)
     end,
   })
   vim.api.nvim_create_autocmd({ "WinLeave", "BufWinLeave", "BufHidden" }, {
-    group = instance._buffer_augroup, buffer = instance.bufnr,
+    group = buffer.buffer_augroup, buffer = buffer.bufnr,
     callback = function()
       local winid = vim.api.nvim_get_current_win()
-      if instance._pending_initial_cursor then
-        instance._pending_initial_cursor[winid] = nil
+      if buffer.pending_initial_cursor then
+        buffer.pending_initial_cursor[winid] = nil
       end
       vim.schedule(function()
-        if instance._destroyed then return end
-        view.sync(instance, { report = true })
+        if buffer.destroyed() then return end
+        buffer.sync_views(buffer, { report = true })
       end)
     end,
   })
   vim.api.nvim_create_autocmd("BufModifiedSet", {
-    group = instance._buffer_augroup, buffer = instance.bufnr,
+    group = buffer.buffer_augroup, buffer = buffer.bufnr,
     callback = function()
-      if not instance._destroyed then instance.manager:gc_reconsider(instance, true) end
+      if not buffer.destroyed() then buffer.reconsider_gc(buffer, true) end
     end,
   })
   vim.api.nvim_create_autocmd("CursorMoved", {
-    group = instance._buffer_augroup, buffer = instance.bufnr,
-    callback = function() M.constrain_cursor(instance) end,
+    group = buffer.buffer_augroup, buffer = buffer.bufnr,
+    callback = function() M.constrain_cursor(buffer) end,
   })
   for _, event in ipairs({ "InsertEnter", "InsertCharPre", "CursorMovedI" }) do
     vim.api.nvim_create_autocmd(event, {
-      group = instance._buffer_augroup, buffer = instance.bufnr,
-      callback = function() M.constrain_cursor(instance) end,
+      group = buffer.buffer_augroup, buffer = buffer.bufnr,
+      callback = function() M.constrain_cursor(buffer) end,
     })
   end
+  require("fre.mapping").setup(buffer)
 end
 
-function M.teardown(instance)
-  instance._highlight_disabled = true
-  instance._highlight_pending = nil
-  if instance._buffer_augroup then
-    pcall(vim.api.nvim_del_augroup_by_id, instance._buffer_augroup)
-    instance._buffer_augroup = nil
+function M.teardown(buffer)
+  buffer.highlight_disabled = true
+  buffer.highlight_pending = nil
+  if buffer.buffer_augroup then
+    pcall(vim.api.nvim_del_augroup_by_id, buffer.buffer_augroup)
+    buffer.buffer_augroup = nil
   end
+  require("fre.mapping").teardown(buffer)
 end
 
 M.namespace = row_namespace

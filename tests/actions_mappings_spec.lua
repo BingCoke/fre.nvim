@@ -16,10 +16,10 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -142,7 +142,7 @@ describe("fre ticket 17 actions and mappings", function()
   after_each(function()
     actions._reset_ui_adapter()
     for _, instance in ipairs(manager_instances()) do
-      if instance.state ~= "destroyed" then pcall(instance.destroy, instance) end
+      if instance:status() ~= "destroyed" then pcall(instance.destroy, instance) end
     end
     pcall(vim.cmd, "silent! tabonly")
     pcall(vim.cmd, "silent! only")
@@ -171,7 +171,7 @@ describe("fre ticket 17 actions and mappings", function()
     local instance = ready({ ["alpha.txt"] = "a", ["beta.txt"] = "b" })
     local row = row_for(instance, "alpha.txt")
     local winid = open_current(instance)
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
     vim.api.nvim_win_set_cursor(winid, { row, decoded.visible_range.start_byte })
 
     local first = actions.context()
@@ -226,13 +226,13 @@ describe("fre ticket 17 actions and mappings", function()
     }))
     local winid = open_current(instance)
 
-    local navigation = assert(buffer.decode(instance, 1))
+    local navigation = assert(instance.buffer:decode(1))
     vim.api.nvim_win_set_cursor(winid, { 1, navigation.column_ranges[1].start_byte })
     invoke(instance.bufnr, "n", "gp")
     assert.are.same({ 1, navigation.path_range.start_byte }, vim.api.nvim_win_get_cursor(winid))
 
     local entry_row = row_for(instance, "a.txt")
-    local entry = assert(buffer.decode(instance, entry_row))
+    local entry = assert(instance.buffer:decode(entry_row))
     vim.api.nvim_win_set_cursor(winid, { entry_row, entry.column_ranges[1].start_byte })
     invoke(instance.bufnr, "n", "gp")
     assert.are.same(
@@ -268,7 +268,7 @@ describe("fre ticket 17 actions and mappings", function()
     local ok, err = pcall(invoke, instance.bufnr, "n", "zM")
 
     assert.is_true(ok, tostring(err))
-    assert.is_false(instance.nodes_by_path[fixture:path("dir")].expanded)
+    assert.is_false(instance.tree.nodes_by_path[fixture:path("dir")].expanded)
     assert.is_nil(instance:get_pos("dir/file.txt"))
   end)
 
@@ -379,7 +379,7 @@ describe("fre ticket 17 actions and mappings", function()
       return instance:get_pos("a/n/deep.txt") ~= nil and instance:get_pos("b/file.txt") ~= nil
     end)
     wait_for(function()
-      for _, node in pairs(instance.nodes_by_id) do
+      for _, node in pairs(instance.tree.nodes_by_id) do
         if node.kind == "directory"
             and (node.load_state == "loading" or node.load_state == "refreshing") then
           return false
@@ -387,10 +387,10 @@ describe("fre ticket 17 actions and mappings", function()
       end
       return true
     end)
-    local a = instance.nodes_by_path[fixture:path("a")]
-    local n = instance.nodes_by_path[fixture:path("a", "n")]
-    local b = instance.nodes_by_path[fixture:path("b")]
-    local deep = instance.nodes_by_path[fixture:path("a", "n", "deep.txt")]
+    local a = instance.tree.nodes_by_path[fixture:path("a")]
+    local n = instance.tree.nodes_by_path[fixture:path("a", "n")]
+    local b = instance.tree.nodes_by_path[fixture:path("b")]
+    local deep = instance.tree.nodes_by_path[fixture:path("a", "n", "deep.txt")]
     local deep_id = deep.id
     local first = open_current(instance)
     vim.cmd("vsplit")
@@ -398,23 +398,29 @@ describe("fre ticket 17 actions and mappings", function()
     vim.api.nvim_win_set_cursor(first, instance:get_pos("a/n/deep.txt"))
     vim.api.nvim_win_set_cursor(second, { 1, 0 })
 
-    local renders, syncs = 0, 0
-    local render = instance._render_success
-    local sync = instance._sync_watchers
-    instance._render_success = function(self) renders = renders + 1; return render(self) end
-    instance._sync_watchers = function(self, ...) syncs = syncs + 1; return sync(self, ...) end
+    local commits, syncs = 0, 0
+    local commit = instance.buffer.commit
+    local sync = instance.sync.sync_watchers
+    instance.buffer.commit = function(self, ...)
+      commits = commits + 1
+      return commit(self, ...)
+    end
+    instance.sync.sync_watchers = function(self, ...)
+      syncs = syncs + 1
+      return sync(self, ...)
+    end
     invoke(instance.bufnr, "n", "zM")
 
-    assert.are.equal(1, renders)
+    assert.are.equal(1, commits)
     assert.are.equal(1, syncs)
-    assert.is_true(instance.root_node.expanded)
-    assert.is_false(a.expanded)
-    assert.is_false(n.expanded)
-    assert.is_false(b.expanded)
-    assert.is_true(a.children_cached)
-    assert.is_true(n.children_cached)
-    assert.are.equal(deep, instance.nodes_by_id[deep_id])
-    assert.are.equal(deep, instance.nodes_by_path[deep.path])
+    assert.is_true(instance.tree:root_node().expanded)
+    assert.is_false(instance.tree:node_by_id(a.id).expanded)
+    assert.is_false(instance.tree:node_by_id(n.id).expanded)
+    assert.is_false(instance.tree:node_by_id(b.id).expanded)
+    assert.is_true(instance.tree:node_by_id(a.id).children_cached)
+    assert.is_true(instance.tree:node_by_id(n.id).children_cached)
+    assert.are.equal(deep_id, instance.tree:node_by_id(deep_id).id)
+    assert.are.equal(deep_id, instance.tree:node_by_path(deep.path).id)
     local line_count = vim.api.nvim_buf_line_count(instance.bufnr)
     for _, winid in ipairs({ first, second }) do
       local cursor = vim.api.nvim_win_get_cursor(winid)
@@ -422,7 +428,7 @@ describe("fre ticket 17 actions and mappings", function()
     end
 
     invoke(instance.bufnr, "n", "zM")
-    assert.are.equal(1, renders)
+    assert.are.equal(1, commits)
     assert.are.equal(1, syncs)
   end)
 
@@ -446,7 +452,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal(bufnr, vim.api.nvim_win_get_buf(ctx.winid))
     assert.are.equal(ambient_buf, vim.api.nvim_win_get_buf(ambient_win))
     assert.is_nil(fre.view.inspect(instance, source_tab))
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
 
     if link then
       local linked = ready({})
@@ -772,7 +778,7 @@ describe("fre ticket 17 actions and mappings", function()
 
     local child = actions.select(ctx, { target_winid = target_win })
 
-    assert.are.equal("creating", child.state)
+    assert.are.equal("creating", child:status())
     assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(target_win))
     assert.are.same({
       winid = target_win,
@@ -801,12 +807,12 @@ describe("fre ticket 17 actions and mappings", function()
 
     local child = actions.select(ctx, { target_winid = target_win })
 
-    assert.are.equal("creating", child.state)
+    assert.are.equal("creating", child:status())
     assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(target_win))
     assert.is_not_nil(fre.view.inspect(child, ctx.tabpage))
     assert.is_function(pending)
     pending("injected child load failure")
-    wait_for(function() return child.state == "load-failed" end)
+    wait_for(function() return child:status() == "load-failed" end)
 
     assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(target_win))
     assert.is_not_nil(fre.view.inspect(child, ctx.tabpage))
@@ -890,7 +896,7 @@ describe("fre ticket 17 actions and mappings", function()
 
     assert.is_truthy(err:find("source is no longer valid", 1, true))
     assert.is_not_nil(child)
-    assert.are.equal("destroyed", child.state)
+    assert.are.equal("destroyed", child:status())
     assert.is_nil(manager_module.default:find_by_id(child_id))
     assert.is_nil(manager_module.default:find_by_buf(child_bufnr))
     assert.is_false(vim.api.nvim_buf_is_valid(child_bufnr))
@@ -1104,7 +1110,7 @@ describe("fre ticket 17 actions and mappings", function()
       instance = { expanded = { "child" } },
     }))
     assert.are.same({}, parent.config.expanded)
-    local previous_root = parent.nodes_by_path[path.absolute(fixture:path("child"))]
+    local previous_root = parent.tree.nodes_by_path[path.absolute(fixture:path("child"))]
     assert.is_not_nil(previous_root)
     assert.is_false(previous_root.expanded)
     assert.is_nil(parent:get_pos("child/nested"))
@@ -1137,7 +1143,7 @@ describe("fre ticket 17 actions and mappings", function()
       wait_ready(parent)
       local winid = vim.api.nvim_get_current_win()
       assert.are.same({}, parent.config.expanded)
-      assert.is_false(parent.nodes_by_path[path.absolute(fixture:path("child"))].expanded)
+      assert.is_false(parent.tree.nodes_by_path[path.absolute(fixture:path("child"))].expanded)
       assert.are.same(parent:get_pos("child"), vim.api.nvim_win_get_cursor(winid))
       parent:destroy()
       instance:destroy()
@@ -1149,17 +1155,17 @@ describe("fre ticket 17 actions and mappings", function()
     local instance = wait_ready(fre.new({ root = fixture.root, columns = {} }))
     instance:expand("src")
     wait_for(function()
-      local node = instance.nodes_by_path[path.absolute(fixture:path("src"))]
+      local node = instance.tree.nodes_by_path[path.absolute(fixture:path("src"))]
       return node and node.loaded
     end)
     instance:expand("src/x")
     wait_for(function()
-      local node = instance.nodes_by_path[path.absolute(fixture:path("src/x"))]
+      local node = instance.tree.nodes_by_path[path.absolute(fixture:path("src/x"))]
       return node and node.loaded
     end)
     instance:expand("src/x/x")
     wait_for(function()
-      local node = instance.nodes_by_path[path.absolute(fixture:path("src/x/x"))]
+      local node = instance.tree.nodes_by_path[path.absolute(fixture:path("src/x/x"))]
       return node and node.loaded
     end)
 
@@ -1168,8 +1174,8 @@ describe("fre ticket 17 actions and mappings", function()
     }))
     assert.are.same({ "x", "x/x" }, child.config.expanded)
     wait_for(function()
-      local first = child.nodes_by_path[path.absolute(fixture:path("src/x"))]
-      local second = child.nodes_by_path[path.absolute(fixture:path("src/x/x"))]
+      local first = child.tree.nodes_by_path[path.absolute(fixture:path("src/x"))]
+      local second = child.tree.nodes_by_path[path.absolute(fixture:path("src/x/x"))]
       return first and first.expanded and second and second.expanded and second.loaded
     end)
     assert.are.equal(path.absolute(fixture:path("src")), child.root)
@@ -1195,10 +1201,10 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal(target, vim.fn.bufwinid(child.bufnr))
     assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(target))
     assert.is_true(vim.api.nvim_get_option_value("cursorline", { win = target }))
-    assert.is_false(child.current_hidden_file)
-    assert.are.equal(sort_fn, child.current_sort)
+    assert.is_false(child.buffer:hidden_files())
+    assert.are.equal(sort_fn, child.tree:get_comparator())
     assert.is_nil(child.config.mapping.n.y)
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
     wait_ready(child)
 
     instance:open({ position = "current" })
@@ -1210,7 +1216,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are_not.equal(source_tab, target_tab)
     assert.are.equal(tab_child.bufnr, vim.api.nvim_get_current_buf())
     assert.are.equal(path.absolute(fixture:path("tab")), tab_child.root)
-    assert.is_false(tab_child.current_hidden_file)
+    assert.is_false(tab_child.buffer:hidden_files())
     assert.is_true(#vim.fn.win_findbuf(instance.bufnr) > 0)
     assert.are.same({
       winid = target_win,
@@ -1258,9 +1264,9 @@ describe("fre ticket 17 actions and mappings", function()
       local source_tab = vim.api.nvim_get_current_tabpage()
       assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(child_win))
       assert.are.equal(path.absolute(fixture:path(case.name)), child.root)
-      assert.is_false(child.current_hidden_file)
+      assert.is_false(child.buffer:hidden_files())
       assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(source))
-      assert.are.equal("ready", instance.state)
+      assert.are.equal("ready", instance:status())
       assert.are.same({
         winid = child_win,
         origin_winid = source,
@@ -1615,7 +1621,7 @@ describe("fre ticket 17 actions and mappings", function()
     local source_tab = vim.api.nvim_get_current_tabpage()
     local source_view = window_view(source_win)
     local source_inspect = assert(fre.view.inspect(instance, source_tab))
-    local source_state = instance.state
+    local source_state = instance:status()
     local source_number = vim.wo[source_win].number
     local source_cursorline = vim.wo[source_win].cursorline
     local before_windows = window_buffers()
@@ -1634,7 +1640,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.same(source_inspect, fre.view.inspect(instance, source_tab))
     assert.are.equal(source_number, vim.wo[source_win].number)
     assert.are.equal(source_cursorline, vim.wo[source_win].cursorline)
-    assert.are.equal(source_state, instance.state)
+    assert.are.equal(source_state, instance:status())
     assert.are.equal(-1, vim.fn.bufnr(created_path))
 
     local existing_path = path.absolute(fixture:path("existing.txt"))
@@ -1655,7 +1661,7 @@ describe("fre ticket 17 actions and mappings", function()
     vim.api.nvim_set_current_win(source_win)
     local existing_ctx = context_for(instance, "existing.txt")
     source_view = window_view(source_win)
-    source_state = instance.state
+    source_state = instance:status()
     before_windows = window_buffers()
     inject_bufwinenter(target_win, existing_path, function()
       actions.select(existing_ctx, { target_winid = target_win })
@@ -1668,7 +1674,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal(source_win, vim.api.nvim_get_current_win())
     assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(source_win))
     assert.are.same(source_view, window_view(source_win))
-    assert.are.equal(source_state, instance.state)
+    assert.are.equal(source_state, instance:status())
     assert.is_true(vim.api.nvim_tabpage_is_valid(target_tab))
     assert.are.equal(unrelated_buf, vim.api.nvim_win_get_buf(target_win))
     assert.are.same(target_view, window_view(target_win))
@@ -1696,7 +1702,7 @@ describe("fre ticket 17 actions and mappings", function()
       local source_win = open_current(instance)
       local source_tab = vim.api.nvim_get_current_tabpage()
       local source_view = assert(fre.view.inspect(instance, source_tab))
-      local source_state = instance.state
+      local source_state = instance:status()
       vim.cmd("tabnew")
       local unrelated_tab = vim.api.nvim_get_current_tabpage()
       local unrelated_win = vim.api.nvim_get_current_win()
@@ -1771,7 +1777,7 @@ describe("fre ticket 17 actions and mappings", function()
       assert.are.same(source_cursor, vim.api.nvim_win_get_cursor(source_win))
       assert.are.same(source_saved_view, vim.api.nvim_win_call(source_win, vim.fn.winsaveview))
       assert.are.same(source_view, fre.view.inspect(instance, source_tab))
-      assert.are.equal(source_state, instance.state)
+      assert.are.equal(source_state, instance:status())
       assert.is_true(vim.api.nvim_tabpage_is_valid(unrelated_tab))
       assert.is_true(vim.api.nvim_win_is_valid(unrelated_win))
       assert.are.equal(unrelated_buf, vim.api.nvim_win_get_buf(unrelated_win))
@@ -1779,7 +1785,7 @@ describe("fre ticket 17 actions and mappings", function()
       if case.kind == "file" then
         assert.are.equal(-1, vim.fn.bufnr(selected_path))
       else
-        assert.are.equal("destroyed", child.state)
+        assert.are.equal("destroyed", child:status())
         assert.is_nil(manager_module.default:find_by_id(child_id))
         assert.is_nil(manager_module.default:find_by_buf(child_bufnr))
         assert.is_false(vim.api.nvim_buf_is_valid(child_bufnr))
@@ -1796,7 +1802,7 @@ describe("fre ticket 17 actions and mappings", function()
     local source_view = assert(fre.view.inspect(instance, caller_tab))
     local source_cursor = vim.api.nvim_win_get_cursor(caller_win)
     local source_saved_view = vim.api.nvim_win_call(caller_win, vim.fn.winsaveview)
-    local source_state = instance.state
+    local source_state = instance:status()
     vim.cmd("tabnew")
     local unrelated_tab = vim.api.nvim_get_current_tabpage()
     local unrelated_win = vim.api.nvim_get_current_win()
@@ -1836,7 +1842,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.same(source_cursor, vim.api.nvim_win_get_cursor(caller_win))
     assert.are.same(source_saved_view, vim.api.nvim_win_call(caller_win, vim.fn.winsaveview))
     assert.are.same(source_view, fre.view.inspect(instance, caller_tab))
-    assert.are.equal(source_state, instance.state)
+    assert.are.equal(source_state, instance:status())
     assert.is_true(vim.api.nvim_tabpage_is_valid(unrelated_tab))
     assert.is_true(vim.api.nvim_win_is_valid(unrelated_win))
     assert.are.equal(unrelated_buf, vim.api.nvim_win_get_buf(unrelated_win))

@@ -20,10 +20,10 @@ local function ready(entries, opts)
   opts = vim.tbl_extend("force", { root = fixture.root, columns = {} }, opts or {})
   local instance = keep(fre.new(opts))
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -96,7 +96,7 @@ describe("fre editor-derived Views", function()
 
   after_each(function()
     for _, instance in ipairs(instances) do
-      if instance.state ~= "destroyed" then instance:destroy() end
+      if instance:status() ~= "destroyed" then instance:destroy() end
     end
     pcall(vim.cmd, "silent! tabonly")
     pcall(vim.cmd, "silent! only")
@@ -347,12 +347,12 @@ describe("fre editor-derived Views", function()
     vim.cmd("tabnew")
     local inspected_tab = vim.api.nvim_get_current_tabpage()
     open_view(instance, { position = "current" })
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
 
     vim.cmd("tabclose")
     assert.is_false(vim.api.nvim_tabpage_is_valid(inspected_tab))
     assert.is_nil(fre.view.inspect(instance, inspected_tab))
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
 
     vim.cmd("tabnew")
     local hidden_tab = vim.api.nvim_get_current_tabpage()
@@ -360,7 +360,7 @@ describe("fre editor-derived Views", function()
     vim.cmd("tabclose")
     assert.is_false(vim.api.nvim_tabpage_is_valid(hidden_tab))
     assert.is_true(instance:hidden(hidden_tab))
-    assert.are.equal("ready", instance.state)
+    assert.are.equal("ready", instance:status())
   end)
 
 

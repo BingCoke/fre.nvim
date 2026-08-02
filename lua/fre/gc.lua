@@ -1,5 +1,3 @@
-local mutation_execute = require("fre.mutation.execute")
-
 local M = {}
 
 local function fail(message, level)
@@ -46,7 +44,7 @@ local Controller = {}
 Controller.__index = Controller
 
 function Controller:_registered(instance)
-  if type(instance) ~= "table" or instance._destroyed then return false end
+  if type(instance) ~= "table" or instance:is_destroyed() or instance:is_destroying() then return false end
   if self.manager.instances_by_id[instance.id] ~= instance then return false end
   if self.manager.instances_by_buf[instance.bufnr] ~= instance then return false end
   local group_name = instance.config and instance.config.gc and instance.config.gc.group
@@ -78,15 +76,12 @@ end
 function Controller:is_eligible(instance)
   if not self:_registered(instance) then return false end
   self:_sync_visibility(instance)
-  if instance.state ~= "ready" or instance.hidden_since == nil
+  if not instance:is_ready() or instance.hidden_since == nil
       or not vim.api.nvim_buf_is_valid(instance.bufnr)
       or self:_buffer_is_visible(instance) then
     return false
   end
-  if instance.actions and instance.actions.write then return false end
-  if instance._execution and not mutation_execute.is_terminal(instance._execution) then
-    return false
-  end
+  if instance.work:is_write_active() or instance.work:is_execution_active() then return false end
   if vim.bo[instance.bufnr].modified and not instance.config.gc.include_modified then
     return false
   end
@@ -119,7 +114,7 @@ end
 
 function Controller:_arm(instance)
   local ttl = instance.config and instance.config.gc and instance.config.gc.ttl_ms or 0
-  if ttl <= 0 or instance.hidden_since == nil or instance._destroyed then return end
+  if ttl <= 0 or instance.hidden_since == nil or instance:is_destroyed() or instance:is_destroying() then return end
   local remaining = instance.hidden_since + ttl - self:_now()
   if remaining <= 0 then
     local pending = instance._gc_expired_reconsider
@@ -222,7 +217,7 @@ function Controller:reconsider(instance)
     local remaining = instance.hidden_since + ttl - self:_now()
     if eligible and remaining <= 0 then
       if self:is_eligible(instance) then instance:destroy() end
-      return instance.state == "destroyed"
+      return instance:is_destroyed()
     end
     if remaining > 0 and instance._gc_timer == nil then self:_arm(instance) end
   end

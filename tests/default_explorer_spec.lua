@@ -93,7 +93,7 @@ local function reset_editor()
   pcall(vim.cmd, "noautocmd silent! only!")
   pcall(vim.cmd, "noautocmd silent! enew!")
   for _, instance in ipairs(manager_instances()) do
-    if instance.state ~= "destroyed" then pcall(instance.destroy, instance) end
+    if instance:status() ~= "destroyed" then pcall(instance.destroy, instance) end
   end
   local current = vim.api.nvim_get_current_buf()
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
@@ -180,13 +180,13 @@ describe("fre ticket 20 default directory explorer", function()
 
     local child = assert(fre.get_instance())
     assert.are.equal(path.absolute(fixture.root), child.root)
-    assert.is_true(child.current_hidden_file)
+    assert.is_true(child.buffer:hidden_files())
     assert.is_true(vim.wo.cursorline)
     assert.is_false(vim.api.nvim_buf_is_valid(source))
     wait_for(function()
-      return child.state == "ready" or child.state == "load-failed"
+      return child:status() == "ready" or child:status() == "load-failed"
     end)
-    assert.are.equal("ready", child.state, tostring(child.error))
+    assert.are.equal("ready", child:status(), tostring(child:failure()))
 
     local later_source = source_buffer(fixture:path("one"))
     fre.setup({ default_file_explorer = false, columns = {} })
@@ -214,7 +214,7 @@ describe("fre ticket 20 default directory explorer", function()
     })
     local instance = fre.get_instance()
     if not instance then instance = assert(controller:check(source, winid)) end
-    wait_for(function() return instance.state == "ready" end)
+    wait_for(function() return instance:status() == "ready" end)
 
     vim.api.nvim_win_set_cursor(winid, { 1, 0 })
     vim.cmd("normal! G")
@@ -257,7 +257,7 @@ describe("fre ticket 20 default directory explorer", function()
     })
     local parent = fre.get_instance()
     if not parent then parent = assert(controller:check(source, winid)) end
-    wait_for(function() return parent.state == "ready" end)
+    wait_for(function() return parent:status() == "ready" end)
 
     vim.cmd("normal! G")
     local directory_row
@@ -268,7 +268,7 @@ describe("fre ticket 20 default directory explorer", function()
     assert.is_not_nil(directory_row)
     vim.api.nvim_win_set_cursor(winid, { directory_row, 0 })
     local child = actions.select(actions.context())
-    wait_for(function() return child.state == "ready" end)
+    wait_for(function() return child:status() == "ready" end)
 
     assert.are.equal(child.bufnr, vim.api.nvim_get_current_buf())
     assert.is_nil(fre.view.inspect(parent))
@@ -447,7 +447,7 @@ describe("fre ticket 20 default directory explorer", function()
       controller:check(source, winid)
     end)
     assert.is_not_nil(created)
-    assert.are.equal("destroyed", created.state)
+    assert.are.equal("destroyed", created:status())
     assert.is_false(vim.api.nvim_buf_is_valid(created.bufnr))
   end)
 
@@ -560,8 +560,8 @@ describe("fre ticket 20 default directory explorer", function()
     assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(winid))
     assert.are.equal(child, manager:find_by_id(child.id))
     assert.is_false(vim.api.nvim_buf_is_valid(source))
-    wait_for(function() return child.state == "load-failed" end)
-    assert.are.equal("injected takeover load failure", child.error)
+    wait_for(function() return child:status() == "load-failed" end)
+    assert.are.equal("injected takeover load failure", child:failure())
     assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(winid))
   end)
 

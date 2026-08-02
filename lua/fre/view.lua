@@ -16,9 +16,8 @@ end
 
 local function live_instance(instance)
   return type(instance) == "table"
-    and not instance._destroyed
-    and instance.state ~= "destroying"
-    and instance.state ~= "destroyed"
+    and not instance:is_destroying()
+    and not instance:is_destroyed()
     and type(instance.bufnr) == "number"
     and vim.api.nvim_buf_is_valid(instance.bufnr)
     and instance.manager
@@ -268,7 +267,7 @@ function M.sync(instance, opts)
         captured[#captured + 1] = message
       else
         local scheduled, schedule_err = pcall(vim.schedule, function()
-          if not instance._destroyed then report(instance, message) end
+          if not instance:is_destroying() and not instance:is_destroyed() then report(instance, message) end
         end)
         if not scheduled then
           instance._last_async_error = message

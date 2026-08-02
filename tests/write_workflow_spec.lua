@@ -21,10 +21,10 @@ end
 
 local function wait_ready(instance)
   wait_for(function()
-    return instance.state == "ready"
-      or instance.state == "load-failed"
+    return instance:status() == "ready"
+      or instance:status() == "load-failed"
   end)
-  assert.are_not.equal("load-failed", instance.state, tostring(instance.error))
+  assert.are_not.equal("load-failed", instance:status(), tostring(instance:failure()))
   return instance
 end
 
@@ -40,7 +40,7 @@ end
 
 local function set_lines(instance, replacement)
   local navigation = lines(instance)[1]
-  assert.are.equal("navigation", assert(buffer.decode(instance, 1)).row_kind)
+  assert.are.equal("navigation", assert(instance.buffer:decode(1)).row_kind)
   local next_lines = {}
   if replacement[1] ~= navigation then next_lines[1] = navigation end
   vim.list_extend(next_lines, replacement)
@@ -52,7 +52,7 @@ end
 
 local function row_for(instance, relative)
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
     if decoded and decoded.row_kind == "entry"
         and decoded.entry.relative_path == relative then
       return row
@@ -68,7 +68,7 @@ end
 local function edited_line(instance, relative, target)
   local row = row_for(instance, relative)
   local physical = lines(instance)[row]
-  local decoded = buffer.decode(instance, row)
+  local decoded = instance.buffer:decode(row)
   return physical:sub(1, decoded.path_range.start_byte) .. target
     .. physical:sub(decoded.path_range.end_byte + 1)
 end
@@ -76,7 +76,7 @@ end
 local function projected_paths(instance)
   local result = {}
   for row = 1, vim.api.nvim_buf_line_count(instance.bufnr) do
-    local decoded = assert(buffer.decode(instance, row))
+    local decoded = assert(instance.buffer:decode(row))
     if decoded.row_kind == "entry" then result[#result + 1] = decoded.path end
   end
   return result
@@ -94,8 +94,8 @@ end
 
 local function wait_unlocked(instance)
   wait_for(function()
-    return (not instance.actions or not instance.actions.write)
-      and instance._refresh_request == nil and instance._execution == nil
+    return not instance.work:is_write_active()
+      and not instance.work:is_execution_active() and not instance.sync:is_busy()
   end)
 end
 
@@ -130,6 +130,20 @@ local function invoke_mapping(bufnr, lhs)
     end
   end
   error("missing buffer mapping " .. lhs)
+end
+
+local function wait_for_float()
+  local result
+  wait_for(function()
+    for _, winid in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_config(winid).relative ~= "" then
+        result = { winid = winid, bufnr = vim.api.nvim_win_get_buf(winid) }
+        return true
+      end
+    end
+    return false
+  end)
+  return result
 end
 
 local function scripted_ui(opts)
@@ -223,17 +237,14 @@ describe("fre ticket 11 write workflow", function()
     fre._reset_mutation_adapter()
     vim.notify = original_notify
     for _, instance in ipairs(instances) do
-      if instance.actions and instance.actions.write then
-        local execution = instance._execution
+      if instance.work and instance.work:is_write_active() then
+        local execution = instance.work:active_execution()
         if execution then pcall(execution.cancel, execution) end
         vim.wait(500, function()
-          return not instance.actions or not instance.actions.write
+          return not instance.work or not instance.work:is_write_active()
         end, 10)
-        if instance.actions and instance.actions.write then
-          instance:_release_write_lock(instance.actions.write)
-        end
       end
-      if instance.state ~= "destroyed" then pcall(instance.destroy, instance) end
+      if instance:status() ~= "destroyed" then pcall(instance.destroy, instance) end
     end
     pcall(vim.cmd, "silent! tabonly")
     pcall(vim.cmd, "silent! only")
@@ -267,8 +278,9 @@ describe("fre ticket 11 write workflow", function()
     vim.api.nvim_buf_call(instance.bufnr, function() vim.cmd("silent! undo") end)
     assert.are.same(reconciled, lines(instance))
     assert.is_false(vim.bo[instance.bufnr].modified)
-    assert.are.equal("succeeded", instance._last_write_result.execution.state)
-    assert.is_nil(instance._last_write_result.reconciliation_error)
+    local result = instance.work:last_write_result()
+    assert.are.equal("succeeded", result.execution.state)
+    assert.is_nil(result.reconciliation_error)
   end)
 
   it("skips confirmation at the exact Oil-style simple-edit limits", function()
@@ -309,7 +321,7 @@ describe("fre ticket 11 write workflow", function()
       assert.is_not_nil(vim.uv.fs_lstat(fixture:path("created-" .. index .. ".txt")))
     end
     assert.are.equal("directory", vim.uv.fs_lstat(fixture:path("created-dir")).type)
-    assert.are.equal("succeeded", instance._last_write_result.execution.state)
+    assert.are.equal("succeeded", instance.work:last_write_result().execution.state)
   end)
 
   it("keeps confirmation for deletes, unknown operations, and edits beyond simple limits", function()
@@ -331,7 +343,7 @@ describe("fre ticket 11 write workflow", function()
       assert.is_true(write_command(instance))
       assert.are.equal(1, #ui.confirmations)
       ui.decide(false)
-      assert.is_nil(instance.actions)
+      assert.is_false(instance.work:is_write_active())
     end
 
     expect_confirmation({ delete = 1 }, function(instance)
@@ -362,13 +374,13 @@ describe("fre ticket 11 write workflow", function()
 
     local unknown = ready({}, { skip_confirm_for_simple_edits = true })
     local ui = scripted_ui()
-    unknown._prepare_write = function()
+    unknown.work._prepare = function()
       return { operations = { { type = "future_operation" } }, display = { "FUTURE" } }
     end
     assert.is_true(write_command(unknown))
     assert.are.same({ "FUTURE" }, ui.confirmations[1])
     ui.decide(false)
-    assert.is_nil(unknown.actions)
+    assert.is_false(unknown.work:is_write_active())
   end)
 
   it("holds one nonmodifiable lock, rejects mutators, and allows snapshot lookup, reveal, and windows", function()
@@ -384,7 +396,7 @@ describe("fre ticket 11 write workflow", function()
 
     assert.are.equal(1, #ui.progress_statuses)
     assert.are.equal("running", ui.progress_statuses[1].state)
-    assert.is_not_nil(instance.actions.write)
+    assert.is_true(instance.work:is_write_active())
     assert.is_false(vim.bo[instance.bufnr].modifiable)
     local second_write_ok, second_write_error = write_command(instance)
     assert.is_false(second_write_ok)
@@ -431,10 +443,10 @@ describe("fre ticket 11 write workflow", function()
     assert.are.same(draft, lines(instance))
     assert.is_true(vim.bo[instance.bufnr].modified)
     assert.is_true(vim.bo[instance.bufnr].modifiable)
-    assert.is_nil(instance.actions)
+    assert.is_false(instance.work:is_write_active())
     assert.are.equal(0, #ui.confirmations)
     assert.are.equal(0, #ui.progress_statuses)
-    assert.is_nil(instance._execution)
+    assert.is_false(instance.work:is_execution_active())
   end)
 
   it("passes display lines verbatim and cancellation preserves the draft without execution", function()
@@ -452,8 +464,8 @@ describe("fre ticket 11 write workflow", function()
     assert.are.same(draft, lines(instance))
     assert.is_true(vim.bo[instance.bufnr].modified)
     assert.is_true(vim.bo[instance.bufnr].modifiable)
-    assert.is_nil(instance.actions)
-    assert.is_nil(instance._execution)
+    assert.is_false(instance.work:is_write_active())
+    assert.is_false(instance.work:is_execution_active())
     assert.are.equal(0, #ui.progress_statuses)
     assert.are.equal(1, ui.confirmation_closes)
   end)
@@ -498,7 +510,16 @@ describe("fre ticket 11 write workflow", function()
     local caller_win = vim.api.nvim_get_current_win()
 
     assert.is_true(write_command(instance))
-    local confirmation = assert(instance.actions.write.confirmation_ui)
+    local confirmation
+    wait_for(function()
+      for _, winid in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_get_config(winid).relative ~= "" then
+          confirmation = { winid = winid, bufnr = vim.api.nvim_win_get_buf(winid) }
+          return true
+        end
+      end
+      return false
+    end)
     vim.api.nvim_set_current_win(caller_win)
     wait_for(function() return vim.api.nvim_get_current_win() == confirmation.winid end)
     invoke_mapping(confirmation.bufnr, "q")
@@ -513,7 +534,16 @@ describe("fre ticket 11 write workflow", function()
     second:open({ position = "current" })
     set_lines(second, { physical_line(second, "a.txt"), "other.txt" })
     assert.is_true(write_command(second))
-    local second_confirmation = assert(second.actions.write.confirmation_ui)
+    local second_confirmation
+    wait_for(function()
+      for _, winid in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_get_config(winid).relative ~= "" then
+          second_confirmation = { winid = winid, bufnr = vim.api.nvim_win_get_buf(winid) }
+          return true
+        end
+      end
+      return false
+    end)
     vim.api.nvim_set_current_win(alternate_win)
     vim.wait(50, function() return false end, 10)
     assert.are.equal(alternate_win, vim.api.nvim_get_current_win())
@@ -541,8 +571,8 @@ describe("fre ticket 11 write workflow", function()
       assert.are.same(draft, lines(instance))
       assert.is_true(vim.bo[instance.bufnr].modified)
       assert.are.equal(original_modifiable, vim.bo[instance.bufnr].modifiable)
-      assert.is_nil(instance.actions)
-      assert.is_nil(instance._execution)
+      assert.is_false(instance.work:is_write_active())
+      assert.is_false(instance.work:is_execution_active())
     end
 
     expect_construction_failure("open window exploded", "nvim_open_win", function(original)
@@ -582,8 +612,8 @@ describe("fre ticket 11 write workflow", function()
     assert.are.same(draft, lines(instance))
     assert.is_true(vim.bo[instance.bufnr].modified)
     assert.are.equal(original_modifiable, vim.bo[instance.bufnr].modifiable)
-    assert.is_nil(instance.actions)
-    assert.is_nil(instance._execution)
+    assert.is_false(instance.work:is_write_active())
+    assert.is_false(instance.work:is_execution_active())
   end)
 
   it("closes progress floats and safely terminalizes Execution when progress initialization throws", function()
@@ -627,9 +657,9 @@ describe("fre ticket 11 write workflow", function()
       local execution = with_override(case.owner, case.key, case.replacement, function()
         local ok, err = write_command(instance)
         assert.is_true(ok, tostring(err))
-        local confirmation = assert(instance.actions.write.confirmation_ui)
+        local confirmation = wait_for_float()
         invoke_mapping(confirmation.bufnr, "y")
-        return assert(instance._execution)
+        return assert(instance.work:active_execution())
       end)
 
       assert.are.equal("canceling", execution:get_status().state)
@@ -639,11 +669,11 @@ describe("fre ticket 11 write workflow", function()
       assert.is_false(vim.bo[instance.bufnr].modified)
       assert.are.equal(original_modifiable, vim.bo[instance.bufnr].modifiable)
       assert.are.equal("canceled", execution:get_status().state)
-      assert.are.equal("canceled", instance._last_write_result.execution.state)
+      assert.are.equal("canceled", instance.work:last_write_result().execution.state)
       assert.is_nil(vim.uv.fs_lstat(fixture:path(case.name .. ".txt")))
-      assert.is_nil(instance.actions)
-      assert.is_nil(instance._execution)
-      assert.is_nil(instance._refresh_request)
+      assert.is_false(instance.work:is_write_active())
+      assert.is_false(instance.work:is_execution_active())
+      assert.is_false(instance.sync:is_busy())
     end
   end)
 
@@ -672,8 +702,9 @@ describe("fre ticket 11 write workflow", function()
     assert.is_nil(vim.uv.fs_lstat(fixture:path("second.txt")))
     assert.are.same({ "first.txt", "keep.txt" }, projected_paths(instance))
     assert.is_false(vim.bo[instance.bufnr].modified)
-    assert.are.equal("failed", instance._last_write_result.execution.state)
-    assert.is_truthy(tostring(instance._last_write_result.execution.error)
+    local result = instance.work:last_write_result()
+    assert.are.equal("failed", result.execution.state)
+    assert.is_truthy(tostring(result.execution.error)
       :find("forced second create failure", 1, true))
     assert.are.equal("failed", ui.reports[1].outcome.state)
   end)
@@ -702,14 +733,14 @@ describe("fre ticket 11 write workflow", function()
     ui.decide(true)
     assert.are.equal(1, #ui.progress_statuses)
     vim.wait(30, function() return false end, 10)
-    assert.are.equal("running", instance._execution:get_status().state)
-    assert.is_not_nil(instance.actions.write)
+    assert.are.equal("running", instance.work:active_execution():get_status().state)
+    assert.is_true(instance.work:is_write_active())
 
     ui.cancel_progress()
     wait_unlocked(instance)
     assert.is_not_nil(vim.uv.fs_lstat(fixture:path("partial.txt")))
     assert.are.same({ "partial.txt" }, projected_paths(instance))
-    assert.are.equal("canceled", instance._last_write_result.execution.state)
+    assert.are.equal("canceled", instance.work:last_write_result().execution.state)
     assert.is_false(vim.bo[instance.bufnr].modified)
     assert.are.equal(1, ui.progress_closes)
   end)
@@ -730,9 +761,10 @@ describe("fre ticket 11 write workflow", function()
     assert.are.same(draft, lines(instance))
     assert.is_true(vim.bo[instance.bufnr].modified)
     assert.is_true(vim.bo[instance.bufnr].modifiable)
-    assert.is_true(instance.needs_refresh)
-    assert.are.equal("succeeded", instance._last_write_result.execution.state)
-    assert.is_truthy(tostring(instance._last_write_result.reconciliation_error)
+    assert.is_true(instance.sync:is_dirty())
+    local result = instance.work:last_write_result()
+    assert.are.equal("succeeded", result.execution.state)
+    assert.is_truthy(tostring(result.reconciliation_error)
       :find("forced reconciliation failure", 1, true))
     assert.are.equal("succeeded", ui.reports[1].outcome.state)
     assert.is_truthy(tostring(ui.reports[1].reconciliation_error)
@@ -747,7 +779,7 @@ describe("fre ticket 11 write workflow", function()
     wait_for(function() return refreshed end)
     assert.is_nil(refresh_error)
     assert.are.same({ "actual.txt", "keep.txt" }, projected_paths(instance))
-    assert.is_false(instance.needs_refresh)
+    assert.is_false(instance.sync:is_dirty())
     assert.is_false(vim.bo[instance.bufnr].modified)
   end)
 
@@ -757,12 +789,12 @@ describe("fre ticket 11 write workflow", function()
     local baseline = lines(instance)
     local row = row_for(instance, "a.txt")
     local physical = baseline[row]
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
     local padded = physical:sub(1, decoded.path_range.start_byte) .. "  a.txt  "
     set_lines(instance, { "", padded, "" })
     assert.are.same({ operations = {}, display = {} }, instance:prepare())
     assert.is_true(write_command(instance))
-    assert.is_nil(instance._execution)
+    assert.is_false(instance.work:is_execution_active())
     wait_unlocked(instance)
 
     assert.are.same(baseline, lines(instance))
@@ -770,7 +802,7 @@ describe("fre ticket 11 write workflow", function()
     assert.are.equal(0, #ui.progress_statuses)
     assert.is_false(vim.bo[instance.bufnr].modified)
     assert.is_true(vim.bo[instance.bufnr].modifiable)
-    assert.is_nil(instance._last_write_result.execution)
+    assert.is_nil(instance.work:last_write_result().execution)
   end)
 
   it("writes retained unsupported snapshot kinds through the empty Plan path", function()
@@ -786,14 +818,14 @@ describe("fre ticket 11 write workflow", function()
 
     assert.are.same({ operations = {}, display = {} }, instance:prepare())
     assert.is_true(write_command(instance))
-    assert.is_nil(instance._execution)
+    assert.is_false(instance.work:is_execution_active())
     wait_unlocked(instance)
 
     assert.are.same(baseline, lines(instance))
     assert.are.equal(0, #ui.confirmations)
     assert.are.equal(0, #ui.progress_statuses)
     assert.is_false(vim.bo[instance.bufnr].modified)
-    assert.is_nil(instance._last_write_result.execution)
+    assert.is_nil(instance.work:last_write_result().execution)
   end)
 
   it("cleans lock and UI references when confirmation, progress, update, close, or report throws", function()
@@ -803,7 +835,7 @@ describe("fre ticket 11 write workflow", function()
     local ok, err = write_command(confirm_instance)
     assert.is_false(ok)
     assert.is_truthy(tostring(err):find("confirmation exploded", 1, true))
-    assert.is_nil(confirm_instance.actions)
+    assert.is_false(confirm_instance.work:is_write_active())
     assert.is_true(vim.bo[confirm_instance.bufnr].modifiable)
 
     local progress_instance = wait_ready(keep(fre.new({ root = fixture.root, columns = {} })))
@@ -817,9 +849,9 @@ describe("fre ticket 11 write workflow", function()
     set_lines(progress_instance, { physical_line(progress_instance, "a.txt"), "other.txt" })
     assert.is_true(write_command(progress_instance))
     wait_unlocked(progress_instance)
-    assert.is_nil(progress_instance.actions)
-    assert.is_nil(progress_instance._execution)
-    assert.is_nil(progress_instance._refresh_request)
+    assert.is_false(progress_instance.work:is_write_active())
+    assert.is_false(progress_instance.work:is_execution_active())
+    assert.is_false(progress_instance.sync:is_busy())
     assert.is_true(vim.bo[progress_instance.bufnr].modifiable)
     assert.is_false(vim.bo[progress_instance.bufnr].modified)
   end)
@@ -839,11 +871,11 @@ describe("fre ticket 11 write workflow", function()
     local before = {
       lines = lines(instance),
       tree = instance.tree,
-      root_node = instance.root_node,
-      view = instance.view,
+      root_node = instance.tree.root,
+      view = instance.buffer.view,
       modified = vim.bo[instance.bufnr].modified,
       modifiable = vim.bo[instance.bufnr].modifiable,
-      needs_refresh = instance.needs_refresh,
+      needs_refresh = instance.sync:is_dirty(),
       load_count = load_count,
     }
     local execution = instance:execute({
@@ -855,13 +887,13 @@ describe("fre ticket 11 write workflow", function()
     assert.are.equal(1, calls)
     assert.are.same(before.lines, lines(instance))
     assert.are.equal(before.tree, instance.tree)
-    assert.are.equal(before.root_node, instance.root_node)
-    assert.are.equal(before.view, instance.view)
+    assert.are.equal(before.root_node, instance.tree.root)
+    assert.are.equal(before.view, instance.buffer.view)
     assert.are.equal(before.modified, vim.bo[instance.bufnr].modified)
     assert.are.equal(before.modifiable, vim.bo[instance.bufnr].modifiable)
-    assert.are.equal(before.needs_refresh, instance.needs_refresh)
+    assert.are.equal(before.needs_refresh, instance.sync:is_dirty())
     assert.are.equal(before.load_count, load_count)
-    assert.is_nil(instance.actions)
+    assert.is_false(instance.work:is_write_active())
     assert.are.equal(0, #ui.confirmations)
     assert.are.equal(0, #ui.progress_statuses)
   end)

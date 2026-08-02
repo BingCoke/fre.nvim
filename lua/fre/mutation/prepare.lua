@@ -32,17 +32,18 @@ local function cached_unsupported(node, operation)
   return nil
 end
 
-local function sorted_node_ids(nodes_by_id)
+local function sorted_node_ids(tree)
   local ids = {}
-  for id in pairs(nodes_by_id or {}) do ids[#ids + 1] = id end
+  for id in tree:iter_nodes() do ids[#ids + 1] = id end
   table.sort(ids)
   return ids
 end
 
 local function baseline_order(instance)
-  local baseline = assert(instance.view and instance.view.baseline)
+  local committed = instance.buffer:committed_entries()
+  local baseline = assert(committed.baseline)
   local ordered, seen = {}, {}
-  for _, node in ipairs(instance.view.visible_nodes or {}) do
+  for _, node in ipairs(committed.visible_nodes or {}) do
     if baseline[node.id] ~= nil and not seen[node.id] then
       ordered[#ordered + 1] = node.id
       seen[node.id] = true
@@ -133,15 +134,16 @@ local function derived_target(root, source, target)
 end
 
 function M.prepare(instance)
-  if instance.state ~= "ready" then fail("instance is not ready", 3) end
+  if not instance.ready then fail("instance is not ready", 3) end
   if not vim.api.nvim_buf_is_valid(instance.bufnr) then
     fail("instance buffer is not valid", 3)
   end
-  if not instance.view or type(instance.view.baseline) ~= "table" then
+  local committed = instance.buffer:committed_entries()
+  if type(committed.baseline) ~= "table" then
     fail("instance has no successful projection baseline", 3)
   end
 
-  local baseline = instance.view.baseline
+  local baseline = committed.baseline
   local ordered_baseline = baseline_order(instance)
   local windows = path.is_windows(instance.root)
   local function path_key(value)
@@ -152,7 +154,7 @@ function M.prepare(instance)
   local line_count = vim.api.nvim_buf_line_count(instance.bufnr)
 
   for row = 1, line_count do
-    local decoded = buffer.decode(instance, row)
+    local decoded = instance.buffer:decode(row)
     if decoded.synthetic then
       -- Synthetic decoded rows never participate in filesystem plans.
     elseif decoded.marked then
@@ -201,7 +203,8 @@ function M.prepare(instance)
   for index, id in ipairs(ordered_baseline) do baseline_index[id] = index end
   local classification_order = vim.list_slice(ordered_baseline)
   table.sort(classification_order, function(left, right)
-    local left_node, right_node = instance.nodes_by_id[left], instance.nodes_by_id[right]
+    local left_node = instance.tree:node_by_id(left)
+    local right_node = instance.tree:node_by_id(right)
     local left_depth, right_depth = node_depth(left_node), node_depth(right_node)
     if left_depth ~= right_depth then return left_depth < right_depth end
     return baseline_index[left] < baseline_index[right]
@@ -209,7 +212,7 @@ function M.prepare(instance)
   -- Adapter-defined opaque kinds remain occupants but never own direct actions.
   local mutable_order = {}
   for _, id in ipairs(classification_order) do
-    local node = instance.nodes_by_id[id]
+    local node = instance.tree:node_by_id(id)
     if node == nil then
       fail("projected baseline references missing local node " .. tostring(id), 3)
     end
@@ -299,7 +302,7 @@ function M.prepare(instance)
   end
 
   for _, id in ipairs(classification_order) do
-    local node = assert(instance.nodes_by_id[id])
+    local node = assert(instance.tree:node_by_id(id))
     local source = path.normalize(baseline[id], { windows = windows })
     local source_relative = assert(path.relative(instance.root, source))
     local found = sorted_occurrences(occurrences[id], windows)
@@ -464,7 +467,7 @@ function M.prepare(instance)
   end
 
   local known_entries, known_nodes = {}, {}
-  for _, node in pairs(instance.nodes_by_id or {}) do
+  for _, node in instance.tree:iter_nodes() do
     local key = path_key(node.path)
     known_entries[key] = node.kind
     known_nodes[key] = node
@@ -612,9 +615,9 @@ function M.prepare(instance)
   end
 
   local snapshot = {}
-  for _, id in ipairs(sorted_node_ids(instance.nodes_by_id)) do
-    local node = instance.nodes_by_id[id]
-    if node ~= instance.root_node then
+  for _, id in ipairs(sorted_node_ids(instance.tree)) do
+    local node = instance.tree:node_by_id(id)
+    if node ~= instance.tree:root_node() then
       snapshot[#snapshot + 1] = {
         id = id, node = node, path = path.normalize(node.path, { windows = windows }), kind = node.kind,
       }
