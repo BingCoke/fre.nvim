@@ -5,6 +5,7 @@ local mutation_prepare = require("fre.mutation.prepare")
 local path = require("fre.path")
 local row = require("fre.instance.row")
 local Tree = require("fre.instance.tree")
+local Registry = require("fre.registry")
 local real_fs = require("fre.fs").default
 local fs = require("tests.helpers.fs")
 
@@ -571,7 +572,10 @@ describe("fre ticket 10 prepare basic mutations", function()
     local root = { id = 1, path = "C:/Project", kind = "directory" }
     local a = { id = 2, path = "C:/Project/A.txt", kind = "file", name = "A.txt" }
     local b = { id = 3, path = "C:/Project/B.txt", kind = "file", name = "B.txt" }
-    local tree = Tree.new(root.path, 777, function(_, left, right) return left.name < right.name end)
+    local registry = Registry.new()
+    local tree = Tree.new(
+      root.path, 777, function(_, left, right) return left.name < right.name end, registry
+    )
     tree.root = root
     tree.nodes_by_id = { [1] = root, [2] = a, [3] = b }
     tree.nodes_by_path = { [root.path] = root, [a.path] = a, [b.path] = b }
@@ -583,12 +587,10 @@ describe("fre ticket 10 prepare basic mutations", function()
       config = { columns = {} },
       tree = tree,
     }
-    local marker_widths = { instance = 3, node = 3, generation = 1 }
     fake.buffer = buffer.new({
-      id = fake.id, root = fake.root, bufnr = fake.bufnr, config = fake.config, tree = tree,
-      get_marker_widths = function() return marker_widths end,
+      id = fake.id, root = fake.root, bufnr = fake.bufnr, config = fake.config,
+      tree = tree, registry = registry,
       can_reproject = function() return false end,
-      resolve_buffer_by_id = function(id) return id == fake.id and fake.buffer or nil end,
       destroyed = function() return false end,
       destroying = function() return false end,
       list_views = function() return {} end,

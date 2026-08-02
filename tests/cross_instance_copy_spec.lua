@@ -253,7 +253,7 @@ describe("fre ticket 13 cross-instance copy", function()
     end)
   end)
 
-  it("rejects destroyed, unregistered, and removed foreign sources with target rows", function()
+  it("rejects destroyed, removed marker sources, and missing foreign nodes with target rows", function()
     local target = ready(make_root("target", {}))
 
     local destroyed = ready(make_root("destroyed", { ["a.txt"] = "a" }))
@@ -264,7 +264,7 @@ describe("fre ticket 13 cross-instance copy", function()
 
     local unregistered = ready(make_root("unregistered", { ["b.txt"] = "b" }))
     local unregistered_line = edited_line(unregistered, "b.txt", "unregistered-copy.txt")
-    unregistered.manager:remove(unregistered)
+    buffer.teardown(unregistered.buffer)
     set_lines(target, { unregistered_line })
     assert_error(2, "unknown instance", function() target:prepare() end)
 

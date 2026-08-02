@@ -3,6 +3,7 @@ local buffer = require("fre.instance.buffer")
 local columns = require("fre.columns")
 local row = require("fre.instance.row")
 local Tree = require("fre.instance.tree")
+local Registry = require("fre.registry")
 local fs = require("tests.helpers.fs")
 
 local instances = {}
@@ -262,17 +263,17 @@ describe("fre metadata buffer rows", function()
     local node = {
       id = 2, path = "C:/Project/plain.txt", kind = "file", name = "plain.txt",
     }
-    local marker_widths = { instance = 3, node = 3, generation = 1 }
-    local tree = Tree.new(root.path, 777, function(_, left, right) return left.name < right.name end)
+    local registry = Registry.new()
+    local tree = Tree.new(
+      root.path, 777, function(_, left, right) return left.name < right.name end, registry
+    )
     tree.root = root
     tree.nodes_by_id = { [1] = root, [2] = node }
     tree.nodes_by_path = { [root.path] = root, [node.path] = node }
     local fake = buffer.new({
       id = 777, root = root.path, bufnr = vim.api.nvim_create_buf(false, true),
-      config = { columns = {} }, tree = tree,
-      get_marker_widths = function() return marker_widths end,
+      config = { columns = {} }, tree = tree, registry = registry,
       can_reproject = function() return false end,
-      resolve_buffer_by_id = function() return nil end,
       destroyed = function() return false end,
       destroying = function() return false end,
       list_views = function() return {} end,

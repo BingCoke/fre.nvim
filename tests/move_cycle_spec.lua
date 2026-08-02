@@ -7,6 +7,7 @@ local mutation_prepare = require("fre.mutation.prepare")
 local path = require("fre.path")
 local row = require("fre.instance.row")
 local Tree = require("fre.instance.tree")
+local Registry = require("fre.registry")
 local fs = require("tests.helpers.fs")
 
 local fixture
@@ -151,7 +152,10 @@ local function fake_plan(root_path, definitions)
     visible[#visible + 1] = node
     replacement[#replacement + 1] = row.marker(nil, 900, id, marker_widths) .. definition.target
   end
-  local tree = Tree.new(root_path, 900, function(_, left, right) return left.name < right.name end)
+  local registry = Registry.new()
+  local tree = Tree.new(
+    root_path, 900, function(_, left, right) return left.name < right.name end, registry
+  )
   tree.root = root
   tree.nodes_by_id = nodes_by_id
   tree.nodes_by_path = {}
@@ -165,10 +169,9 @@ local function fake_plan(root_path, definitions)
     tree = tree,
   }
   fake.buffer = buffer.new({
-    id = fake.id, root = fake.root, bufnr = fake.bufnr, config = fake.config, tree = tree,
-    get_marker_widths = function() return marker_widths end,
+    id = fake.id, root = fake.root, bufnr = fake.bufnr, config = fake.config,
+    tree = tree, registry = registry,
     can_reproject = function() return false end,
-    resolve_buffer_by_id = function(id) return id == fake.id and fake.buffer or nil end,
     destroyed = function() return false end,
     destroying = function() return false end,
     list_views = function() return {} end,

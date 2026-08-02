@@ -12,17 +12,47 @@ local M = {}
 Buffer.__index = M
 setmetatable(M, { __index = Buffer })
 
+local function marker_column_context(source, node, entry, descriptor, index, is_last)
+  local mtime = node.mtime
+  if type(mtime) == "table" then
+    mtime = { sec = tonumber(mtime.sec) or 0, nsec = tonumber(mtime.nsec) or 0 }
+  else
+    mtime = { sec = tonumber(mtime) or 0, nsec = 0 }
+  end
+  return {
+    entry = entry, descriptor = descriptor, config = descriptor,
+    column_index = index, is_last = is_last,
+    instance = { id = source.id, bufnr = source.bufnr, root = source.root },
+    metadata = {
+      kind = node.kind, mode = tonumber(node.mode) or 0,
+      size = node.stat and tonumber(node.stat.size) or nil, mtime = mtime,
+    },
+  }
+end
+
+local function marker_tree_contract(tree)
+  return {
+    root_node = function() return tree:root_node() end,
+    node_by_id = function(_, id) return tree:node_by_id(id) end,
+    node_by_path = function(_, node_path) return tree:node_by_path(node_path) end,
+    entry = function(_, node) return tree:entry(node) end,
+  }
+end
+
 function Buffer.new(options)
   if type(options) ~= "table" then fail("buffer options are required", 2) end
+  local registry = assert(options.registry)
+  local widths = registry:marker_widths()
   local self = setmetatable({
     id = options.id,
     root = options.root,
     bufnr = options.bufnr,
     config = options.config,
     tree = options.tree,
-    get_marker_widths = assert(options.get_marker_widths),
+    registry = registry,
+    registry_id = registry.registry_id,
+    last_marker_generation = widths.generation,
     can_reproject = assert(options.can_reproject),
-    resolve_buffer_by_id = assert(options.resolve_buffer_by_id),
     destroyed = assert(options.destroyed),
     destroying = assert(options.destroying),
     list_views = assert(options.list_views),
@@ -39,23 +69,40 @@ function Buffer.new(options)
     pending_initial_cursor = {},
     marker_width_stale = false,
   }, Buffer)
+  self.marker_source = {
+    id = self.id,
+    root = self.root,
+    bufnr = self.bufnr,
+    config = { columns = self.config.columns or {} },
+    tree = marker_tree_contract(self.tree),
+    view = self.view,
+    _column_context = marker_column_context,
+    destroyed = function() return false end,
+  }
   return self
 end
 
 M.new = Buffer.new
 
 function Buffer:marker_widths()
-  return self.get_marker_widths()
+  return self.registry:marker_widths()
 end
 
-function M:on_marker_width_changed(generation)
+function Buffer:find_marker_source(instance_id)
+  return self.registry:find_marker_source(instance_id)
+end
+
+function M:on_marker_width_changed(event)
+  if event.registry_id ~= self.registry_id
+      or event.generation <= self.last_marker_generation then return end
+  self.last_marker_generation = event.generation
   self.marker_width_stale = true
   if not self.can_reproject() then return end
   if not vim.api.nvim_buf_is_valid(self.bufnr) or vim.bo[self.bufnr].modified then return end
 
   local current_generation = self:marker_widths().generation
   local view_generation = self.view and self.view.marker_generation or 0
-  if view_generation >= generation and view_generation >= current_generation then
+  if view_generation >= event.generation and view_generation >= current_generation then
     self.marker_width_stale = false
     return
   end
@@ -116,21 +163,7 @@ function M:position(node)
 end
 
 function M:_column_context(node, entry, descriptor, index, is_last)
-  local mtime = node.mtime
-  if type(mtime) == "table" then
-    mtime = { sec = tonumber(mtime.sec) or 0, nsec = tonumber(mtime.nsec) or 0 }
-  else
-    mtime = { sec = tonumber(mtime) or 0, nsec = 0 }
-  end
-  return {
-    entry = entry, descriptor = descriptor, config = descriptor,
-    column_index = index, is_last = is_last,
-    instance = { id = self.id, bufnr = self.bufnr, root = self.root },
-    metadata = {
-      kind = node.kind, mode = tonumber(node.mode) or 0,
-      size = node.stat and tonumber(node.stat.size) or nil, mtime = mtime,
-    },
-  }
+  return marker_column_context(self, node, entry, descriptor, index, is_last)
 end
 
 function M:replace_lines(first, last, lines)
@@ -637,6 +670,7 @@ function M.commit(buffer, prepared)
       last_patch = patch,
       projection_generation = (previous_view.projection_generation or 0) + 1,
     }
+    buffer.marker_source.view = buffer.view
     buffer.projection_ranges = prepared.projection and prepared.projection.ranges or {}
     vim.bo[buffer.bufnr].modified = false
     pcall(restore_view_cursors, buffer, cursor_snapshots, prepared)
@@ -652,6 +686,7 @@ function M.commit(buffer, prepared)
   end)
   if not ok or result == false then
     buffer.view = previous_view
+    buffer.marker_source.view = buffer.view
     local restore_ok, restore_err = pcall(restore, buffer, snapshot)
     if not restore_ok then
       error(tostring(result) .. "; rollback failed: " .. tostring(restore_err), 0)
@@ -820,6 +855,11 @@ function M.setup(buffer)
 
   local group_name = "FreBuffer" .. tostring(buffer.bufnr)
   buffer.buffer_augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
+  vim.api.nvim_create_autocmd("User", {
+    group = buffer.buffer_augroup,
+    pattern = "FreRegistryMarkerWidthsChanged",
+    callback = function(args) M.on_marker_width_changed(buffer, args.data) end,
+  })
   vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
     group = buffer.buffer_augroup, buffer = buffer.bufnr,
     callback = function() externally_deleted(buffer) end,
@@ -885,9 +925,15 @@ function M.setup(buffer)
     })
   end
   require("fre.mapping").setup(buffer)
+  buffer.registry:register_marker_source(buffer.id, buffer.marker_source)
+  buffer.marker_source_registered = true
 end
 
 function M.teardown(buffer)
+  if buffer.marker_source_registered then
+    buffer.registry:remove_marker_source(buffer.id, buffer.marker_source)
+    buffer.marker_source_registered = false
+  end
   buffer.highlight_disabled = true
   buffer.highlight_pending = nil
   if buffer.buffer_augroup then

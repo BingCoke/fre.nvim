@@ -1,8 +1,11 @@
 local manager_module = require("fre.manager")
 
-local function instance(manager, bufnr, group)
+local next_id = 1
+local function instance(_, bufnr, group)
+  local id = next_id
+  next_id = id + 1
   return {
-    id = manager:allocate_id(),
+    id = id,
     bufnr = bufnr,
     config = { gc = { group = group or "default" } },
     is_destroyed = function() return false end,
@@ -11,36 +14,6 @@ local function instance(manager, bufnr, group)
 end
 
 describe("fre manager", function()
-  it("allocates positive IDs that are never reused", function()
-    local manager = manager_module.new()
-    local first = instance(manager, 101)
-    manager:register(first)
-    manager:remove(first)
-    local second = instance(manager, 102)
-
-    assert.are.equal(1, first.id)
-    assert.are.equal(2, second.id)
-    assert.is_true(second.id > first.id)
-  end)
-
-  it("rejects re-registration of an ID after its instance is removed", function()
-    local manager = manager_module.new()
-    local first = instance(manager, 111)
-    manager:register(first)
-    manager:remove(first)
-
-    local reused = {
-      id = first.id,
-      bufnr = 112,
-      config = { gc = { group = "default" } },
-    }
-    assert.has_error(function()
-      manager:register(reused)
-    end)
-    assert.is_nil(manager:find_by_id(first.id))
-    assert.is_nil(manager:find_by_buf(reused.bufnr))
-    assert.is_nil(manager:find_by_group("default")[first.id])
-  end)
 
   it("registers and finds instances through every index", function()
     local manager = manager_module.new()

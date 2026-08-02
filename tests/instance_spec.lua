@@ -2,6 +2,7 @@ local buffer = require("fre.instance.buffer")
 local Instance = require("fre.instance")
 local Sync = require("fre.instance.sync")
 local manager_module = require("fre.manager")
+local Registry = require("fre.registry")
 local mapping = require("fre.mapping")
 local fre = require("fre")
 local path = require("fre.path")
@@ -470,8 +471,16 @@ describe("fre async hidden instances", function()
   end)
 
   it("cleans failed core construction without registration or GC rollback", function()
-    local manager = manager_module.new()
+    local registry = Registry.new()
+    local manager = manager_module.new({ registry = registry })
     local root = path.absolute(fixture.root)
+    local allocated = {}
+    local allocate_instance_id = registry.allocate_instance_id
+    registry.allocate_instance_id = function(owner)
+      local id = allocate_instance_id(owner)
+      allocated[#allocated + 1] = id
+      return id
+    end
     local registrations = 0
     local enrollments = 0
     local original_register = manager.register
@@ -509,20 +518,24 @@ describe("fre async hidden instances", function()
         end,
       },
     }
-    local first_failed_id = manager._next_id
+    local failed_ids = {}
 
     for _, stage in ipairs(stages) do
       local pending
       manager:set_fs_adapter({ load = function(_, done) pending = done end })
       local before_buffers = vim.api.nvim_list_bufs()
-      local failed_id = manager._next_id
+      local before_allocations = #allocated
       local restore = stage.install()
       local ok, err = pcall(manager.create_instance, manager, { root = root })
       restore()
 
+      local failed_id = allocated[#allocated]
+      failed_ids[#failed_ids + 1] = failed_id
       assert.is_false(ok, stage.name)
       assert.is_truthy(tostring(err):find("injected " .. stage.name, 1, true), tostring(err))
-      assert.are.equal(failed_id + 1, manager._next_id)
+      assert.are.equal(before_allocations + 1, #allocated)
+      assert.is_true(registry:is_instance_id_consumed(failed_id))
+      assert.is_nil(registry:find_marker_source(failed_id))
       assert.are.same(before_buffers, vim.api.nvim_list_bufs())
       assert.is_nil(manager:find_by_id(failed_id))
       assert.is_nil(manager:find_by_group("default")[failed_id])
@@ -538,12 +551,14 @@ describe("fre async hidden instances", function()
     manager._gc.on_register = original_on_register
     assert.are.equal(0, registrations)
     assert.are.equal(0, enrollments)
-    assert.are.equal(first_failed_id + #stages, manager:allocate_id())
+    local next_id = registry:allocate_instance_id()
+    assert.is_true(next_id > failed_ids[#failed_ids])
   end)
 
   it("cleans core resources when managed registration fails atomically", function()
     local timers = { created = 0, stopped = 0, closed = 0 }
-    local manager = manager_module.new()
+    local registry = Registry.new()
+    local manager = manager_module.new({ registry = registry })
     manager:set_gc_adapter({
       now = function() return 0 end,
       new_timer = function()
@@ -576,7 +591,6 @@ describe("fre async hidden instances", function()
     local pending
     manager:set_fs_adapter({ load = function(_, done) pending = done end })
     local before_buffers = vim.api.nvim_list_bufs()
-    local failed_id = manager._next_id
     local constructed
     local original_on_register = manager._gc.on_register
     manager._gc.on_register = function(controller, created)
@@ -588,6 +602,7 @@ describe("fre async hidden instances", function()
     local ok, err = pcall(manager.create_instance, manager, { root = fixture.root })
     manager._gc.on_register = original_on_register
 
+    local failed_id = constructed.id
     assert.is_false(ok)
     assert.is_truthy(tostring(err):find("injected managed registration failure", 1, true))
     assert.is_nil(pending)
@@ -596,16 +611,17 @@ describe("fre async hidden instances", function()
     assert.is_nil(manager:find_by_id(failed_id))
     assert.is_nil(manager:find_by_buf(constructed.bufnr))
     assert.is_nil(manager:find_by_group("default")[failed_id])
+    assert.is_nil(registry:find_marker_source(failed_id))
     assert.are.same(before_buffers, vim.api.nvim_list_bufs())
     assert.are.same({ created = 1, stopped = 1, closed = 1 }, timers)
   end)
 
   it("removes managed ownership when initial load start fails", function()
-    local manager = manager_module.new()
+    local registry = Registry.new()
+    local manager = manager_module.new({ registry = registry })
     local pending
     manager:set_fs_adapter({ load = function(_, done) pending = done end })
     local before_buffers = vim.api.nvim_list_bufs()
-    local failed_id = manager._next_id
     local constructed
     local original_register = manager.register
     local original_load_initial = Sync.load_initial
@@ -622,6 +638,7 @@ describe("fre async hidden instances", function()
     manager.register = original_register
     Sync.load_initial = original_load_initial
 
+    local failed_id = constructed.id
     assert.is_false(ok)
     assert.is_truthy(tostring(err):find("injected load start failure", 1, true))
     assert.is_function(pending)
@@ -630,6 +647,7 @@ describe("fre async hidden instances", function()
     assert.is_nil(manager:find_by_id(failed_id))
     assert.is_nil(manager:find_by_buf(constructed.bufnr))
     assert.is_nil(manager:find_by_group("default")[failed_id])
+    assert.is_nil(registry:find_marker_source(failed_id))
     assert.are.same(before_buffers, vim.api.nvim_list_bufs())
 
     pending(nil, {})

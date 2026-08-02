@@ -112,7 +112,7 @@ end
 
 local function marker_source(buffer, instance_id, row_number)
   if instance_id == buffer.id then return buffer end
-  local source = buffer.resolve_buffer_by_id(instance_id)
+  local source = buffer:find_marker_source(instance_id)
   if not source then
     fail_row(row_number, "marker references unknown instance " .. tostring(instance_id))
   end

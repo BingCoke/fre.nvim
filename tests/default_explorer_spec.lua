@@ -468,16 +468,24 @@ describe("fre ticket 20 default directory explorer", function()
     local before = {
       buffers = vim.api.nvim_list_bufs(),
       instances = instance_count(manager),
-      next_id = manager._next_id,
       view = vim.api.nvim_win_call(winid, vim.fn.winsaveview),
       options = { number = vim.wo[winid].number, cursorline = vim.wo[winid].cursorline },
       autocmds = autocmds(),
     }
+    local allocated_id
+    local registry = manager._registry
+    local allocate_instance_id = registry.allocate_instance_id
+    registry.allocate_instance_id = function(owner)
+      allocated_id = allocate_instance_id(owner)
+      return allocated_id
+    end
 
     local err = error_text(function() controller:check(source, winid) end)
+    registry.allocate_instance_id = allocate_instance_id
     fre.setup({})
     assert.is_truthy(err:lower():find("unknown option", 1, true), err)
-    assert.are.equal(before.next_id + 1, manager._next_id)
+    assert.is_true(registry:is_instance_id_consumed(allocated_id))
+    assert.is_nil(registry:find_marker_source(allocated_id))
     assert.are.same(before.buffers, vim.api.nvim_list_bufs())
     assert.are.equal(before.instances, instance_count(manager))
     assert.are.equal(source, vim.api.nvim_win_get_buf(winid))
@@ -485,12 +493,12 @@ describe("fre ticket 20 default directory explorer", function()
     assert.are.equal(before.options.number, vim.wo[winid].number)
     assert.are.equal(before.options.cursorline, vim.wo[winid].cursorline)
     assert.are.same(before.autocmds, autocmds())
-    assert.is_nil(manager:find_by_id(before.next_id))
-    assert.is_false(pcall(vim.api.nvim_get_autocmds, { group = "FreBuffer" .. before.next_id }))
+    assert.is_nil(manager:find_by_id(allocated_id))
+    assert.is_false(pcall(vim.api.nvim_get_autocmds, { group = "FreBuffer" .. allocated_id }))
     assert.are.same({}, gc_state.handles)
     assert.is_nil(controller._checking[source])
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-      assert.are_not.equal("fre://" .. before.next_id, vim.api.nvim_buf_get_name(bufnr))
+      assert.are_not.equal("fre://" .. allocated_id, vim.api.nvim_buf_get_name(bufnr))
     end
   end)
 

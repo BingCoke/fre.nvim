@@ -1,4 +1,5 @@
 local Tree = require("fre.instance.tree")
+local Registry = require("fre.registry")
 
 describe("fre Tree interface", function()
   local function comparator(_, left, right)
@@ -7,9 +8,13 @@ describe("fre Tree interface", function()
 
   it("owns lookup sorting expansion and directory load transitions", function()
     local observed = {}
-    local tree = Tree.new("/root", 42, comparator, function(id)
+    local registry = Registry.new()
+    local observe_node_id = registry.observe_node_id
+    registry.observe_node_id = function(owner, id)
       observed[#observed + 1] = id
-    end)
+      return observe_node_id(owner, id)
+    end
+    local tree = Tree.new("/root", 42, comparator, registry)
     local root = tree:root_node()
     local ordered = tree:reconcile(root, {
       { name = "z.txt", kind = "file" },
@@ -37,7 +42,7 @@ describe("fre Tree interface", function()
   end)
 
   it("restores topology without reusing IDs and adopts candidates with stable identity", function()
-    local tree = Tree.new("/root", 7, comparator)
+    local tree = Tree.new("/root", 7, comparator, Registry.new())
     local root = tree:root_node()
     local directory = tree:reconcile(root, {
       { name = "dir", kind = "directory" },

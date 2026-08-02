@@ -2,6 +2,7 @@ local config = require("fre.config")
 local gc = require("fre.gc")
 local fs = require("fre.fs")
 local mutation_fs = require("fre.mutation.fs")
+local registry = require("fre.registry")
 local watch = require("fre.watch")
 local takeover = require("fre.takeover")
 
@@ -16,9 +17,6 @@ local function positive_integer(value)
   return type(value) == "number" and value > 0 and value % 1 == 0
 end
 
-local function decimal_width(id)
-  return #tostring(id)
-end
 
 local function new_group(capacity)
   return {
@@ -35,10 +33,7 @@ function Manager.new(opts)
     groups[name] = new_group(capacity)
   end
   local self = setmetatable({
-    _next_id = 1,
-    _consumed_ids = {},
-    _marker_widths = { instance = 3, node = 3, generation = 1 },
-    _marker_width_refresh_scheduled = false,
+    _registry = opts.registry or registry.default,
     _setup_defaults = defaults,
     _default_file_explorer = nil,
     _fs_adapter = fs.default,
@@ -55,54 +50,6 @@ function Manager.new(opts)
   return self
 end
 
-function Manager:_schedule_marker_width_refresh()
-  if self._marker_width_refresh_scheduled then return end
-  self._marker_width_refresh_scheduled = true
-  vim.schedule(function()
-    self._marker_width_refresh_scheduled = false
-    local generation = self._marker_widths.generation
-    for _, instance in pairs(self.instances_by_id) do
-      local target = instance.buffer
-      if target and type(target.on_marker_width_changed) == "function" then
-        local ok, err = pcall(target.on_marker_width_changed, target, generation)
-        if not ok and type(target.report_async_error) == "function" then
-          pcall(target.report_async_error, err)
-        end
-      end
-    end
-  end)
-end
-
-function Manager:_observe_marker_id(field, id)
-  if type(id) ~= "number" or id < 0 or id % 1 ~= 0 then
-    fail(field .. " marker ID must be a non-negative integer")
-  end
-  local width = math.max(3, decimal_width(id))
-  if width <= self._marker_widths[field] then return false end
-  self._marker_widths[field] = width
-  self._marker_widths.generation = self._marker_widths.generation + 1
-  self:_schedule_marker_width_refresh()
-  return true
-end
-
-function Manager:allocate_id()
-  local id = self._next_id
-  self._next_id = id + 1
-  self:_observe_marker_id("instance", id)
-  return id
-end
-
-function Manager:observe_node_id(id)
-  return self:_observe_marker_id("node", id)
-end
-
-function Manager:get_marker_widths()
-  return {
-    instance = self._marker_widths.instance,
-    node = self._marker_widths.node,
-    generation = self._marker_widths.generation,
-  }
-end
 
 function Manager:create_instance(opts)
   if type(opts) ~= "table" then
@@ -120,8 +67,8 @@ function Manager:create_instance(opts)
 
   local root = require("fre.path").absolute(opts.root)
   local effective = self:resolve_instance_config(opts, root)
-  local id = self:allocate_id()
-  local instance = require("fre.instance").new(self, id, root, effective)
+  local id = self._registry:allocate_instance_id()
+  local instance = require("fre.instance").new(self, id, root, effective, self._registry)
   local ok, result = pcall(function()
     self:register(instance)
     return instance:_start_initial_load()
@@ -261,12 +208,6 @@ function Manager:register(instance)
   if not positive_integer(instance.id) then
     fail("instance.id must be a positive integer")
   end
-  if instance.id >= self._next_id then
-    fail("instance.id must be allocated by this manager")
-  end
-  if self._consumed_ids[instance.id] then
-    fail("instance ID was already consumed: " .. instance.id)
-  end
   if not positive_integer(instance.bufnr) then
     fail("instance.bufnr must be a positive integer")
   end
@@ -284,7 +225,6 @@ function Manager:register(instance)
     fail("instance has unknown GC group: " .. tostring(group_name))
   end
 
-  self._consumed_ids[instance.id] = true
   self.instances_by_id[instance.id] = instance
   self.instances_by_buf[instance.bufnr] = instance
   group.instances[instance.id] = instance

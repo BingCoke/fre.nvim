@@ -552,7 +552,7 @@ function Instance:_start_initial_load()
   return self
 end
 
-function Instance.new(manager, id, root, effective)
+function Instance.new(manager, id, root, effective, registry)
   local bufnr = vim.api.nvim_create_buf(false, true)
   local self = setmetatable({
     manager = manager,
@@ -589,10 +589,7 @@ function Instance.new(manager, id, root, effective)
       if key ~= "fre" then vim.b[bufnr][key] = copy(value) end
     end
 
-    self.tree = Tree.new(
-      root, self.id, effective.sort,
-      function(node_id) manager:observe_node_id(node_id) end
-    )
+    self.tree = Tree.new(root, self.id, effective.sort, registry)
     self.buffer = buffer.new({
       id = self.id,
       root = self.root,
@@ -600,7 +597,7 @@ function Instance.new(manager, id, root, effective)
       config = self.config,
       tree = self.tree,
       hidden_file = effective.hidden_file,
-      get_marker_widths = function() return manager:get_marker_widths() end,
+      registry = registry,
       can_reproject = function()
         if self.lifecycle:is_dead() or not self.lifecycle:is_ready() then return false end
         if (self.work and self.work:is_write_active()) or (self.sync and self.sync:is_busy()) then
@@ -614,10 +611,6 @@ function Instance.new(manager, id, root, effective)
           end
         end
         return true
-      end,
-      resolve_buffer_by_id = function(instance_id)
-        local owner = manager:find_by_id(instance_id)
-        return owner and owner.buffer
       end,
       destroyed = function() return self.lifecycle:is_destroyed() end,
       destroying = function() return self.lifecycle:is_destroying() end,
