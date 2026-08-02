@@ -173,4 +173,52 @@ describe("fre manager", function()
     vim.api.nvim_buf_delete(bufnr, { force = true })
   end)
 
+  it("consumes only matching live presentation facts through its User autocmd", function()
+    local manager = manager_module.new()
+    manager:setup({ gc = { ttl_ms = 0, groups = { default = 0, project = 0 } } })
+    local first_buf = vim.api.nvim_create_buf(false, true)
+    local second_buf = vim.api.nvim_create_buf(false, true)
+    local first = instance(manager, first_buf)
+    local second = instance(manager, second_buf)
+    manager:register(first)
+    manager:register(second)
+
+    local function emit(data)
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = "FreInstancePresentationChanged", modeline = false, data = data,
+      })
+    end
+
+    local first_hidden = first.hidden_since
+    local second_hidden = second.hidden_since
+    emit({ instance_id = first.id, bufnr = second.bufnr, visible = true })
+    emit({ instance_id = first.id + 10000, bufnr = first.bufnr, visible = true })
+    emit({ instance_id = first.id, bufnr = first.bufnr + 10000, visible = true })
+    assert.are.equal(first_hidden, first.hidden_since)
+    assert.are.equal(second_hidden, second.hidden_since)
+
+    emit({ instance_id = first.id, bufnr = first.bufnr, visible = true })
+    assert.is_nil(first.hidden_since)
+    assert.are.equal(second_hidden, second.hidden_since)
+
+    emit({ instance_id = first.id, bufnr = first.bufnr, visible = false })
+    assert.is_number(first.hidden_since)
+    local final_hidden = first.hidden_since
+
+    manager.instances_by_id[first.id] = nil
+    emit({ instance_id = first.id, bufnr = first.bufnr, visible = true })
+    assert.are.equal(final_hidden, first.hidden_since)
+    manager.instances_by_id[first.id] = first
+
+    first.is_destroying = function() return true end
+    first.hidden_since = nil
+    emit({ instance_id = first.id, bufnr = first.bufnr, visible = false })
+    assert.is_nil(first.hidden_since)
+
+    manager:remove(first)
+    manager:remove(second)
+    vim.api.nvim_buf_delete(first_buf, { force = true })
+    vim.api.nvim_buf_delete(second_buf, { force = true })
+  end)
+
 end)

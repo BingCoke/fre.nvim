@@ -1,6 +1,5 @@
 local buffer = require("fre.instance.buffer")
 local manager_module = require("fre.manager")
-local view = require("fre.instance.view")
 
 local M = {}
 
@@ -63,7 +62,8 @@ function M.context(expected_buffer, opts)
   end
 
   local winid = vim.api.nvim_get_current_win()
-  local source_view = view.source(instance, winid)
+  local source_view = instance:inspect_view({ winid = winid })
+  if not source_view then fail("current window is not a live Fre View", 2) end
   local cursor = vim.api.nvim_win_get_cursor(winid)
   local mode = vim.api.nvim_get_mode().mode
   local row, col = cursor[1], cursor[2]

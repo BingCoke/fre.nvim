@@ -1,7 +1,6 @@
 local row = require("fre.instance.row")
 local path = require("fre.path")
 local window = require("fre.window")
-local view = require("fre.instance.view")
 
 local function fail(message, level)
   error("fre: " .. message, level or 3)

@@ -151,16 +151,41 @@ describe("fre finite Instance User events", function()
     end)
     local instance = ready({ ["a.txt"] = "a" })
 
+    local first_tab = vim.api.nvim_get_current_tabpage()
     instance:open({ position = "current" })
     instance:open({ position = "current" })
-    instance:hidden()
-    instance:hidden()
+
+    vim.cmd("tabnew")
+    local second_tab = vim.api.nvim_get_current_tabpage()
+    instance:open({ position = "current" })
+    instance:hidden(second_tab)
+    vim.cmd("tabclose")
+
+    vim.api.nvim_set_current_tabpage(first_tab)
+    instance:hidden(first_tab)
+    instance:hidden(first_tab)
     instance:open({ position = "current" })
 
     assert.are.equal(3, #events)
     assert.are.same({ instance_id = instance.id, bufnr = instance.bufnr, visible = true }, events[1])
     assert.are.same({ instance_id = instance.id, bufnr = instance.bufnr, visible = false }, events[2])
     assert.are.same({ instance_id = instance.id, bufnr = instance.bufnr, visible = true }, events[3])
+  end)
+
+  it("publishes one final hidden fact between destroying and destroyed", function()
+    local sequence = {}
+    capture("FreInstanceDestroying", function() sequence[#sequence + 1] = "destroying" end)
+    capture("FreInstancePresentationChanged", function(data)
+      sequence[#sequence + 1] = "presentation:" .. tostring(data.visible)
+    end)
+    capture("FreInstanceDestroyed", function() sequence[#sequence + 1] = "destroyed" end)
+    local instance = ready({ ["a.txt"] = "a" })
+    instance:open({ position = "current" })
+    sequence = {}
+
+    instance:destroy()
+
+    assert.are.same({ "destroying", "presentation:false", "destroyed" }, sequence)
   end)
 
   it("publishes refresh, write, and execution activity boundaries", function()

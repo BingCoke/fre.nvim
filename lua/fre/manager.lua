@@ -25,6 +25,34 @@ local function new_group(capacity)
   }
 end
 
+local next_observer_id = 0
+
+local function observe_presentation(manager)
+  next_observer_id = next_observer_id + 1
+  local group = vim.api.nvim_create_augroup(
+    "FreManagerPresentation" .. tostring(next_observer_id), { clear = true }
+  )
+  vim.api.nvim_create_autocmd("User", {
+    group = group,
+    pattern = "FreInstancePresentationChanged",
+    callback = function(args)
+      local data = args.data
+      if type(data) ~= "table" or not positive_integer(data.instance_id)
+          or not positive_integer(data.bufnr) or type(data.visible) ~= "boolean" then return end
+      local instance = manager.instances_by_id[data.instance_id]
+      if not instance or manager.instances_by_buf[data.bufnr] ~= instance
+          or instance.id ~= data.instance_id or instance.bufnr ~= data.bufnr
+          or instance:is_destroying() or instance:is_destroyed() then return end
+      if data.visible then
+        manager._gc:presentation_enter(instance)
+      else
+        manager._gc:presentation_leave(instance)
+      end
+    end,
+  })
+  return group
+end
+
 function Manager.new(opts)
   opts = opts or {}
   local defaults = config.resolve_setup()
@@ -44,6 +72,7 @@ function Manager.new(opts)
     groups = groups,
   }, Manager)
   self._gc = gc.new(self)
+  self._presentation_augroup = observe_presentation(self)
   if opts.takeover ~= nil then
     self._takeover = opts.takeover(self)
   end
@@ -147,13 +176,6 @@ function Manager:is_gc_eligible(instance)
   return self._gc:is_eligible(instance)
 end
 
-function Manager:gc_presentation_enter(instance)
-  return self._gc:presentation_enter(instance)
-end
-
-function Manager:gc_presentation_leave(instance)
-  return self._gc:presentation_leave(instance)
-end
 
 function Manager:gc_reconsider(instance, deferred)
   if deferred then

@@ -152,11 +152,6 @@ function Instance:_emit_activity(activity, active)
   Events.activity_changed(self.id, self.bufnr, activity, active)
 end
 
-function Instance:_on_presentation_changed(visible)
-  if self.lifecycle:is_dead() or self._event_presented == visible then return end
-  self._event_presented = visible
-  Events.presentation_changed(self.id, self.bufnr, visible)
-end
 
 
 
@@ -283,7 +278,7 @@ function Instance:reveal(snapshot_path)
 
   self._reveal_generation = self._reveal_generation + 1
   local target_tabpage = vim.api.nvim_get_current_tabpage()
-  local target_winid = view.select(self, target_tabpage)
+  local target_winid = view.select(self.view, target_tabpage)
   local request = {
     generation = self._reveal_generation,
     relative = relative,
@@ -400,52 +395,54 @@ function Instance:refresh(opts)
   return nil
 end
 
-function Instance:_on_presentation_leave()
-  if self.lifecycle:is_dead() then return end
-  self.manager:gc_presentation_leave(self)
+function Instance:inspect_view(location)
+  if not self.view then return nil end
+  return view.inspect(self.view, location)
 end
 
-function Instance:_on_presentation_enter()
-  if self.lifecycle:is_dead() then return end
-  if not self.manager:gc_presentation_enter(self) then return end
-  if not self.lifecycle:is_ready() or not self.sync:is_dirty()
-      or self._pending_presentation_refresh or self.sync:is_busy()
-      or vim.bo[self.bufnr].modified or self.work:is_write_active() then return end
-  if self.work:is_execution_active() then return end
-  for _, node in self.tree:iter_nodes() do
-    if node.kind == "directory"
-        and (node.load_state == "loading" or node.load_state == "refreshing") then return end
-  end
-  self._pending_presentation_refresh = true
-  local ok, err = pcall(self.sync.presentation_refresh, self.sync, function(refresh_err)
-    if self.lifecycle:is_dead() then return end
-    self._pending_presentation_refresh = false
-    if refresh_err ~= nil then self:_report_async_error(refresh_err) end
-  end)
-  if not ok then
-    self._pending_presentation_refresh = false
-    self:_report_async_error(err)
-  end
+function Instance:release_view(winid)
+  return view.release(self.view, winid)
+end
+
+function Instance:take_view(source_instance, winid)
+  return view.take(self.view, source_instance.view, winid)
+end
+
+function Instance:adopt_view(winid, presentation)
+  return view.adopt(self.view, winid, presentation)
+end
+
+function Instance:place_initial_cursor(winid)
+  view.place_initial_cursor(self.view, winid)
+  return self
+end
+
+function Instance:capture_view_errors()
+  return view.capture_errors(self.view)
+end
+
+function Instance:sync_view(opts)
+  return view.sync(self.view, opts)
 end
 
 function Instance:open(layout)
   if self.lifecycle:is_dead() then fail("instance is destroyed", 2) end
-  return self, view.open(self, layout)
+  return self, view.open(self.view, layout)
 end
 
 function Instance:hidden(tabpage)
   if self.lifecycle:is_dead() then fail("instance is destroyed", 2) end
-  return view.hidden(self, tabpage)
+  return view.hidden(self.view, tabpage)
 end
 
 function Instance:hide_all()
   if self.lifecycle:is_dead() then fail("instance is destroyed", 2) end
-  return view.hide_all(self)
+  return view.hide_all(self.view)
 end
 
 function Instance:toggle(layout)
   if self.lifecycle:is_dead() then fail("instance is destroyed", 2) end
-  local result = view.toggle(self, layout)
+  local result = view.toggle(self.view, layout)
   return type(result) == "number" and self or result
 end
 
@@ -463,11 +460,11 @@ function Instance:_start_destroy()
   if not self.lifecycle:begin_destroy() then return false end
   Events.destroying(self.id, self.bufnr)
   local manager = self.manager
-  pcall(view.hide_all, self)
+  pcall(view.hide_all, self.view)
+  view.destroy(self.view)
   manager:get_gc_controller():stop(self)
   self.buffer:clear_initial_cursors()
   self._reveal_generation = self._reveal_generation + 1
-  self._pending_presentation_refresh = false
   if self.work then pcall(self.work.destroy, self.work) end
   if self.sync then pcall(self.sync.destroy, self.sync) end
   if self.tree then self.tree:invalidate_loads(self.tree:root_node()) end
@@ -572,9 +569,14 @@ function Instance.new(manager, id, root, effective, registry)
       schedule = vim.schedule,
       emit_ready = function(err, result) self:_emit_ready(err, result) end,
     })
-    self._event_presented = false
-    self._pending_presentation_refresh = false
     self._reveal_generation = 0
+    self.view = view.new({
+      id = self.id,
+      bufnr = self.bufnr,
+      lifecycle = self.lifecycle,
+      layout = self.config.layout,
+      window_options = self.config.window.options,
+    })
 
     vim.api.nvim_buf_set_name(bufnr, "fre://" .. tostring(self.id))
     for key, value in pairs(required_options) do
@@ -620,11 +622,9 @@ function Instance.new(manager, id, root, effective, registry)
       end,
       destroyed = function() return self.lifecycle:is_destroyed() end,
       destroying = function() return self.lifecycle:is_destroying() end,
-      list_views = function(tabpage) return view.list(self, tabpage) end,
-      apply_window = function(_, winid)
-        return require("fre.window").apply(self, winid)
-      end,
-      sync_views = function(_, opts) return view.sync(self, opts) end,
+      list_views = function(tabpage) return view.list(self.view, tabpage) end,
+      apply_window = function(_, winid) return view.apply_window(self.view, winid) end,
+      sync_views = function(_, opts) return view.sync(self.view, opts) end,
       request_write = function(ctx)
         ctx.instance = self
         return require("fre.actions").write(ctx)
@@ -652,13 +652,13 @@ function Instance.new(manager, id, root, effective, registry)
       is_execution_active = function()
         return self.work and self.work:is_execution_active() or false
       end,
-      is_presented = function() return view.has_active(self) end,
+      is_presented = function() return view.has_active(self.view) end,
       on_refresh_activity = function(active) self:_emit_activity("refresh", active) end,
       on_initial_complete = function(err, value, real_root, on_complete)
         self:_complete_initial_load(err, value, real_root, on_complete)
       end,
       report_error = function(err) self:_report_async_error(err) end,
-      on_followup_needed = function() self:_on_presentation_enter() end,
+      on_followup_needed = function() view.refresh_if_presented(self.view) end,
       watch_adapter = manager:get_watch_adapter(),
     })
     self.work = Work.new({
@@ -674,6 +674,12 @@ function Instance.new(manager, id, root, effective, registry)
       reconsider_gc = function(deferred) return manager:gc_reconsider(self, deferred) end,
       on_activity = function(activity, active) self:_emit_activity(activity, active) end,
       report_error = function(err) return self:_report_async_error(err) end,
+    })
+    view.attach(self.view, {
+      buffer = self.buffer,
+      sync = self.sync,
+      tree = self.tree,
+      work = self.work,
     })
     self.buffer:setup()
     return self

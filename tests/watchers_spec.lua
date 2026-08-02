@@ -485,7 +485,7 @@ describe("fre ticket 15 directory watchers", function()
       function(instance) instance.work:_release_write(request) end)
   end)
 
-  it("performs one pending full refresh on the first managed presentation enter", function()
+  it("performs one pending full refresh on presentation without Manager registration", function()
     local counts = loader_counts()
     local instance = ready({ ["dir/old.txt"] = "old" })
     instance:expand("dir")
@@ -497,8 +497,13 @@ describe("fre ticket 15 directory watchers", function()
     watcher:emit(instance.root, nil, "ignored")
     watcher:fire(instance.root)
     wait_for(function() return instance.sync:is_dirty() end)
+    local manager = instance.manager
+    manager.instances_by_id[instance.id] = nil
+    manager.instances_by_buf[instance.bufnr] = nil
     instance:open()
     instance:open()
+    manager.instances_by_id[instance.id] = instance
+    manager.instances_by_buf[instance.bufnr] = instance
     wait_for(function()
       return not instance.sync:is_dirty() and instance:get_pos("root-new.txt") ~= nil
         and instance:get_pos("dir/new.txt") ~= nil
@@ -507,7 +512,6 @@ describe("fre ticket 15 directory watchers", function()
     assert.are.equal("ready", instance:status())
     assert.are.equal(1, counts[instance.root])
     assert.are.equal(1, counts[fixture:path("dir")])
-    assert.is_false(instance._pending_presentation_refresh)
   end)
 
   it("follows a public refresh when an event arrives after its boundary scan", function()
@@ -544,7 +548,6 @@ describe("fre ticket 15 directory watchers", function()
     assert.are.equal(1, callbacks)
     assert.are.equal(2, counts[instance.root])
     assert.are.equal(2, counts[directory])
-    assert.is_false(instance._pending_presentation_refresh)
   end)
 
   it("follows write reconciliation after a post-scan event and unlocks once", function()
@@ -586,7 +589,6 @@ describe("fre ticket 15 directory watchers", function()
     assert.are.equal(2, counts[instance.root])
     assert.are.equal(2, counts[directory])
     assert.is_false(instance.work:is_write_active())
-    assert.is_false(instance._pending_presentation_refresh)
   end)
 
   it("reports each failed handle once, stops it, and recreates after refresh", function()

@@ -1,9 +1,7 @@
-local buffer = require("fre.instance.buffer")
 local config = require("fre.config")
 local Work = require("fre.instance.work")
 local mapping = require("fre.mapping")
 local path = require("fre.path")
-local view = require("fre.instance.view")
 local window = require("fre.window")
 
 local M = {}
@@ -81,12 +79,20 @@ local function validate_source(ctx, instance)
   end
 end
 
-local function capture_target(_, winid)
+local function capture_source(instance, ctx)
+  instance:inspect_view({ winid = ctx.winid })
+end
+
+local function capture_target(instance, winid)
   validate_target(winid)
+  local bufnr = vim.api.nvim_win_get_buf(winid)
+  local owner = bufnr == instance.bufnr and instance or require("fre").get_instance(bufnr)
+  if owner then owner:inspect_view({ winid = winid }) end
   return {
     winid = winid,
     tabpage = vim.api.nvim_win_get_tabpage(winid),
-    bufnr = vim.api.nvim_win_get_buf(winid),
+    bufnr = bufnr,
+    owner = owner,
   }
 end
 
@@ -243,7 +249,7 @@ local function install_selection(instance, prepared, captured)
 end
 
 local function capture_enter_errors(prepared)
-  if prepared.kind == "child" then return view.capture_errors(prepared.child) end
+  if prepared.kind == "child" then return prepared.child:capture_view_errors() end
   return function() return nil end
 end
 
@@ -251,29 +257,37 @@ local function append_error(errors, err)
   if err ~= nil then errors[#errors + 1] = tostring(err) end
 end
 
-local function sync_error(instance, errors)
-  local ok, err = pcall(view.sync, instance)
-  if not ok then append_error(errors, err) end
-end
-
 local function commit_selection(instance, target, prepared, captured, previous, destination)
   local errors = {}
   if prepared.kind == "file" then
-    sync_error(instance, errors)
+    if captured.owner then
+      local ok, err = pcall(captured.owner.release_view, captured.owner, captured.winid)
+      if not ok then append_error(errors, err) end
+    end
     return prepared.bufnr, errors
   end
   local child = prepared.child
-  if destination then
-    view.track_created(
-      captured.winid, destination.layout, destination.origin_winid, destination.mode
-    )
-  else
-    view.track_current(captured.winid, previous and previous.bufnr or nil)
-  end
-  buffer.place_initial_cursor(child.buffer, captured.winid)
+  local ownership_ok, ownership_err = pcall(function()
+    if captured.owner then
+      child:take_view(captured.owner, captured.winid)
+    elseif destination then
+      child:adopt_view(captured.winid, {
+        layout = destination.layout,
+        origin_winid = destination.origin_winid,
+        mode = destination.mode or "close",
+      })
+    else
+      child:adopt_view(captured.winid, {
+        layout = { position = "current" },
+        origin_winid = captured.winid,
+        mode = "restore",
+        previous_bufnr = previous and previous.bufnr or nil,
+      })
+    end
+  end)
+  if not ownership_ok then append_error(errors, ownership_err) end
+  child:place_initial_cursor(captured.winid)
   if target.cursor then child:set_cursor_to_path(target.cursor, captured.winid) end
-  sync_error(instance, errors)
-  sync_error(child, errors)
   return child, errors
 end
 
@@ -399,6 +413,7 @@ function M.select(ctx, opts)
   local target = selection_target(ctx, instance)
   local hide_source = validate_selection_options(opts, target, "select")
   validate_source(ctx, instance)
+  capture_source(instance, ctx)
   local captured = capture_target(instance, opts.target_winid or ctx.winid)
   if target.kind == "noop" then return nil end
 
@@ -422,6 +437,7 @@ function M.tab_select(ctx, opts)
   local target = selection_target(ctx, instance)
   local hide_source = validate_selection_options(opts, target, "tab_select")
   validate_source(ctx, instance)
+  capture_source(instance, ctx)
   if target.kind == "noop" then return nil end
 
   local prepared = prepare_selection(instance, target, opts.instance)
@@ -465,6 +481,7 @@ function M.split_select(ctx, opts)
   local target = selection_target(ctx, instance)
   local hide_source = validate_selection_options(opts, target, "split_select")
   validate_source(ctx, instance)
+  capture_source(instance, ctx)
   local anchor = split_anchor(ctx, opts.anchor_winid)
   local normalized, effective = window.prepare_split(opts.layout, anchor)
   if target.kind == "noop" then return nil end

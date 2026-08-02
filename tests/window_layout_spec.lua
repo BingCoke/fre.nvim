@@ -1,4 +1,5 @@
 local fre = require("fre")
+local instance_view = require("fre.instance.view")
 local fs = require("tests.helpers.fs")
 
 local fixture
@@ -567,60 +568,26 @@ describe("fre editor-derived Views", function()
   it("reconciles a noautocmd View before reusing it through open", function()
     local instance = ready()
     local winid = vim.api.nvim_get_current_win()
-    assert.is_not_nil(instance.hidden_since)
+    assert.is_nil(fre.view.inspect(instance))
     vim.cmd("noautocmd buffer " .. tostring(instance.bufnr))
     assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(winid))
-    assert.is_not_nil(instance.hidden_since)
 
     assert.are.equal(winid, open_view(instance))
-    assert.is_nil(instance.hidden_since)
+    assert.are.equal(winid, assert(fre.view.inspect(instance)).winid)
   end)
 
-  it("focuses a reused noncurrent View before surfacing its enter failure", function()
+  it("focuses a reused noncurrent View without a Manager callback seam", function()
     local instance = ready()
     local caller = vim.api.nvim_get_current_win()
     vim.cmd("vsplit")
     local target = vim.api.nvim_get_current_win()
     vim.cmd("noautocmd buffer " .. tostring(instance.bufnr))
     vim.api.nvim_set_current_win(caller)
-    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(target))
-    assert.are_not.equal(target, vim.api.nvim_get_current_win())
-    assert.is_not_nil(instance.hidden_since)
 
-    local original = instance._on_presentation_enter
-    instance._on_presentation_enter = function()
-      error("injected noncurrent open presentation failure")
-    end
-    local ok, err = pcall(instance.open, instance)
-    instance._on_presentation_enter = original
-
-    assert.is_false(ok)
-    assert.is_truthy(tostring(err):find(
-      "injected noncurrent open presentation failure", 1, true
-    ))
+    assert.are.equal(target, open_view(instance))
     assert.are.equal(target, vim.api.nvim_get_current_win())
     assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(target))
-    assert.is_nil(instance.hidden_since)
     assert.are.equal(target, assert(fre.view.inspect(instance)).winid)
-  end)
-
-  it("surfaces an explicit open enter failure after keeping the View committed", function()
-    local instance = ready()
-    local original = instance._on_presentation_enter
-    instance._on_presentation_enter = function()
-      error("injected explicit open presentation failure")
-    end
-
-    local ok, err = pcall(instance.open, instance, { position = "current" })
-    instance._on_presentation_enter = original
-    assert.is_false(ok)
-    assert.is_truthy(tostring(err):find(
-      "injected explicit open presentation failure", 1, true
-    ))
-    local inspected = assert(fre.view.inspect(instance))
-    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(inspected.winid))
-    assert.are.equal(inspected.winid, vim.api.nvim_get_current_win())
-    assert.is_nil(instance.hidden_since)
   end)
 
   it("discards malformed exact policy and hides with conservative View behavior", function()
@@ -724,4 +691,63 @@ describe("fre editor-derived Views", function()
       "number", { scope = "local", win = winid }
     ))
   end)
+
+  it("constructs View without parent or management callback capabilities", function()
+    local lifecycle = { is_dead = function() return false end }
+    local configured_layout = { position = "right", size = 20 }
+    local configured_options = { number = true }
+    local state = instance_view.new({
+      id = 91,
+      bufnr = 37,
+      lifecycle = lifecycle,
+      layout = configured_layout,
+      window_options = configured_options,
+    })
+    configured_layout.size = 99
+    configured_options.number = false
+
+    assert.are.equal(91, state.id)
+    assert.are.equal(37, state.bufnr)
+    assert.are.equal(lifecycle, state.lifecycle)
+    assert.are.same({ position = "right", size = 20 }, state.default_layout)
+    assert.are.same({ number = true }, state.window_options)
+    for _, key in ipairs({
+      "instance", "parent", "manager", "gc", "context",
+      "gc_presentation_enter", "gc_presentation_leave", "gc_reconsider",
+      "report_async_error",
+    }) do
+      assert.is_nil(state[key], key .. " must not be retained by View")
+    end
+    for key, value in pairs(state) do
+      assert.are_not.equal("function", type(value), key .. " retained a callback capability")
+    end
+  end)
+  it("delegates public inspection through the Instance presentation operation", function()
+    local location = { winid = 91 }
+    local calls = {}
+    local fake = {
+      inspect_view = function(self, actual)
+        calls[#calls + 1] = actual
+        return { winid = self.winid }
+      end,
+      winid = 37,
+    }
+    assert.are.same({ winid = 37 }, fre.view.inspect(fake, location))
+    assert.are.same({ location }, calls)
+  end)
+
+  it("keeps presentation truth when Manager registration is temporarily absent", function()
+    local instance = ready()
+    local winid = open_view(instance, { position = "current" })
+    local manager = instance.manager
+    local by_id = manager.instances_by_id[instance.id]
+    local by_buf = manager.instances_by_buf[instance.bufnr]
+    manager.instances_by_id[instance.id] = nil
+    manager.instances_by_buf[instance.bufnr] = nil
+    local inspected = fre.view.inspect(instance)
+    manager.instances_by_id[instance.id] = by_id
+    manager.instances_by_buf[instance.bufnr] = by_buf
+    assert.are.equal(winid, inspected.winid)
+  end)
+
 end)

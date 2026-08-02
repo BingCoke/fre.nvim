@@ -1,3 +1,4 @@
+local Events = require("fre.instance.events")
 local layout = require("fre.layout")
 local window = require("fre.window")
 
@@ -14,14 +15,43 @@ local function copy(value)
   return vim.deepcopy(value)
 end
 
-local function live_instance(instance)
-  return type(instance) == "table"
-    and not instance:is_destroying()
-    and not instance:is_destroyed()
-    and type(instance.bufnr) == "number"
-    and vim.api.nvim_buf_is_valid(instance.bufnr)
-    and instance.manager
-    and instance.manager:find_by_buf(instance.bufnr) == instance
+function M.new(options)
+  options = options or {}
+  return {
+    id = assert(options.id),
+    bufnr = assert(options.bufnr),
+    lifecycle = assert(options.lifecycle),
+    default_layout = copy(options.layout),
+    window_options = copy(options.window_options or {}),
+    buffer = options.buffer,
+    sync = options.sync,
+    tree = options.tree,
+    work = options.work,
+    records = {},
+    released = {},
+    presented = false,
+    pending_refresh = false,
+  }
+end
+
+local function state(view)
+  return type(view) == "table" and view or nil
+end
+
+local function subject(view)
+  local current = assert(state(view))
+  return {
+    bufnr = current.bufnr,
+    config = { window = { options = current.window_options } },
+  }
+end
+
+local function live_instance(view)
+  local current = state(view)
+  return current ~= nil
+    and not current.lifecycle:is_dead()
+    and type(current.bufnr) == "number"
+    and vim.api.nvim_buf_is_valid(current.bufnr)
 end
 
 local function valid_window(winid)
@@ -192,21 +222,77 @@ local function snapshot(record)
   }
 end
 
-local function records(instance, tabpage)
-  local result = {}
-  for _, winid in ipairs(actual_windows(instance, tabpage)) do
-    local record = describe(instance, winid)
-    if record then result[#result + 1] = record end
+local function forget(instance, winid)
+  local current = state(instance)
+  if not current then return end
+  for tab, tab_records in pairs(current.records) do
+    tab_records[winid] = nil
+    if next(tab_records) == nil then current.records[tab] = nil end
   end
+end
+
+local function remember(instance, record)
+  local current = assert(state(instance))
+  current.released[record.winid] = nil
+  local tab_records = current.records[record.tabpage]
+  if not tab_records then
+    tab_records = {}
+    current.records[record.tabpage] = tab_records
+  end
+  tab_records[record.winid] = copy(record)
+  return tab_records[record.winid]
+end
+
+local function stored(instance, winid)
+  local current = state(instance)
+  if not current then return nil end
+  for _, tab_records in pairs(current.records) do
+    if tab_records[winid] then return copy(tab_records[winid]) end
+  end
+  return nil
+end
+
+local function records(instance, tabpage)
+  local current = state(instance)
+  if not current then return {} end
+  local result = {}
+  local actual = {}
+  for _, winid in ipairs(actual_windows(instance, tabpage)) do
+    actual[winid] = true
+    if current.released[winid] == current.bufnr then
+      -- An explicit release is authoritative until the window stops displaying this buffer.
+    else
+      local record = describe(instance, winid)
+      if record then
+        remember(instance, record)
+        result[#result + 1] = record
+      end
+    end
+  end
+  for released_winid, released_bufnr in pairs(current.released) do
+    if not valid_window(released_winid)
+        or vim.api.nvim_win_get_buf(released_winid) ~= released_bufnr then
+      current.released[released_winid] = nil
+    end
+  end
+  local requested_tab = tabpage ~= nil and normalize_tabpage(tabpage) or nil
+  for tracked_tab, tab_records in pairs(current.records) do
+    for winid in pairs(tab_records) do
+      local invalid_tab = not vim.api.nvim_tabpage_is_valid(tracked_tab)
+      local in_scope = tabpage == nil or tracked_tab == requested_tab
+      if invalid_tab or (in_scope and not actual[winid]) then forget(instance, winid) end
+    end
+  end
+  table.sort(result, function(left, right) return left.winid < right.winid end)
   return result
 end
 
-local function report(instance, message)
-  if type(instance._report_async_error) == "function" then
-    pcall(instance._report_async_error, instance, message)
-  else
-    pcall(vim.notify, "fre: " .. tostring(message), vim.log.levels.ERROR)
-  end
+local function report_async_error(message)
+  local text = "fre: " .. tostring(message)
+  local ok = pcall(vim.schedule, function()
+    pcall(vim.notify, text, vim.log.levels.ERROR)
+  end)
+  if not ok then pcall(vim.notify, text, vim.log.levels.ERROR) end
 end
 
 local error_scopes = setmetatable({}, { __mode = "k" })
@@ -231,54 +317,47 @@ function M.capture_errors(instance)
   end
 end
 
-function M.sync(instance, opts)
-  opts = opts or {}
-  if not live_instance(instance) then return false end
-  local visible = #actual_windows(instance) > 0
-  instance:_on_presentation_changed(visible)
-  local transition
-  if visible and instance.hidden_since ~= nil then
-    transition = instance._on_presentation_enter
-  elseif not visible and instance.hidden_since == nil then
-    transition = instance._on_presentation_leave
+function M.attach(view, dependencies)
+  local current = assert(state(view))
+  for _, key in ipairs({ "buffer", "sync", "tree", "work" }) do
+    if dependencies[key] ~= nil then current[key] = dependencies[key] end
   end
-  if not transition then return visible end
+end
 
-  local ok, err = pcall(transition, instance)
-  if not ok then
-    local lifecycle_ok, lifecycle_err
-    if visible then
-      lifecycle_ok, lifecycle_err = pcall(
-        instance.manager.gc_presentation_enter, instance.manager, instance
-      )
-    else
-      lifecycle_ok, lifecycle_err = pcall(
-        instance.manager.gc_presentation_leave, instance.manager, instance
-      )
-    end
-    if not lifecycle_ok then
-      err = tostring(err) .. "; lifecycle sync failed: " .. tostring(lifecycle_err)
-      pcall(instance.manager.gc_reconsider, instance.manager, instance, true)
-    end
-    if opts.report then
-      local message = "presentation synchronization failed: " .. tostring(err)
-      local stack = error_scopes[instance]
-      if stack and stack[#stack] then
-        local captured = stack[#stack]
-        captured[#captured + 1] = message
-      else
-        local scheduled, schedule_err = pcall(vim.schedule, function()
-          if not instance:is_destroying() and not instance:is_destroyed() then report(instance, message) end
-        end)
-        if not scheduled then
-          instance._last_async_error = message
-            .. "; error scheduling failed: " .. tostring(schedule_err)
-        end
-      end
-    else
-      error(err, 0)
-    end
+function M.refresh_if_presented(view)
+  local current = state(view)
+  if not current or current.lifecycle:is_dead() or not current.presented then return end
+  local sync = current.sync
+  local work = current.work
+  local tree = current.tree
+  if not sync or not work or not tree or not current.lifecycle:is_ready()
+      or not sync:is_dirty() or current.pending_refresh or sync:is_busy()
+      or vim.bo[current.bufnr].modified or work:is_write_active()
+      or work:is_execution_active() then return end
+  for _, node in tree:iter_nodes() do
+    if node.kind == "directory"
+        and (node.load_state == "loading" or node.load_state == "refreshing") then return end
   end
+  current.pending_refresh = true
+  local ok, err = pcall(sync.presentation_refresh, sync, function(refresh_err)
+    if current.lifecycle:is_dead() then return end
+    current.pending_refresh = false
+    if refresh_err ~= nil then report_async_error(refresh_err) end
+  end)
+  if not ok then
+    current.pending_refresh = false
+    report_async_error(err)
+  end
+end
+
+function M.sync(view, _)
+  if not live_instance(view) then return false end
+  local current = assert(state(view))
+  local visible = #records(view) > 0
+  if current.presented == visible then return visible end
+  current.presented = visible
+  Events.presentation_changed(current.id, current.bufnr, visible)
+  if visible then M.refresh_if_presented(view) end
   return visible
 end
 
@@ -294,7 +373,10 @@ end
 
 function M.source(instance, winid)
   if not live_instance(instance) then fail("instance is not live", 3) end
-  local record = describe(instance, winid)
+  local record
+  for _, candidate in ipairs(records(instance)) do
+    if candidate.winid == winid then record = candidate; break end
+  end
   if not record then fail("window does not display this instance", 3) end
   M.sync(instance)
   return snapshot(record)
@@ -313,7 +395,12 @@ local function inspect_location(instance, location)
     tabpage = normalize_tabpage(location)
     if not tabpage then return nil end
   end
-  if exact_winid then return describe(instance, exact_winid) end
+  if exact_winid then
+    for _, record in ipairs(records(instance)) do
+      if record.winid == exact_winid then return record end
+    end
+    return nil
+  end
   local found = records(instance, tabpage)
   if #found == 0 then return nil end
   local current = vim.api.nvim_get_current_win()
@@ -365,24 +452,86 @@ function M.select(instance, tabpage)
 end
 
 function M.has_active(instance)
-  return live_instance(instance) and #actual_windows(instance) > 0
+  return live_instance(instance) and #records(instance) > 0
 end
 
-function M.track_created(winid, layout, origin_winid, mode)
-  return set_policy(winid, {
-    layout = layout,
+function M.adopt(instance, winid, presentation)
+  if not live_instance(instance) then fail("instance is not live", 3) end
+  if not displays(instance, winid) then fail("window does not display this instance", 3) end
+  presentation = presentation or {
+    layout = { position = "current" },
+    origin_winid = winid,
+    mode = "restore",
+    previous_bufnr = alternate_buffer(winid, instance.bufnr),
+  }
+  set_policy(winid, {
+    layout = presentation.layout,
+    origin_winid = presentation.origin_winid,
+    mode = presentation.mode or "restore",
+    previous_bufnr = presentation.previous_bufnr,
+  }, false)
+  local record = assert(describe(instance, winid))
+  remember(instance, record)
+  M.sync(instance)
+  return snapshot(record)
+end
+
+function M.release(instance, winid)
+  local current = state(instance)
+  if not current then return false end
+  local record = stored(instance, winid)
+  forget(instance, winid)
+  if valid_window(winid) and vim.api.nvim_win_get_buf(winid) == current.bufnr then
+    current.released[winid] = current.bufnr
+  else
+    current.released[winid] = nil
+  end
+  if live_instance(instance) then M.sync(instance) end
+  return record ~= nil
+end
+
+function M.take(instance, source_instance, winid)
+  if not live_instance(instance) then fail("instance is not live", 3) end
+  local record = stored(source_instance, winid)
+  if not record then
+    local tracked = policy(winid)
+    if tracked then
+      record = {
+        winid = winid,
+        tabpage = vim.api.nvim_win_get_tabpage(winid),
+        origin_winid = tracked.origin_winid,
+        layout = copy(tracked.layout),
+        mode = tracked.mode,
+        previous_bufnr = tracked.previous_bufnr,
+        managed = true,
+      }
+    end
+  end
+  if not record then fail("source View is not managed", 3) end
+  M.release(source_instance, winid)
+  return M.adopt(instance, winid, record)
+end
+
+function M.track_created(instance, winid, requested_layout, origin_winid, mode)
+  return M.adopt(instance, winid, {
+    layout = requested_layout,
     origin_winid = origin_winid,
     mode = mode or "close",
-  }, false)
+  })
 end
 
-function M.track_current(winid, previous_bufnr)
-  return set_policy(winid, {
+function M.track_current(instance, winid, previous_bufnr)
+  return M.adopt(instance, winid, {
     layout = { position = "current" },
     origin_winid = winid,
     mode = "restore",
     previous_bufnr = previous_bufnr,
-  }, true)
+  })
+end
+
+function M.place_initial_cursor(instance, winid)
+  local current = assert(state(instance))
+  return require("fre.instance.buffer").place_initial_cursor(current.buffer, winid)
 end
 
 local function focus(winid)
@@ -394,8 +543,9 @@ end
 
 local function removal_error(instance, record)
   clear_policy(record.winid)
+  forget(instance, record.winid)
   local ok, err = window.remove(
-    instance, record.winid, record.mode, record.previous_bufnr
+    subject(instance), record.winid, record.mode, record.previous_bufnr
   )
   if ok then return nil end
   return err or "failed to remove View"
@@ -410,15 +560,17 @@ function M.open(instance, requested)
 
   if selected and requested == nil then
     focus(selected.winid)
-    window.apply(instance, selected.winid)
+    window.apply(subject(instance), selected.winid)
     M.sync(instance)
     return selected.winid
   end
 
-  if requested == nil then normalized, effective = window.prepare(instance.config.layout) end
+  if requested == nil then
+    normalized, effective = window.prepare(assert(state(instance)).default_layout)
+  end
   if selected and vim.deep_equal(selected.layout, normalized) then
     focus(selected.winid)
-    window.apply(instance, selected.winid)
+    window.apply(subject(instance), selected.winid)
     M.sync(instance)
     return selected.winid
   end
@@ -453,7 +605,7 @@ function M.open(instance, requested)
   local saved = selected and window.save_view(selected.winid) or nil
   local finish_capture = M.capture_errors(instance)
   local created, winid, previous = pcall(
-    window.create, instance, normalized, effective, anchor
+    window.create, subject(instance), normalized, effective, anchor
   )
   local enter_err = finish_capture()
   if not created then error(winid, 0) end
@@ -480,9 +632,10 @@ function M.open(instance, requested)
     }, false)
   end)
   if not policy_ok then
-    window.remove(instance, winid, cleanup_mode, previous and previous.bufnr or nil)
+    window.remove(subject(instance), winid, cleanup_mode, previous and previous.bufnr or nil)
     error(policy_err, 0)
   end
+  remember(instance, assert(describe(instance, winid)))
   window.restore_view(winid, saved)
 
   local remove_err
@@ -492,14 +645,18 @@ function M.open(instance, requested)
     )
     if not fixed_ok then
       clear_policy(winid)
-      window.remove(instance, winid, cleanup_mode, previous and previous.bufnr or nil)
+      forget(instance, winid)
+      window.remove(subject(instance), winid, cleanup_mode, previous and previous.bufnr or nil)
       focus(selected.winid)
       error(fixed_option, 0)
     end
     if selected.mode == "tab" then
       clear_policy(selected.winid)
+      forget(instance, selected.winid)
       local retire_mode = selected.layout.position == "current" and "restore" or "close"
-      local retired, retire_err = window.remove(instance, selected.winid, retire_mode, nil)
+      local retired, retire_err = window.remove(
+        subject(instance), selected.winid, retire_mode, nil
+      )
       if not retired then remove_err = retire_err end
     else
       remove_err = removal_error(instance, selected)
@@ -541,7 +698,10 @@ end
 function M.hidden(instance, tabpage)
   if not live_instance(instance) then fail("instance is not live", 2) end
   tabpage = normalize_tabpage(tabpage)
-  if not tabpage then return true end
+  if not tabpage then
+    pcall(M.sync, instance, { report = true })
+    return true
+  end
   return hide_records(instance, records(instance, tabpage))
 end
 
@@ -560,20 +720,34 @@ end
 function M.takeover(instance, winid)
   if not live_instance(instance) then fail("instance is not live", 2) end
   if not valid_window(winid) then fail("target window is not valid", 2) end
-  local existing = policy(winid)
   local previous_bufnr = vim.api.nvim_win_get_buf(winid)
-  if not existing then M.track_current(winid, previous_bufnr) end
   local finish_capture = M.capture_errors(instance)
-  local ok, previous = pcall(window.install, instance, winid)
+  local ok, previous = pcall(window.install, subject(instance), winid)
   local enter_err = finish_capture()
-  if not ok then
-    if not existing then clear_policy(winid) end
-    error(previous, 0)
-  end
-  require("fre.instance.buffer").place_initial_cursor(instance, winid)
-  M.sync(instance)
+  if not ok then error(previous, 0) end
+  M.track_current(instance, winid, previous_bufnr)
+  M.place_initial_cursor(instance, winid)
   if enter_err then error(enter_err, 0) end
   return winid
+end
+
+function M.apply_window(instance, winid)
+  return window.apply(subject(instance), winid)
+end
+
+function M.destroy(instance)
+  local current = state(instance)
+  if not current then return end
+  if current.presented then
+    current.presented = false
+    Events.presentation_changed(current.id, current.bufnr, false)
+  end
+  for _, tab_records in pairs(current.records) do
+    for winid in pairs(tab_records) do clear_policy(winid) end
+  end
+  current.records = {}
+  current.released = {}
+  current.pending_refresh = false
 end
 
 return M

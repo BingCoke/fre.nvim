@@ -67,9 +67,8 @@ function Controller:_buffer_is_visible(instance)
 end
 
 function Controller:_sync_visibility(instance)
-  local ok, view = pcall(require, "fre.instance.view")
-  if ok and type(view.sync) == "function" then
-    pcall(view.sync, instance, { report = true })
+  if type(instance.sync_view) == "function" then
+    pcall(instance.sync_view, instance, { report = true })
   end
 end
 

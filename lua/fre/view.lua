@@ -1,9 +1,7 @@
-local view = require("fre.instance.view")
-
 local M = {}
 
 function M.inspect(instance, location)
-  return view.inspect(instance, location)
+  return instance:inspect_view(location)
 end
 
 return M

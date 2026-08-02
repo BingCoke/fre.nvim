@@ -756,6 +756,95 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_nil(fre.view.inspect(child, source_tab))
   end)
 
+  it("transfers noautocmd external split and float Views while source lookup is absent", function()
+    for _, kind in ipairs({ "split", "float" }) do
+      pcall(vim.cmd, "silent! only")
+      local instance = ready({ ["dir/child.txt"] = "x" })
+      local previous_buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_buf_set_lines(previous_buf, 0, -1, false, { kind .. " previous" })
+      local source_win
+      if kind == "split" then
+        vim.cmd("vsplit")
+        source_win = vim.api.nvim_get_current_win()
+        vim.api.nvim_win_set_buf(source_win, previous_buf)
+      else
+        source_win = vim.api.nvim_open_win(previous_buf, true, {
+          relative = "editor", width = 29, height = 7, row = 2, col = 5,
+          border = "single", noautocmd = true,
+        })
+      end
+      vim.cmd("noautocmd buffer " .. tostring(instance.bufnr))
+      vim.api.nvim_win_set_cursor(source_win, { row_for(instance, "dir"), 0 })
+      local ctx = actions.context()
+      local expected_view = { winid = source_win }
+      if kind == "split" then
+        expected_view.origin_winid = source_win
+        expected_view.layout = { position = "current" }
+      else
+        local config = vim.api.nvim_win_get_config(source_win)
+        expected_view.layout = {
+          position = "float", width = config.width, height = config.height,
+          row = config.row, col = config.col, border = vim.deepcopy(config.border),
+        }
+      end
+      local manager = instance.manager
+      manager.instances_by_id[instance.id] = nil
+      manager.instances_by_buf[instance.bufnr] = nil
+
+      local ok, child = pcall(actions.select, ctx)
+      manager.instances_by_id[instance.id] = instance
+      manager.instances_by_buf[instance.bufnr] = instance
+      assert.is_true(ok, tostring(child))
+
+      assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(source_win))
+      assert.is_nil(fre.view.inspect(instance, { winid = source_win }))
+      assert.are.same(expected_view, fre.view.inspect(child, { winid = source_win }))
+      child:hidden(ctx.tabpage)
+      assert.is_true(vim.api.nvim_win_is_valid(source_win))
+      assert.are.equal(previous_buf, vim.api.nvim_win_get_buf(source_win))
+      child:destroy()
+      instance:destroy()
+      if vim.api.nvim_win_is_valid(source_win) and kind == "float" then
+        vim.api.nvim_win_close(source_win, true)
+      end
+    end
+  end)
+
+  it("captures a distinct noautocmd target owner through default managed lookup", function()
+    local instance = ready({ ["dir/child.txt"] = "x" })
+    local ctx = context_for(instance, "dir")
+    local target_owner = ready({ ["other.txt"] = "other" })
+    local previous_buf = vim.api.nvim_create_buf(false, true)
+    local target_win = vim.api.nvim_open_win(previous_buf, false, {
+      relative = "editor", width = 27, height = 6, row = 4, col = 8,
+      border = "double", noautocmd = true,
+    })
+    vim.api.nvim_win_call(target_win, function()
+      vim.cmd("noautocmd buffer " .. tostring(target_owner.bufnr))
+    end)
+    local config = vim.api.nvim_win_get_config(target_win)
+    local expected_view = {
+      winid = target_win,
+      layout = {
+        position = "float", width = config.width, height = config.height,
+        row = config.row, col = config.col, border = vim.deepcopy(config.border),
+      },
+    }
+
+    local child = actions.select(ctx, { target_winid = target_win })
+
+    assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(target_win))
+    assert.is_nil(fre.view.inspect(target_owner, { winid = target_win }))
+    assert.are.same(expected_view, fre.view.inspect(child, { winid = target_win }))
+    child:hidden(ctx.tabpage)
+    assert.is_true(vim.api.nvim_win_is_valid(target_win))
+    assert.are.equal(previous_buf, vim.api.nvim_win_get_buf(target_win))
+    child:destroy()
+    target_owner:destroy()
+    instance:destroy()
+    if vim.api.nvim_win_is_valid(target_win) then vim.api.nvim_win_close(target_win, true) end
+  end)
+
   it("establishes an ordinary target View immediately and restores its buffer after loading", function()
     local instance = ready({ ["dir/child.txt"] = "x" })
     local ctx = context_for(instance, "dir")
@@ -981,66 +1070,6 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.same(source_view, fre.view.inspect(instance, ctx.tabpage))
   end)
 
-  it("keeps a child destination committed after a source presentation callback error", function()
-    local instance = ready({ ["dir/child.txt"] = "x" })
-    local ctx = context_for(instance, "dir")
-    local original_leave = instance._on_presentation_leave
-    instance._on_presentation_leave = function() error("injected presentation leave failure") end
-
-    local ok, err = pcall(actions.select, ctx)
-    instance._on_presentation_leave = original_leave
-
-    assert.is_false(ok)
-    assert.is_truthy(tostring(err):find("injected presentation leave failure", 1, true))
-    local child
-    for _, candidate in ipairs(manager_instances()) do
-      if candidate ~= instance and path.equal(candidate.root, fixture:path("dir")) then
-        child = candidate
-      end
-    end
-    assert.is_not_nil(child)
-    assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(ctx.winid))
-    assert.is_nil(fre.view.inspect(instance, ctx.tabpage))
-    assert.is_not_nil(fre.view.inspect(child, ctx.tabpage))
-  end)
-
-  it("keeps a created split committed after its presentation callback errors", function()
-    local instance = ready({ ["dir/child.txt"] = "x" })
-    local ctx = context_for(instance, "dir")
-    local child
-    fre._set_fs_adapter({
-      load = function(scan_path, _)
-        for _, candidate in ipairs(manager_instances()) do
-          if candidate ~= instance and path.equal(candidate.root, scan_path) then
-            child = candidate
-          end
-        end
-        assert.is_not_nil(child)
-        child._on_presentation_enter = function()
-          error("injected created View presentation failure")
-        end
-      end,
-    })
-
-    local ok, err = pcall(actions.split_select, ctx, {
-      layout = { position = "right", size = 20 },
-    })
-
-    assert.is_false(ok)
-    assert.is_truthy(tostring(err):find(
-      "injected created View presentation failure", 1, true
-    ))
-    local committed = assert(fre.view.inspect(child, ctx.tabpage))
-    local target_win = committed.winid
-    assert.are.equal(target_win, vim.api.nvim_get_current_win())
-    assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(target_win))
-    assert.are.same({
-      winid = target_win,
-      origin_winid = ctx.winid,
-      layout = { position = "right", size = 20 },
-    }, committed)
-    assert.is_not_nil(fre.view.inspect(instance, ctx.tabpage))
-  end)
 
   it("keeps a selected file committed after exact-target focus failure", function()
     local instance = ready({ ["file.txt"] = "x" })

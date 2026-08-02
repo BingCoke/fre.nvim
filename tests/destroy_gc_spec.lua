@@ -367,7 +367,7 @@ describe("fre ticket 19 destroy and GC", function()
       "root_node", "nodes_by_id", "nodes_by_path", "view",
       "actions", "_execution", "_watchers", "_buffer_augroup", "_mapping_installed",
       "_installed_mappings", "_last_layout_by_tab",
-      "_pending_initial_cursor", "_pending_reveal", "_pending_presentation_refresh",
+      "_pending_initial_cursor", "_pending_reveal",
       "hidden_since", "_gc_timer", "_gc_expired_reconsider", "needs_refresh",
       "result", "error", "real_root",
     }) do
@@ -816,11 +816,15 @@ describe("fre ticket 19 destroy and GC", function()
     assert.are.equal("ready", instance:status())
   end)
 
-  it("surfaces final explicit-hide GC failures after committing View removal", function()
+  it("isolates final explicit-hide GC observer failures after committing View removal", function()
     fre.setup({ columns = {}, gc = {
       ttl_ms = 100, groups = { default = 0, project = 0 },
     } })
+    local original_notify = vim.notify
+    local notices = {}
+    vim.notify = function(message) notices[#notices + 1] = tostring(message) end
     for _, method in ipairs({ "hidden", "hide_all" }) do
+      local notice_count = #notices
       local instance = ready()
       local tabpage = vim.api.nvim_get_current_tabpage()
       local previous_bufnr = vim.api.nvim_get_current_buf()
@@ -837,60 +841,23 @@ describe("fre ticket 19 destroy and GC", function()
       end)
       clock.adapter.timer_start = timer_start
 
-      assert.is_false(ok)
-      assert.is_truthy(tostring(err):find("adapter.timer_start() failed", 1, true))
+      assert.is_true(ok, tostring(err))
       assert.is_true(injected)
       assert.is_nil(fre.view.inspect(instance, tabpage))
       assert.are.equal(previous_bufnr, vim.api.nvim_win_get_buf(winid))
       assert.is_not_nil(instance.hidden_since)
       assert.is_nil(instance._gc_timer)
+      wait_for(function()
+        if #notices <= notice_count then return false end
+        for index = notice_count + 1, #notices do
+          local notice = notices[index]
+          if notice:find("FreInstancePresentationChanged observer failed", 1, true)
+              and notice:find("adapter.timer_start() failed", 1, true) then return true end
+        end
+        return false
+      end)
     end
-  end)
-
-  it("contains and reports persistent visibility-sync GC retry failures", function()
-    fre.setup({ columns = {}, gc = {
-      ttl_ms = 100, groups = { default = 0, project = 0 },
-    } })
-    local instance = ready()
-    local _, winid = instance:open({ position = "current" })
-    local replacement = scratch()
-    local reported = {}
-    instance._report_async_error = function(_, err)
-      reported[#reported + 1] = tostring(err)
-    end
-    local starts = 0
-    clock.adapter.timer_start = function()
-      starts = starts + 1
-      return false
-    end
-
-    local replaced, replace_err = pcall(vim.api.nvim_win_set_buf, winid, replacement)
-    assert.is_true(replaced, tostring(replace_err))
-    wait_for(function()
-      return #sorted_windows(instance.bufnr) == 0 and starts == 2 and #reported == 1
-    end)
-
-    assert.are.equal(replacement, vim.api.nvim_win_get_buf(winid))
-    assert.is_truthy(reported[1]:find("presentation synchronization failed", 1, true))
-    assert.is_truthy(reported[1]:find("adapter.timer_start() failed", 1, true))
-    assert.is_nil(instance._gc_timer)
-    assert.are.equal("ready", instance:status())
-
-    local drained, drain_err = pcall(clock.drain, clock)
-    assert.is_true(drained, tostring(drain_err))
-    assert.are.equal(3, starts)
-    assert.are.equal(2, #reported)
-    assert.is_truthy(reported[2]:find("GC reconsideration failed", 1, true))
-    assert.is_truthy(reported[2]:find("adapter.timer_start() failed", 1, true))
-    assert.is_nil(instance._gc_timer)
-    assert.are.equal("ready", instance:status())
-    assert.are.equal(replacement, vim.api.nvim_win_get_buf(winid))
-    assert.are.same({}, clock.scheduled)
-
-    drained, drain_err = pcall(clock.drain, clock)
-    assert.is_true(drained, tostring(drain_err))
-    assert.are.equal(3, starts)
-    assert.are.equal(2, #reported)
+    vim.notify = original_notify
   end)
 
   it("treats native duplicates as presentation for TTL and capacity", function()
