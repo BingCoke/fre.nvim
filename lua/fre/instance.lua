@@ -4,6 +4,7 @@ local path = require("fre.path")
 local Work = require("fre.instance.work")
 local Tree = require("fre.instance.tree")
 local Lifecycle = require("fre.instance.lifecycle")
+local Events = require("fre.instance.events")
 local Sync = require("fre.instance.sync")
 local view = require("fre.instance.view")
 
@@ -56,17 +57,7 @@ end
 
 
 function Instance:_emit_ready(err, result)
-  local data = {
-    instance_id = self.id,
-    bufnr = self.bufnr,
-    error = err,
-    result = result,
-  }
-  vim.api.nvim_exec_autocmds("User", {
-    pattern = "FreReady",
-    modeline = false,
-    data = data,
-  })
+  Events.ready(self.id, self.bufnr, err, result)
 end
 
 function Instance:_complete_initial_load(err, result, _real_root, on_complete)
@@ -154,6 +145,17 @@ function Instance:_report_async_error(err)
     self._last_async_error = self._last_async_error
       .. "; error reporter failed: " .. tostring(notify_err)
   end
+end
+
+function Instance:_emit_activity(activity, active)
+  if self.lifecycle:is_destroyed() then return end
+  Events.activity_changed(self.id, self.bufnr, activity, active)
+end
+
+function Instance:_on_presentation_changed(visible)
+  if self.lifecycle:is_dead() or self._event_presented == visible then return end
+  self._event_presented = visible
+  Events.presentation_changed(self.id, self.bufnr, visible)
 end
 
 
@@ -459,6 +461,7 @@ end
 
 function Instance:_start_destroy()
   if not self.lifecycle:begin_destroy() then return false end
+  Events.destroying(self.id, self.bufnr)
   local manager = self.manager
   pcall(view.hide_all, self)
   manager:get_gc_controller():stop(self)
@@ -495,6 +498,7 @@ function Instance:_finish_destroy()
     if not retained[key] then self[key] = nil end
   end
   self.lifecycle:finish_destroy()
+  Events.destroyed(self.id, bufnr)
   return nil
 end
 
@@ -549,6 +553,7 @@ end
 
 function Instance:_start_initial_load()
   self.sync:load_initial()
+  Events.created(self.id, self.bufnr)
   return self
 end
 
@@ -567,6 +572,7 @@ function Instance.new(manager, id, root, effective, registry)
       schedule = vim.schedule,
       emit_ready = function(err, result) self:_emit_ready(err, result) end,
     })
+    self._event_presented = false
     self._pending_presentation_refresh = false
     self._reveal_generation = 0
 
@@ -647,6 +653,7 @@ function Instance.new(manager, id, root, effective, registry)
         return self.work and self.work:is_execution_active() or false
       end,
       is_presented = function() return view.has_active(self) end,
+      on_refresh_activity = function(active) self:_emit_activity("refresh", active) end,
       on_initial_complete = function(err, value, real_root, on_complete)
         self:_complete_initial_load(err, value, real_root, on_complete)
       end,
@@ -665,6 +672,7 @@ function Instance.new(manager, id, root, effective, registry)
       is_alive = function() return not self.lifecycle:is_dead() end,
       is_ready = function() return self.lifecycle:is_ready() end,
       reconsider_gc = function(deferred) return manager:gc_reconsider(self, deferred) end,
+      on_activity = function(activity, active) self:_emit_activity(activity, active) end,
       report_error = function(err) return self:_report_async_error(err) end,
     })
     self.buffer:setup()

@@ -235,6 +235,7 @@ function M.sync(instance, opts)
   opts = opts or {}
   if not live_instance(instance) then return false end
   local visible = #actual_windows(instance) > 0
+  instance:_on_presentation_changed(visible)
   local transition
   if visible and instance.hidden_since ~= nil then
     transition = instance._on_presentation_enter

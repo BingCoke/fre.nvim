@@ -33,6 +33,7 @@ function Sync.new(options)
     is_presented = assert(options.is_presented),
     on_initial_complete = assert(options.on_initial_complete),
     on_followup_needed = assert(options.on_followup_needed),
+    on_refresh_activity = options.on_refresh_activity or function() end,
     report_error = assert(options.report_error),
     tree_generation = 0,
     real_root = nil,
@@ -474,6 +475,10 @@ function Sync:_finish_request(request, err)
   if self.refresh_request == request then self.refresh_request = nil end
   if self.watch_refresh_request == request then self.watch_refresh_request = nil end
   if self.initial_refresh_request == request then self.initial_refresh_request = nil end
+  if request.activity_started then
+    request.activity_started = false
+    self.on_refresh_activity(false)
+  end
   if err ~= nil then self.dirty = true end
   self:_schedule_completion(request.on_complete, err)
 end
@@ -631,6 +636,8 @@ function Sync:refresh(force, on_complete, write_reconciliation)
     completed = false,
   }
   self.refresh_request = request
+  request.activity_started = true
+  self.on_refresh_activity(true)
   self.dirty = true
   local paths = { self.root }
   for _, active_path in ipairs(request.active_paths) do paths[#paths + 1] = active_path end
