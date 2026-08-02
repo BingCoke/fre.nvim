@@ -1,4 +1,4 @@
-local Tree = require("fre.tree")
+local Tree = require("fre.instance.tree")
 
 describe("fre Tree interface", function()
   local function comparator(_, left, right)

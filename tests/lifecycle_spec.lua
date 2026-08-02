@@ -1,4 +1,4 @@
-local Lifecycle = require("fre.lifecycle")
+local Lifecycle = require("fre.instance.lifecycle")
 
 describe("fre Lifecycle", function()
   local scheduled

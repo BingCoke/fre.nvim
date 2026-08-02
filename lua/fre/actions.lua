@@ -1,9 +1,9 @@
-local buffer = require("fre.buffer")
+local buffer = require("fre.instance.buffer")
 local config = require("fre.config")
-local Work = require("fre.work")
+local Work = require("fre.instance.work")
 local mapping = require("fre.mapping")
 local path = require("fre.path")
-local view = require("fre.view")
+local view = require("fre.instance.view")
 local window = require("fre.window")
 
 local M = {}

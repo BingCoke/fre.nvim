@@ -1,7 +1,7 @@
 local fre = require("fre")
-local buffer = require("fre.buffer")
+local buffer = require("fre.instance.buffer")
 local path = require("fre.path")
-local row = require("fre.row")
+local row = require("fre.instance.row")
 local fs = require("tests.helpers.fs")
 
 local unit_separator = string.char(31)

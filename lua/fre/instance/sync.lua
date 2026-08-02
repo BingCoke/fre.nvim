@@ -1,6 +1,6 @@
 local path = require("fre.path")
-local Watch = require("fre.watch")
-local Tree = require("fre.tree")
+local Watch = require("fre.instance.watch")
+local Tree = require("fre.instance.tree")
 
 local Sync = {}
 Sync.__index = Sync

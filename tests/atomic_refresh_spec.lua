@@ -1,4 +1,4 @@
-local buffer = require("fre.buffer")
+local buffer = require("fre.instance.buffer")
 local columns = require("fre.columns")
 local fre = require("fre")
 local path = require("fre.path")

@@ -1,5 +1,5 @@
 local actions = require("fre.actions")
-local buffer = require("fre.buffer")
+local buffer = require("fre.instance.buffer")
 local fre = require("fre")
 local mutation_fs = require("fre.mutation.fs")
 local real_fs = require("fre.fs").default

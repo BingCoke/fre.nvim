@@ -1,8 +1,8 @@
 local fre = require("fre")
-local buffer = require("fre.buffer")
+local buffer = require("fre.instance.buffer")
 local columns = require("fre.columns")
-local row = require("fre.row")
-local Tree = require("fre.tree")
+local row = require("fre.instance.row")
+local Tree = require("fre.instance.tree")
 local fs = require("tests.helpers.fs")
 
 local instances = {}

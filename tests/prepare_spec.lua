@@ -1,10 +1,10 @@
-local buffer = require("fre.buffer")
+local buffer = require("fre.instance.buffer")
 local columns = require("fre.columns")
 local fre = require("fre")
 local mutation_prepare = require("fre.mutation.prepare")
 local path = require("fre.path")
-local row = require("fre.row")
-local Tree = require("fre.tree")
+local row = require("fre.instance.row")
+local Tree = require("fre.instance.tree")
 local real_fs = require("fre.fs").default
 local fs = require("tests.helpers.fs")
 

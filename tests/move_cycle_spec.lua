@@ -1,12 +1,12 @@
 local actions = require("fre.actions")
-local buffer = require("fre.buffer")
+local buffer = require("fre.instance.buffer")
 local fre = require("fre")
 local move_graph = require("fre.mutation.move_graph")
 local mutation_fs = require("fre.mutation.fs")
 local mutation_prepare = require("fre.mutation.prepare")
 local path = require("fre.path")
-local row = require("fre.row")
-local Tree = require("fre.tree")
+local row = require("fre.instance.row")
+local Tree = require("fre.instance.tree")
 local fs = require("tests.helpers.fs")
 
 local fixture

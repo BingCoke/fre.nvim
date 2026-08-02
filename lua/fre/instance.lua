@@ -1,11 +1,11 @@
 local config = require("fre.config")
-local buffer = require("fre.buffer")
+local buffer = require("fre.instance.buffer")
 local path = require("fre.path")
-local Work = require("fre.work")
-local Tree = require("fre.tree")
-local Lifecycle = require("fre.lifecycle")
-local Sync = require("fre.sync")
-local view = require("fre.view")
+local Work = require("fre.instance.work")
+local Tree = require("fre.instance.tree")
+local Lifecycle = require("fre.instance.lifecycle")
+local Sync = require("fre.instance.sync")
+local view = require("fre.instance.view")
 
 local Instance = {}
 Instance.__index = Instance

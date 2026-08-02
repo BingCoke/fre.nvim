@@ -1,6 +1,6 @@
-local buffer = require("fre.buffer")
+local buffer = require("fre.instance.buffer")
 local manager_module = require("fre.manager")
-local view = require("fre.view")
+local view = require("fre.instance.view")
 
 local M = {}
 
