@@ -120,7 +120,19 @@ function Manager:create_instance(opts)
 
   local root = require("fre.path").absolute(opts.root)
   local effective = self:resolve_instance_config(opts, root)
-  return require("fre.instance").new(self, root, effective)
+  local id = self:allocate_id()
+  local instance = require("fre.instance").new(self, id, root, effective)
+  local ok, result = pcall(function()
+    self:register(instance)
+    return instance:_start_initial_load()
+  end)
+  if ok then return result end
+
+  local cleaned, cleanup_err = pcall(instance.destroy, instance)
+  if not cleaned then
+    error(tostring(result) .. "; cleanup failed: " .. tostring(cleanup_err), 0)
+  end
+  error(result, 0)
 end
 
 function Manager:get_setup_defaults()

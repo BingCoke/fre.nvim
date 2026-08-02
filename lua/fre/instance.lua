@@ -519,20 +519,6 @@ local function invalidate_failed_constructor(self)
   if self.buffer then self.buffer:clear_initial_cursors() end
 end
 
-local function remove_failed_indexes(manager, self)
-  pcall(manager.remove, manager, self)
-  if manager.instances_by_id and manager.instances_by_id[self.id] == self then
-    manager.instances_by_id[self.id] = nil
-  end
-  for bufnr, indexed in pairs(manager.instances_by_buf or {}) do
-    if indexed == self then manager.instances_by_buf[bufnr] = nil end
-  end
-  for _, group in pairs(manager.groups or {}) do
-    if group.instances and group.instances[self.id] == self then
-      group.instances[self.id] = nil
-    end
-  end
-end
 
 local function wipe_failed_buffer(bufnr)
   if not vim.api.nvim_buf_is_valid(bufnr) then return true end
@@ -553,29 +539,28 @@ local function wipe_failed_buffer(bufnr)
   return true
 end
 
-local function cleanup_failed_constructor(manager, self, bufnr)
+local function cleanup_failed_constructor(self, bufnr)
   if self._constructor_cleanup_done then return true end
   self._constructor_cleanup_done = true
   invalidate_failed_constructor(self)
-
-  local gc_ok, gc_controller = pcall(manager.get_gc_controller, manager)
-  if not gc_ok then gc_controller = manager._gc end
-  if gc_controller then pcall(gc_controller.stop, gc_controller, self) end
-  if self.sync then pcall(self.sync.destroy, self.sync) end
   if self.buffer then pcall(buffer.teardown, self.buffer) end
-  remove_failed_indexes(manager, self)
   return wipe_failed_buffer(bufnr)
 end
 
-function Instance.new(manager, root, effective)
+function Instance:_start_initial_load()
+  self.sync:load_initial()
+  return self
+end
+
+function Instance.new(manager, id, root, effective)
   local bufnr = vim.api.nvim_create_buf(false, true)
   local self = setmetatable({
     manager = manager,
+    id = id,
     bufnr = bufnr,
   }, Instance)
 
   local ok, result = xpcall(function()
-    self.id = manager:allocate_id()
     self.root = root
     self.config = copy(effective)
     self.lifecycle = Lifecycle.new({
@@ -690,13 +675,11 @@ function Instance.new(manager, root, effective)
       report_error = function(err) return self:_report_async_error(err) end,
     })
     self.buffer:setup()
-    manager:register(self)
-    self.sync:load_initial()
     return self
   end, function(err) return err end)
 
   if ok then return result end
-  local cleaned, cleanup_err = cleanup_failed_constructor(manager, self, bufnr)
+  local cleaned, cleanup_err = cleanup_failed_constructor(self, bufnr)
   if not cleaned then
     error(tostring(result) .. "; cleanup failed: instance buffer " .. tostring(bufnr)
       .. " survived: " .. tostring(cleanup_err), 0)

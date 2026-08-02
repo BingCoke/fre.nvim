@@ -417,7 +417,131 @@ describe("fre async hidden instances", function()
     assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
   end)
 
-  it("rolls back every partial constructor stage while permanently consuming allocated IDs", function()
+  it("registers only after core construction returns and before scheduled completion", function()
+    local manager = manager_module.new()
+    local ready_registration
+    local core_returned = false
+    local gc_enrolled = false
+    manager:set_fs_adapter({
+      load = function(_, done) done(nil, {}) end,
+    })
+    vim.api.nvim_create_autocmd("User", {
+      group = event_group,
+      pattern = "FreReady",
+      callback = function(args)
+        local by_id = manager:find_by_id(args.data.instance_id)
+        local by_buf = manager:find_by_buf(args.data.bufnr)
+        local group = manager:find_by_group("default")
+        ready_registration = by_id ~= nil
+          and by_id == by_buf
+          and group[args.data.instance_id] == by_id
+          and gc_enrolled
+      end,
+    })
+
+    local original_new = Instance.new
+    local original_register = manager.register
+    local original_on_register = manager._gc.on_register
+    Instance.new = function(...)
+      local created = original_new(...)
+      core_returned = true
+      return created
+    end
+    manager.register = function(target, created)
+      assert.is_true(core_returned)
+      return original_register(target, created)
+    end
+    manager._gc.on_register = function(controller, created)
+      local registered = original_on_register(controller, created)
+      gc_enrolled = true
+      return registered
+    end
+
+    local ok, result = pcall(manager.create_instance, manager, { root = fixture.root })
+    Instance.new = original_new
+    manager.register = original_register
+    manager._gc.on_register = original_on_register
+    assert.is_true(ok, tostring(result))
+    local instance = keep(result)
+
+    assert.are.equal(instance, manager:find_by_id(instance.id))
+    assert.are.equal(instance, manager:find_by_buf(instance.bufnr))
+    wait_for(function() return instance:is_ready() and ready_registration == true end)
+  end)
+
+  it("cleans failed core construction without registration or GC rollback", function()
+    local manager = manager_module.new()
+    local root = path.absolute(fixture.root)
+    local registrations = 0
+    local enrollments = 0
+    local original_register = manager.register
+    local original_on_register = manager._gc.on_register
+    manager.register = function(target, created)
+      registrations = registrations + 1
+      return original_register(target, created)
+    end
+    manager._gc.on_register = function(controller, created)
+      enrollments = enrollments + 1
+      return original_on_register(controller, created)
+    end
+
+    local stages = {
+      {
+        name = "buffer setup",
+        install = function()
+          local original = buffer.setup
+          buffer.setup = function(instance)
+            original(instance)
+            error("injected buffer setup constructor fault")
+          end
+          return function() buffer.setup = original end
+        end,
+      },
+      {
+        name = "mapping setup",
+        install = function()
+          local original = mapping.setup
+          mapping.setup = function(instance)
+            original(instance)
+            error("injected mapping setup constructor fault")
+          end
+          return function() mapping.setup = original end
+        end,
+      },
+    }
+    local first_failed_id = manager._next_id
+
+    for _, stage in ipairs(stages) do
+      local pending
+      manager:set_fs_adapter({ load = function(_, done) pending = done end })
+      local before_buffers = vim.api.nvim_list_bufs()
+      local failed_id = manager._next_id
+      local restore = stage.install()
+      local ok, err = pcall(manager.create_instance, manager, { root = root })
+      restore()
+
+      assert.is_false(ok, stage.name)
+      assert.is_truthy(tostring(err):find("injected " .. stage.name, 1, true), tostring(err))
+      assert.are.equal(failed_id + 1, manager._next_id)
+      assert.are.same(before_buffers, vim.api.nvim_list_bufs())
+      assert.is_nil(manager:find_by_id(failed_id))
+      assert.is_nil(manager:find_by_group("default")[failed_id])
+      assert.is_false(pcall(vim.api.nvim_get_autocmds, { group = "FreBuffer" .. failed_id }))
+      if pending then
+        pending(nil, {})
+        vim.wait(20, function() return false end, 5)
+        assert.are.same(before_buffers, vim.api.nvim_list_bufs())
+      end
+    end
+
+    manager.register = original_register
+    manager._gc.on_register = original_on_register
+    assert.are.equal(0, registrations)
+    assert.are.equal(0, enrollments)
+    assert.are.equal(first_failed_id + #stages, manager:allocate_id())
+  end)
+
+  it("cleans core resources when managed registration fails atomically", function()
     local timers = { created = 0, stopped = 0, closed = 0 }
     local manager = manager_module.new()
     manager:set_gc_adapter({
@@ -449,88 +573,68 @@ describe("fre async hidden instances", function()
       columns = {},
       gc = { ttl_ms = 100 },
     })
-    local root = path.absolute(fixture.root)
-    local effective = manager:resolve_instance_config({ root = root })
-
-    local stages = {
-      {
-        name = "buffer setup",
-        install = function()
-          local original = buffer.setup
-          buffer.setup = function(instance)
-            original(instance)
-            error("injected buffer setup constructor fault")
-          end
-          return function() buffer.setup = original end
-        end,
-      },
-      {
-        name = "mapping setup",
-        install = function()
-          local original = mapping.setup
-          mapping.setup = function(instance)
-            original(instance)
-            error("injected mapping setup constructor fault")
-          end
-          return function() mapping.setup = original end
-        end,
-      },
-      {
-        name = "registration",
-        install = function()
-          local original = manager.register
-          manager.register = function(target, instance)
-            original(target, instance)
-            error("injected registration constructor fault")
-          end
-          return function() manager.register = nil end
-        end,
-      },
-      {
-        name = "load start",
-        install = function()
-          local original = Sync.load_initial
-          Sync.load_initial = function(sync, ...)
-            original(sync, ...)
-            error("injected load start constructor fault")
-          end
-          return function() Sync.load_initial = original end
-        end,
-      },
-    }
-
-    for _, stage in ipairs(stages) do
-      local pending
-      manager:set_fs_adapter({ load = function(_, done) pending = done end })
-      local before_buffers = vim.api.nvim_list_bufs()
-      local failed_id = manager._next_id
-      local restore = stage.install()
-      local ok, err = pcall(Instance.new, manager, root, effective)
-      restore()
-
-      assert.is_false(ok, stage.name)
-      assert.is_truthy(tostring(err):find("injected " .. stage.name, 1, true), tostring(err))
-      assert.are.equal(failed_id + 1, manager._next_id)
-      assert.are.same(before_buffers, vim.api.nvim_list_bufs())
-      assert.is_nil(manager:find_by_id(failed_id))
-      for _, indexed in pairs(manager.instances_by_buf) do
-        assert.are_not.equal(failed_id, indexed.id)
-      end
-      for _, group in pairs(manager.groups) do assert.is_nil(group.instances[failed_id]) end
-      assert.is_false(pcall(vim.api.nvim_get_autocmds, { group = "FreBuffer" .. failed_id }))
-      for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-        assert.are_not.equal("fre://" .. failed_id, vim.api.nvim_buf_get_name(bufnr))
-      end
-      if pending then
-        pending(nil, {})
-        vim.wait(20, function() return false end, 5)
-        assert.is_nil(manager:find_by_id(failed_id))
-        assert.are.same(before_buffers, vim.api.nvim_list_bufs())
-      end
+    local pending
+    manager:set_fs_adapter({ load = function(_, done) pending = done end })
+    local before_buffers = vim.api.nvim_list_bufs()
+    local failed_id = manager._next_id
+    local constructed
+    local original_on_register = manager._gc.on_register
+    manager._gc.on_register = function(controller, created)
+      constructed = created
+      original_on_register(controller, created)
+      error("injected managed registration failure")
     end
 
-    assert.are.equal(2, timers.created)
-    assert.are.equal(2, timers.stopped)
-    assert.are.equal(2, timers.closed)
+    local ok, err = pcall(manager.create_instance, manager, { root = fixture.root })
+    manager._gc.on_register = original_on_register
+
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):find("injected managed registration failure", 1, true))
+    assert.is_nil(pending)
+    assert.are.equal("destroyed", constructed:status())
+    assert.is_false(vim.api.nvim_buf_is_valid(constructed.bufnr))
+    assert.is_nil(manager:find_by_id(failed_id))
+    assert.is_nil(manager:find_by_buf(constructed.bufnr))
+    assert.is_nil(manager:find_by_group("default")[failed_id])
+    assert.are.same(before_buffers, vim.api.nvim_list_bufs())
+    assert.are.same({ created = 1, stopped = 1, closed = 1 }, timers)
+  end)
+
+  it("removes managed ownership when initial load start fails", function()
+    local manager = manager_module.new()
+    local pending
+    manager:set_fs_adapter({ load = function(_, done) pending = done end })
+    local before_buffers = vim.api.nvim_list_bufs()
+    local failed_id = manager._next_id
+    local constructed
+    local original_register = manager.register
+    local original_load_initial = Sync.load_initial
+    manager.register = function(target, created)
+      constructed = created
+      return original_register(target, created)
+    end
+    Sync.load_initial = function(sync, ...)
+      original_load_initial(sync, ...)
+      error("injected load start failure")
+    end
+
+    local ok, err = pcall(manager.create_instance, manager, { root = fixture.root })
+    manager.register = original_register
+    Sync.load_initial = original_load_initial
+
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):find("injected load start failure", 1, true))
+    assert.is_function(pending)
+    assert.are.equal("destroyed", constructed:status())
+    assert.is_false(vim.api.nvim_buf_is_valid(constructed.bufnr))
+    assert.is_nil(manager:find_by_id(failed_id))
+    assert.is_nil(manager:find_by_buf(constructed.bufnr))
+    assert.is_nil(manager:find_by_group("default")[failed_id])
+    assert.are.same(before_buffers, vim.api.nvim_list_bufs())
+
+    pending(nil, {})
+    vim.wait(20, function() return false end, 5)
+    assert.is_nil(manager:find_by_id(failed_id))
+    assert.are.same(before_buffers, vim.api.nvim_list_bufs())
   end)
 end)
