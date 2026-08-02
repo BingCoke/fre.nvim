@@ -179,7 +179,6 @@ local function fake_plan(root_path, definitions)
     sync_views = function() end,
     request_write = function() end,
     request_destroy = function() end,
-    reconsider_gc = function() end,
     report_async_error = function() end,
   })
   fake.buffer.view = { baseline = baseline, visible_nodes = visible }

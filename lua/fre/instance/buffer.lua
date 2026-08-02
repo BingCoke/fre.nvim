@@ -59,7 +59,6 @@ function Buffer.new(options)
     sync_views = assert(options.sync_views),
     request_write = assert(options.request_write),
     request_destroy = assert(options.request_destroy),
-    reconsider_gc = assert(options.reconsider_gc),
     report_async_error = assert(options.report_async_error),
     view = { baseline = {}, marker_generation = 0 },
     hidden_file = options.hidden_file == true,
@@ -905,12 +904,6 @@ function M.setup(buffer)
         if buffer.destroyed() then return end
         buffer.sync_views(buffer, { report = true })
       end)
-    end,
-  })
-  vim.api.nvim_create_autocmd("BufModifiedSet", {
-    group = buffer.buffer_augroup, buffer = buffer.bufnr,
-    callback = function()
-      if not buffer.destroyed() then buffer.reconsider_gc(buffer, true) end
     end,
   })
   vim.api.nvim_create_autocmd("CursorMoved", {

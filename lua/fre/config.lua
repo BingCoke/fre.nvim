@@ -59,15 +59,6 @@ local function builtins()
       columns.size(),
       columns.mtime({ format = "%Y-%m-%d %H:%M" }),
     },
-    gc = {
-      ttl_ms = 60000,
-      include_modified = false,
-      default_group = "default",
-      groups = {
-        default = 10,
-        project = 5,
-      },
-    },
     layout = {
       position = "left",
       size = 40,
@@ -112,11 +103,6 @@ local function expect_type(value, expected, path)
   end
 end
 
-local function expect_nonnegative_number(value, path)
-  if type(value) ~= "number" or value < 0 then
-    fail(path .. " must be a non-negative number")
-  end
-end
 
 local function check_known_keys(value, allowed, path)
   for key in next, value do
@@ -291,13 +277,6 @@ local function validate_window(value, path)
   end
 end
 
-local function validate_groups(value, path)
-  validate_named_map(value, path, function(capacity, capacity_path)
-    if type(capacity) ~= "number" or capacity < 0 or capacity % 1 ~= 0 then
-      fail(capacity_path .. " must be a non-negative integer")
-    end
-  end)
-end
 
 local setup_fields = {
   default_file_explorer = true,
@@ -306,7 +285,6 @@ local setup_fields = {
   auto_expand_single_directory = true,
   sort = true,
   columns = true,
-  gc = true,
   layout = true,
   use_mapping_default = true,
   mapping = true,
@@ -322,7 +300,6 @@ local new_fields = {
   sort = true,
   expanded = true,
   columns = true,
-  gc = true,
   layout = true,
   use_mapping_default = true,
   mapping = true,
@@ -350,17 +327,6 @@ local function merge_mapping(base, override)
   return result
 end
 
-local function merge_record(base, override, fields)
-  local result = copy(base)
-  if override then
-    for field in next, fields do
-      if override[field] ~= nil then
-        result[field] = copy(override[field])
-      end
-    end
-  end
-  return result
-end
 
 local function validate_common(config, setup)
   expect_type(config.hidden_file, "boolean", "hidden_file")
@@ -373,24 +339,8 @@ local function validate_common(config, setup)
   validate_layout(config.layout, "layout", true)
   validate_buffer(config.buffer, "buffer")
   validate_window(config.window, "window")
-
-  expect_nonnegative_number(config.gc.ttl_ms, "gc.ttl_ms")
-  expect_type(config.gc.include_modified, "boolean", "gc.include_modified")
   if setup then
     expect_type(config.default_file_explorer, "boolean", "default_file_explorer")
-    expect_type(config.gc.default_group, "string", "gc.default_group")
-    if config.gc.default_group == "" then
-      fail("gc.default_group must not be empty")
-    end
-    validate_groups(config.gc.groups, "gc.groups")
-    if config.gc.groups[config.gc.default_group] == nil then
-      fail("gc.default_group must name a configured group")
-    end
-  else
-    expect_type(config.gc.group, "string", "gc.group")
-    if config.gc.group == "" then
-      fail("gc.group must not be empty")
-    end
   end
 end
 
@@ -443,24 +393,6 @@ function M.resolve_setup(opts, ignore_default_file_explorer)
   if not layout_ok then fail(tostring(layout_result):gsub("^fre%.layout:%s*", ""), 3) end
   result.layout = layout_result
 
-  if opts.gc ~= nil then
-    expect_table(opts.gc, "gc")
-    check_known_keys(opts.gc, {
-      ttl_ms = true,
-      include_modified = true,
-      default_group = true,
-      groups = true,
-    }, "gc")
-    if opts.gc.groups ~= nil then
-      validate_groups(opts.gc.groups, "gc.groups")
-    end
-    result.gc = merge_record(result.gc, opts.gc, {
-      ttl_ms = true,
-      include_modified = true,
-      default_group = true,
-    })
-    result.gc.groups = merge_named(result.gc.groups, opts.gc.groups)
-  end
 
   if opts.buffer ~= nil then
     expect_table(opts.buffer, "buffer")
@@ -512,11 +444,6 @@ function M.resolve_instance(setup_defaults, opts, normalized_root)
     sort = setup_defaults.sort,
     expanded = expanded,
     columns = copy(setup_defaults.columns),
-    gc = {
-      ttl_ms = copy(setup_defaults.gc.ttl_ms),
-      include_modified = copy(setup_defaults.gc.include_modified),
-      group = copy(setup_defaults.gc.default_group),
-    },
     layout = copy(setup_defaults.layout),
     use_mapping_default = copy(setup_defaults.use_mapping_default),
     mapping = copy(setup_defaults.mapping),
@@ -548,19 +475,6 @@ function M.resolve_instance(setup_defaults, opts, normalized_root)
   if not layout_ok then fail(tostring(layout_result):gsub("^fre%.layout:%s*", ""), 3) end
   result.layout = layout_result
 
-  if opts.gc ~= nil then
-    expect_table(opts.gc, "gc")
-    check_known_keys(opts.gc, {
-      ttl_ms = true,
-      include_modified = true,
-      group = true,
-    }, "gc")
-    result.gc = merge_record(result.gc, opts.gc, {
-      ttl_ms = true,
-      include_modified = true,
-      group = true,
-    })
-  end
   if opts.buffer ~= nil then
     expect_table(opts.buffer, "buffer")
     check_known_keys(opts.buffer, { options = true, variables = true }, "buffer")
@@ -574,9 +488,6 @@ function M.resolve_instance(setup_defaults, opts, normalized_root)
   end
 
   validate_common(result, false)
-  if setup_defaults.gc.groups[result.gc.group] == nil then
-    fail("gc.group names an unknown group: " .. result.gc.group)
-  end
   return copy(result)
 end
 

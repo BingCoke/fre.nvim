@@ -51,7 +51,6 @@ function Work.new(options)
     get_mutation_adapter = assert(options.get_mutation_adapter),
     is_alive = assert(options.is_alive),
     is_ready = assert(options.is_ready),
-    reconsider_gc = assert(options.reconsider_gc),
     report_error = assert(options.report_error),
     on_activity = options.on_activity or function() end,
     write_request = nil,
@@ -105,12 +104,10 @@ function Work:_start_execution(plan, handlers)
       if self.execution == completed then self.execution = nil end
       self.on_activity("execution", false)
       if self.sync:is_dirty() then self.sync:schedule_followup() end
-      if self.is_alive() then self.reconsider_gc(true) end
     end
   )
   self.execution = execution
   self.on_activity("execution", true)
-  self.reconsider_gc(false)
   return execution
 end
 
@@ -155,7 +152,6 @@ function Work:_acquire_write()
     error(err, 0)
   end
   self.on_activity("write", true)
-  self.reconsider_gc(false)
   return request
 end
 
@@ -171,7 +167,6 @@ function Work:_release_write(request)
   self.write_request = nil
   self.on_activity("write", false)
   if not ok then self:_report("write unlock failed: " .. tostring(err)) end
-  if self.is_alive() then self.reconsider_gc(true) end
   return true
 end
 

@@ -1,219 +1,101 @@
 local manager_module = require("fre.manager")
 
 local next_id = 1
-local function instance(_, bufnr, group)
+
+local function instance(bufnr)
   local id = next_id
   next_id = id + 1
+  local state = "ready"
   return {
     id = id,
     bufnr = bufnr,
-    config = { gc = { group = group or "default" } },
-    is_destroyed = function() return false end,
-    is_destroying = function() return false end,
+    is_ready = function() return state == "ready" end,
+    is_destroyed = function() return state == "destroyed" end,
+    is_destroying = function() return state == "destroying" end,
+    status = function() return state end,
+    set_state = function(_, value) state = value end,
+    sync_view = function() end,
+    destroy = function(self)
+      state = "destroyed"
+      vim.api.nvim_exec_autocmds("User", {
+        pattern = "FreInstanceDestroyed",
+        modeline = false,
+        data = { instance_id = self.id, bufnr = self.bufnr },
+      })
+    end,
   }
 end
 
+local function resolved(manager, gc_options)
+  local core, policy = manager:resolve_instance_config({ gc = gc_options or {} })
+  return core, policy
+end
+
+local function register(manager, subject, gc_options)
+  local _, policy = resolved(manager, gc_options)
+  return manager:register(subject, policy)
+end
+
+local function emit(pattern, data)
+  vim.api.nvim_exec_autocmds("User", {
+    pattern = pattern,
+    modeline = false,
+    data = data,
+  })
+end
+
 describe("fre manager", function()
-
-  it("registers and finds instances through every index", function()
+  it("resolves core configuration separately from GC enrollment policy", function()
     local manager = manager_module.new()
-    local first = instance(manager, 201, "default")
-    local second = instance(manager, 202, "default")
-    local project = instance(manager, 203, "project")
-    manager:register(first)
-    manager:register(second)
-    manager:register(project)
-
-    assert.are.equal(first, manager:find_by_id(first.id))
-    assert.are.equal(second, manager:find_by_buf(second.bufnr))
-    local defaults = manager:find_by_group("default")
-    assert.are.equal(first, defaults[first.id])
-    assert.are.equal(second, defaults[second.id])
-    assert.is_nil(defaults[project.id])
-    assert.are.equal(project, manager:find_by_group("project")[project.id])
-    assert.is_nil(manager:find_by_group("missing"))
-  end)
-
-  it("returns an independent group membership map", function()
-    local manager = manager_module.new()
-    local registered = instance(manager, 301)
-    manager:register(registered)
-    local membership = manager:find_by_group("default")
-    membership[registered.id] = nil
-
-    assert.are.equal(registered, manager:find_by_group("default")[registered.id])
-  end)
-
-  it("removes ID, buffer, and group membership consistently", function()
-    local manager = manager_module.new()
-    local registered = instance(manager, 401)
-    manager:register(registered)
-    registered.bufnr = 999
-    registered.config.gc.group = "project"
-
-    assert.are.equal(registered, manager:remove(registered.id))
-    assert.is_nil(manager:find_by_id(registered.id))
-    assert.is_nil(manager:find_by_buf(401))
-    assert.is_nil(manager:find_by_group("default")[registered.id])
-    assert.is_nil(manager:remove(registered.id))
-  end)
-
-  it("rejects duplicate indexes and unknown group membership without partial registration", function()
-    local manager = manager_module.new()
-    local registered = instance(manager, 501)
-    manager:register(registered)
-
-    local duplicate_buffer = instance(manager, 501)
-    assert.has_error(function()
-      manager:register(duplicate_buffer)
-    end)
-    assert.is_nil(manager:find_by_id(duplicate_buffer.id))
-
-    local unknown_group = instance(manager, 502, "missing")
-    assert.has_error(function()
-      manager:register(unknown_group)
-    end)
-    assert.is_nil(manager:find_by_id(unknown_group.id))
-    assert.is_nil(manager:find_by_buf(unknown_group.bufnr))
-  end)
-
-  it("updates group capacities while preserving membership", function()
-    local manager = manager_module.new()
-    local registered = instance(manager, 601, "project")
-    manager:register(registered)
-    manager:setup({ gc = { groups = { project = 2 } } })
-
-    assert.are.equal(2, manager.groups.project.capacity)
-    assert.are.equal(registered, manager:find_by_group("project")[registered.id])
-  end)
-
-  it("atomically rejects removal of a group with live members", function()
-    local manager = manager_module.new()
-    manager:setup({ gc = { groups = { temporary = 1 } } })
-    local registered = instance(manager, 701, "temporary")
-    manager:register(registered)
-    local before = manager:get_setup_defaults()
-
-    assert.has_error(function()
-      manager:setup({ gc = { groups = { temporary = nil } } })
-    end)
-    -- A nil map value cannot request removal because named maps merge by key.
-    -- Recompute from built-ins is the actual removal attempt.
-    assert.are.same(before, manager:get_setup_defaults())
-
-    manager:remove(registered)
-    manager:setup()
-    assert.is_nil(manager.groups.temporary)
-  end)
-
-  it("moves registered GC membership without changing other indexes", function()
-    local manager = manager_module.new()
-    manager:setup({ gc = { ttl_ms = 0, groups = { default = 0, project = 0 } } })
-    local bufnr = vim.api.nvim_create_buf(false, true)
-    local registered = instance(manager, bufnr)
-    vim.b[bufnr].fre = { gc_group = "default" }
-    manager:register(registered)
-
-    assert.are.equal(registered, manager:move_to_group(registered, "project"))
-    assert.is_nil(manager.groups.default.instances[registered.id])
-    assert.are.equal(registered, manager.groups.project.instances[registered.id])
-    assert.are.equal(registered, manager:find_by_id(registered.id))
-    assert.are.equal(registered, manager:find_by_buf(bufnr))
-    assert.are.equal("project", registered.config.gc.group)
-    assert.are.equal("project", vim.b[bufnr].fre.gc_group)
-
-    local project_members = manager.groups.project.instances
-    assert.are.equal(registered, manager:move_to_group(registered, "project"))
-    assert.are.equal(project_members, manager.groups.project.instances)
-    assert.are.equal(registered, project_members[registered.id])
-
-    local before_metadata = vim.b[bufnr].fre
-    assert.has_error(function() manager:move_to_group(registered, "missing") end)
-    assert.are.equal("project", registered.config.gc.group)
-    assert.are.same(before_metadata, vim.b[bufnr].fre)
-    assert.are.equal(registered, manager.groups.project.instances[registered.id])
-
-    manager:remove(registered)
-    assert.has_error(function() manager:move_to_group(registered, "default") end)
-    vim.api.nvim_buf_delete(bufnr, { force = true })
-  end)
-
-  it("rolls back group migration when metadata assignment fails", function()
-    local manager = manager_module.new()
-    manager:setup({ gc = { ttl_ms = 0, groups = { default = 0, project = 0 } } })
-    local bufnr = vim.api.nvim_create_buf(false, true)
-    local registered = instance(manager, bufnr)
-    vim.b[bufnr].fre = { gc_group = "default" }
-    manager:register(registered)
-
-    local real_b = vim.b
-    vim.b = setmetatable({}, {
-      __index = function(_, buffer)
-        local variables = real_b[buffer]
-        return setmetatable({}, {
-          __index = function(_, name) return variables[name] end,
-          __newindex = function(_, name, value)
-            if name == "fre" then error("injected metadata setter failure") end
-            variables[name] = value
-          end,
-        })
-      end,
+    manager:setup({
+      hidden_file = true,
+      gc = { ttl_ms = 75, include_modified = true, default_group = "project" },
     })
-    local ok, err = pcall(manager.move_to_group, manager, registered, "project")
-    vim.b = real_b
 
-    assert.is_false(ok)
-    assert.is_truthy(tostring(err):find("injected metadata setter failure", 1, true))
-    assert.are.equal(registered, manager.groups.default.instances[registered.id])
-    assert.is_nil(manager.groups.project.instances[registered.id])
-    assert.are.equal("default", registered.config.gc.group)
-    assert.are.equal("default", vim.b[bufnr].fre.gc_group)
+    local core, policy = manager:resolve_instance_config({
+      hidden_file = false,
+      gc = { ttl_ms = 25, include_modified = false, group = "default" },
+    })
 
-    manager:remove(registered)
-    vim.api.nvim_buf_delete(bufnr, { force = true })
+    assert.is_false(core.hidden_file)
+    assert.is_nil(core.gc)
+    assert.are.same({ ttl_ms = 25, include_modified = false, group = "default" }, policy)
   end)
 
-  it("consumes only matching live presentation facts through its User autocmd", function()
+  it("validates GC policy before core construction", function()
     local manager = manager_module.new()
-    manager:setup({ gc = { ttl_ms = 0, groups = { default = 0, project = 0 } } })
-    local first_buf = vim.api.nvim_create_buf(false, true)
-    local second_buf = vim.api.nvim_create_buf(false, true)
-    local first = instance(manager, first_buf)
-    local second = instance(manager, second_buf)
-    manager:register(first)
-    manager:register(second)
-
-    local function emit(data)
-      vim.api.nvim_exec_autocmds("User", {
-        pattern = "FreInstancePresentationChanged", modeline = false, data = data,
-      })
+    local constructed = false
+    local real_new = require("fre.instance").new
+    require("fre.instance").new = function(...)
+      constructed = true
+      return real_new(...)
     end
 
-    local first_hidden = first.hidden_since
-    local second_hidden = second.hidden_since
-    emit({ instance_id = first.id, bufnr = second.bufnr, visible = true })
-    emit({ instance_id = first.id + 10000, bufnr = first.bufnr, visible = true })
-    emit({ instance_id = first.id, bufnr = first.bufnr + 10000, visible = true })
-    assert.are.equal(first_hidden, first.hidden_since)
-    assert.are.equal(second_hidden, second.hidden_since)
+    local ok, err = pcall(manager.create_instance, manager, {
+      root = ".",
+      gc = { group = "missing" },
+    })
+    require("fre.instance").new = real_new
 
-    emit({ instance_id = first.id, bufnr = first.bufnr, visible = true })
-    assert.is_nil(first.hidden_since)
-    assert.are.equal(second_hidden, second.hidden_since)
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):find("unknown group", 1, true))
+    assert.is_false(constructed)
+  end)
 
-    emit({ instance_id = first.id, bufnr = first.bufnr, visible = false })
-    assert.is_number(first.hidden_since)
-    local final_hidden = first.hidden_since
+  it("keeps group definitions and membership exclusively in GC", function()
+    local manager = manager_module.new()
+    local first_buf = vim.api.nvim_create_buf(false, true)
+    local second_buf = vim.api.nvim_create_buf(false, true)
+    local first = instance(first_buf)
+    local second = instance(second_buf)
+    register(manager, first)
+    register(manager, second, { group = "project" })
 
-    manager.instances_by_id[first.id] = nil
-    emit({ instance_id = first.id, bufnr = first.bufnr, visible = true })
-    assert.are.equal(final_hidden, first.hidden_since)
-    manager.instances_by_id[first.id] = first
-
-    first.is_destroying = function() return true end
-    first.hidden_since = nil
-    emit({ instance_id = first.id, bufnr = first.bufnr, visible = false })
-    assert.is_nil(first.hidden_since)
+    assert.is_nil(manager.groups)
+    assert.are.equal(first, manager:find_by_group("default")[first.id])
+    assert.are.equal(second, manager:find_by_group("project")[second.id])
+    assert.are.equal(10, manager:get_gc_controller():group_capacity("default"))
+    assert.are.equal(5, manager:get_gc_controller():group_capacity("project"))
 
     manager:remove(first)
     manager:remove(second)
@@ -221,4 +103,121 @@ describe("fre manager", function()
     vim.api.nvim_buf_delete(second_buf, { force = true })
   end)
 
+  it("records complete snapshotted enrollment policy without Instance or buffer mirrors", function()
+    local manager = manager_module.new()
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.b[bufnr].fre = { version = 1, instance_id = 1, root = "." }
+    local subject = instance(bufnr)
+    register(manager, subject, { ttl_ms = 42, include_modified = true, group = "project" })
+
+    local entry = assert(manager:get_gc_controller():inspect(subject))
+    assert.are.same({
+      instance_id = subject.id,
+      bufnr = bufnr,
+      group = "project",
+      ttl_ms = 42,
+      include_modified = true,
+      hidden = true,
+      eligible = true,
+    }, entry)
+    assert.is_nil(subject.config)
+    assert.is_nil(subject.hidden_since)
+    assert.is_nil(subject._gc_timer)
+    assert.is_nil(vim.b[bufnr].fre.gc_group)
+
+    manager:remove(subject)
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end)
+
+  it("filters lifecycle, presentation, and activity facts by both live indexes", function()
+    local manager = manager_module.new()
+    manager:setup({ gc = { ttl_ms = 0, groups = { default = 0, project = 0 } } })
+    local first_buf = vim.api.nvim_create_buf(false, true)
+    local second_buf = vim.api.nvim_create_buf(false, true)
+    local first = instance(first_buf)
+    local second = instance(second_buf)
+    register(manager, first)
+    register(manager, second)
+
+    local initial = manager:get_gc_controller():inspect(first)
+    emit("FreInstancePresentationChanged", {
+      instance_id = first.id, bufnr = second.bufnr, visible = true,
+    })
+    emit("FreInstanceActivityChanged", {
+      instance_id = first.id + 10000, bufnr = first.bufnr,
+      activity = "write", active = true,
+    })
+    emit("FreReady", {
+      instance_id = first.id, bufnr = first.bufnr + 10000,
+      error = nil, result = {},
+    })
+    assert.are.same(initial, manager:get_gc_controller():inspect(first))
+
+    emit("FreInstancePresentationChanged", {
+      instance_id = first.id, bufnr = first.bufnr, visible = true,
+    })
+    assert.is_false(manager:get_gc_controller():inspect(first).hidden)
+    emit("FreInstanceActivityChanged", {
+      instance_id = first.id, bufnr = first.bufnr,
+      activity = "write", active = true,
+    })
+    assert.is_false(manager:get_gc_controller():inspect(first).eligible)
+    emit("FreInstanceActivityChanged", {
+      instance_id = first.id, bufnr = first.bufnr,
+      activity = "write", active = false,
+    })
+    emit("FreInstancePresentationChanged", {
+      instance_id = first.id, bufnr = first.bufnr, visible = false,
+    })
+    assert.is_true(manager:get_gc_controller():inspect(first).hidden)
+
+    first:set_state("destroying")
+    emit("FreInstanceDestroying", { instance_id = first.id, bufnr = first.bufnr })
+    assert.is_false(manager:get_gc_controller():inspect(first).eligible)
+    first:set_state("destroyed")
+    emit("FreInstanceDestroyed", { instance_id = first.id, bufnr = first.bufnr })
+    assert.is_nil(manager:find_by_id(first.id))
+    assert.is_nil(manager:find_by_buf(first.bufnr))
+    assert.is_nil(manager:get_gc_controller():inspect(first))
+
+    emit("FreReady", { instance_id = first.id, bufnr = first.bufnr, result = {} })
+    emit("FreInstancePresentationChanged", {
+      instance_id = first.id, bufnr = first.bufnr, visible = true,
+    })
+    emit("FreInstanceActivityChanged", {
+      instance_id = first.id, bufnr = first.bufnr, activity = "write", active = false,
+    })
+    emit("FreInstanceDestroyed", { instance_id = first.id, bufnr = first.bufnr })
+    assert.are.equal(second, manager:find_by_id(second.id))
+    assert.is_not_nil(manager:get_gc_controller():inspect(second))
+
+    manager:remove(second)
+    vim.api.nvim_buf_delete(first_buf, { force = true })
+    vim.api.nvim_buf_delete(second_buf, { force = true })
+  end)
+
+  it("delegates atomic group migration to GC without metadata or core mutation", function()
+    local manager = manager_module.new()
+    manager:setup({ gc = { ttl_ms = 100, groups = { default = 0, project = 0 } } })
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.b[bufnr].fre = { version = 1, instance_id = 1, root = "." }
+    local subject = instance(bufnr)
+    register(manager, subject)
+    local before = manager:get_gc_controller():inspect(subject)
+
+    assert.are.equal(subject, manager:move_to_group(subject, "project"))
+    local moved = manager:get_gc_controller():inspect(subject)
+    assert.are.equal("project", moved.group)
+    assert.are.equal(before.ttl_ms, moved.ttl_ms)
+    assert.are.equal(before.include_modified, moved.include_modified)
+    assert.are.equal(before.hidden, moved.hidden)
+    assert.is_nil(vim.b[bufnr].fre.gc_group)
+    assert.is_nil(subject.config)
+
+    assert.has_error(function() manager:move_to_group(subject, "missing") end)
+    assert.are.equal("project", manager:get_gc_controller():inspect(subject).group)
+
+    manager:remove(subject)
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end)
 end)

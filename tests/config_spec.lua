@@ -42,10 +42,11 @@ describe("fre configuration", function()
       defaults.columns[4].id,
     })
     assert.are.equal("%Y-%m-%d %H:%M", defaults.columns[4].format)
-    assert.are.same({ ttl_ms = 60000, include_modified = false, default_group = "default", groups = {
-      default = 10,
-      project = 5,
-    } }, defaults.gc)
+    assert.is_nil(defaults.gc)
+    assert.are.same({
+      ttl_ms = 60000, include_modified = false, default_group = "default",
+      groups = { default = 10, project = 5 },
+    }, new_manager():get_setup_defaults().gc)
     assert.are.same({ position = "left", size = 40 }, defaults.layout)
     assert.are.same({
       buftype = "acwrite",
@@ -322,7 +323,7 @@ describe("fre configuration", function()
       manager:resolve_instance_config({ inherit = {} })
     end)
 
-    local effective = manager:resolve_instance_config({
+    local effective, policy = manager:resolve_instance_config({
       sort = explicit_sort,
       hidden_file = true,
       expanded = { "src", "src/x" },
@@ -330,9 +331,10 @@ describe("fre configuration", function()
     assert.are.equal(explicit_sort, effective.sort)
     assert.is_true(effective.hidden_file)
     assert.are.same({ "src", "src/x" }, effective.expanded)
-    assert.are.equal(60000, effective.gc.ttl_ms)
-    assert.is_false(effective.gc.include_modified)
-    assert.are.equal("default", effective.gc.group)
+    assert.is_nil(effective.gc)
+    assert.are.same({
+      ttl_ms = 60000, include_modified = false, group = "default",
+    }, policy)
   end)
 
   it("validates expanded as a sequence of root-relative directory paths", function()
@@ -373,10 +375,11 @@ describe("fre configuration", function()
         default_group = "project",
       },
     })
-    local effective = manager:resolve_instance_config({
+    local effective, policy = manager:resolve_instance_config({
       gc = { ttl_ms = 0, include_modified = false, group = "default" },
     })
-    assert.are.same({ ttl_ms = 0, include_modified = false, group = "default" }, effective.gc)
+    assert.is_nil(effective.gc)
+    assert.are.same({ ttl_ms = 0, include_modified = false, group = "default" }, policy)
 
     assert_error_contains("unknown group", function()
       manager:resolve_instance_config({ gc = { group = "missing" } })

@@ -598,7 +598,6 @@ describe("fre ticket 10 prepare basic mutations", function()
       sync_views = function() end,
       request_write = function() end,
       request_destroy = function() end,
-      reconsider_gc = function() end,
       report_async_error = function() end,
     })
     fake.buffer.view = {

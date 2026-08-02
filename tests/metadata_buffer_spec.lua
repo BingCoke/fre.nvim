@@ -281,7 +281,6 @@ describe("fre metadata buffer rows", function()
       sync_views = function() end,
       request_write = function() end,
       request_destroy = function() end,
-      reconsider_gc = function() end,
       report_async_error = function() end,
     })
     local prepared = row.prepare(fake, { nodes = { node } }, function() return "plain.txt" end)

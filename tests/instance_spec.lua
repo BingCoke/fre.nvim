@@ -369,8 +369,9 @@ describe("fre async hidden instances", function()
       version = 1,
       instance_id = instance.id,
       root = instance.root,
-      gc_group = instance.config.gc.group,
     }, vim.b[instance.bufnr].fre)
+    assert.is_nil(instance.config.gc)
+    assert.is_nil(vim.b[instance.bufnr].fre.gc_group)
     assert.has_error(function()
       fre.new({ root = fixture.root, buffer = { variables = { fre = "no" } } })
     end)
@@ -442,18 +443,18 @@ describe("fre async hidden instances", function()
 
     local original_new = Instance.new
     local original_register = manager.register
-    local original_on_register = manager._gc.on_register
+    local original_gc_register = manager._gc.register
     Instance.new = function(...)
       local created = original_new(...)
       core_returned = true
       return created
     end
-    manager.register = function(target, created)
+    manager.register = function(target, created, policy)
       assert.is_true(core_returned)
-      return original_register(target, created)
+      return original_register(target, created, policy)
     end
-    manager._gc.on_register = function(controller, created)
-      local registered = original_on_register(controller, created)
+    manager._gc.register = function(controller, created, policy)
+      local registered = original_gc_register(controller, created, policy)
       gc_enrolled = true
       return registered
     end
@@ -461,7 +462,7 @@ describe("fre async hidden instances", function()
     local ok, result = pcall(manager.create_instance, manager, { root = fixture.root })
     Instance.new = original_new
     manager.register = original_register
-    manager._gc.on_register = original_on_register
+    manager._gc.register = original_gc_register
     assert.is_true(ok, tostring(result))
     local instance = keep(result)
 
@@ -484,14 +485,14 @@ describe("fre async hidden instances", function()
     local registrations = 0
     local enrollments = 0
     local original_register = manager.register
-    local original_on_register = manager._gc.on_register
-    manager.register = function(target, created)
+    local original_gc_register = manager._gc.register
+    manager.register = function(target, created, policy)
       registrations = registrations + 1
-      return original_register(target, created)
+      return original_register(target, created, policy)
     end
-    manager._gc.on_register = function(controller, created)
+    manager._gc.register = function(controller, created, policy)
       enrollments = enrollments + 1
-      return original_on_register(controller, created)
+      return original_gc_register(controller, created, policy)
     end
 
     local stages = {
@@ -548,7 +549,7 @@ describe("fre async hidden instances", function()
     end
 
     manager.register = original_register
-    manager._gc.on_register = original_on_register
+    manager._gc.register = original_gc_register
     assert.are.equal(0, registrations)
     assert.are.equal(0, enrollments)
     local next_id = registry:allocate_instance_id()
@@ -592,15 +593,16 @@ describe("fre async hidden instances", function()
     manager:set_fs_adapter({ load = function(_, done) pending = done end })
     local before_buffers = vim.api.nvim_list_bufs()
     local constructed
-    local original_on_register = manager._gc.on_register
-    manager._gc.on_register = function(controller, created)
+    local original_gc_register = manager._gc.register
+    manager._gc.register = function(controller, created, policy)
       constructed = created
-      original_on_register(controller, created)
+      local registered = original_gc_register(controller, created, policy)
       error("injected managed registration failure")
+      return registered
     end
 
     local ok, err = pcall(manager.create_instance, manager, { root = fixture.root })
-    manager._gc.on_register = original_on_register
+    manager._gc.register = original_gc_register
 
     local failed_id = constructed.id
     assert.is_false(ok)

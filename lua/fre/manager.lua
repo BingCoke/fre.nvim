@@ -17,89 +17,117 @@ local function positive_integer(value)
   return type(value) == "number" and value > 0 and value % 1 == 0
 end
 
-
-local function new_group(capacity)
-  return {
-    capacity = capacity,
-    instances = {},
-  }
+local function copy_without(source, omitted)
+  local result = {}
+  for key, value in pairs(source or {}) do
+    if not omitted[key] then result[key] = config.copy(value) end
+  end
+  return result
 end
 
 local next_observer_id = 0
 
-local function observe_presentation(manager)
+local function observe_managed_events(manager)
   next_observer_id = next_observer_id + 1
   local group = vim.api.nvim_create_augroup(
-    "FreManagerPresentation" .. tostring(next_observer_id), { clear = true }
+    "FreManager" .. tostring(next_observer_id), { clear = true }
   )
+
+  local function resolve(data)
+    if type(data) ~= "table" or not positive_integer(data.instance_id)
+        or not positive_integer(data.bufnr) then return nil end
+    local instance = manager.instances_by_id[data.instance_id]
+    if not instance or manager.instances_by_buf[data.bufnr] ~= instance
+        or instance.id ~= data.instance_id or instance.bufnr ~= data.bufnr then
+      return nil
+    end
+    return instance
+  end
+
   vim.api.nvim_create_autocmd("User", {
     group = group,
-    pattern = "FreInstancePresentationChanged",
+    pattern = {
+      "FreInstanceCreated",
+      "FreReady",
+      "FreInstancePresentationChanged",
+      "FreInstanceActivityChanged",
+      "FreInstanceDestroying",
+      "FreInstanceDestroyed",
+    },
     callback = function(args)
       local data = args.data
-      if type(data) ~= "table" or not positive_integer(data.instance_id)
-          or not positive_integer(data.bufnr) or type(data.visible) ~= "boolean" then return end
-      local instance = manager.instances_by_id[data.instance_id]
-      if not instance or manager.instances_by_buf[data.bufnr] ~= instance
-          or instance.id ~= data.instance_id or instance.bufnr ~= data.bufnr
-          or instance:is_destroying() or instance:is_destroyed() then return end
-      if data.visible then
-        manager._gc:presentation_enter(instance)
-      else
-        manager._gc:presentation_leave(instance)
+      local instance = resolve(data)
+      if not instance then return end
+      if args.match == "FreReady" then
+        if not instance:is_destroying() and not instance:is_destroyed() then
+          manager._gc:defer_reconsider(instance)
+        end
+      elseif args.match == "FreInstancePresentationChanged" then
+        if type(data.visible) ~= "boolean" or instance:is_destroying()
+            or instance:is_destroyed() then return end
+        if data.visible then
+          manager._gc:presentation_enter(instance)
+        else
+          manager._gc:presentation_leave(instance)
+        end
+      elseif args.match == "FreInstanceActivityChanged" then
+        if type(data.active) ~= "boolean"
+            or (data.activity ~= "refresh" and data.activity ~= "write"
+              and data.activity ~= "execution")
+            or instance:is_destroying() or instance:is_destroyed() then return end
+        manager._gc:activity_changed(instance, data.activity, data.active)
+      elseif args.match == "FreInstanceDestroying" then
+        manager._gc:stop(instance)
+      elseif args.match == "FreInstanceDestroyed" then
+        manager:remove(instance)
       end
     end,
   })
+
+  vim.api.nvim_create_autocmd("BufModifiedSet", {
+    group = group,
+    callback = function(args)
+      local instance = manager.instances_by_buf[args.buf]
+      if not instance or manager.instances_by_id[instance.id] ~= instance
+          or instance.bufnr ~= args.buf or instance:is_destroying()
+          or instance:is_destroyed() then return end
+      manager._gc:defer_reconsider(instance)
+    end,
+  })
+
   return group
 end
 
 function Manager.new(opts)
   opts = opts or {}
-  local defaults = config.resolve_setup()
-  local groups = {}
-  for name, capacity in next, defaults.gc.groups do
-    groups[name] = new_group(capacity)
-  end
   local self = setmetatable({
     _registry = opts.registry or registry.default,
-    _setup_defaults = defaults,
+    _setup_defaults = config.resolve_setup(),
     _default_file_explorer = nil,
     _fs_adapter = fs.default,
     _mutation_adapter = mutation_fs.default,
     _watch_adapter = watch.default,
     instances_by_id = {},
     instances_by_buf = {},
-    groups = groups,
+    _gc = gc.new(),
   }, Manager)
-  self._gc = gc.new(self)
-  self._presentation_augroup = observe_presentation(self)
-  if opts.takeover ~= nil then
-    self._takeover = opts.takeover(self)
-  end
+  self._events_augroup = observe_managed_events(self)
+  if opts.takeover ~= nil then self._takeover = opts.takeover(self) end
   return self
 end
 
-
 function Manager:create_instance(opts)
-  if type(opts) ~= "table" then
-    error("fre: new options must be a table", 2)
-  end
-  if opts.root == nil then
-    error("fre: root is required", 2)
-  end
-  if type(opts.root) ~= "string" then
-    error("fre: root must be a string", 2)
-  end
-  if opts.root == "" then
-    error("fre: root must not be empty", 2)
-  end
+  if type(opts) ~= "table" then error("fre: new options must be a table", 2) end
+  if opts.root == nil then error("fre: root is required", 2) end
+  if type(opts.root) ~= "string" then error("fre: root must be a string", 2) end
+  if opts.root == "" then error("fre: root must not be empty", 2) end
 
   local root = require("fre.path").absolute(opts.root)
-  local effective = self:resolve_instance_config(opts, root)
+  local effective, policy = self:resolve_instance_config(opts, root)
   local id = self._registry:allocate_instance_id()
   local instance = require("fre.instance").new(self, id, root, effective, self._registry)
   local ok, result = pcall(function()
-    self:register(instance)
+    self:register(instance, policy)
     return instance:_start_initial_load()
   end)
   if ok then return result end
@@ -112,7 +140,9 @@ function Manager:create_instance(opts)
 end
 
 function Manager:get_setup_defaults()
-  return config.copy(self._setup_defaults)
+  local result = config.copy(self._setup_defaults)
+  result.gc = self._gc:get_defaults()
+  return result
 end
 
 function Manager:get_default_file_explorer()
@@ -136,9 +166,7 @@ end
 
 function Manager:set_mutation_adapter(adapter)
   local methods = { "create_file", "create_directory", "copy", "move", "delete" }
-  if type(adapter) ~= "table" then
-    fail("mutation adapter must be a table")
-  end
+  if type(adapter) ~= "table" then fail("mutation adapter must be a table") end
   for _, method in ipairs(methods) do
     if type(adapter[method]) ~= "function" then
       fail("mutation adapter must provide " .. method .. "()")
@@ -176,43 +204,19 @@ function Manager:is_gc_eligible(instance)
   return self._gc:is_eligible(instance)
 end
 
-
-function Manager:gc_reconsider(instance, deferred)
-  if deferred then
-    self._gc:defer_reconsider(instance)
-  else
-    self._gc:reconsider(instance)
-  end
-end
-
 function Manager:setup(opts)
+  opts = opts or {}
+  if type(opts) ~= "table" then error("fre.config: setup options must be a table", 2) end
   local first_setup = self._default_file_explorer == nil
-  local candidate = config.resolve_setup(opts, not first_setup)
-  if not first_setup then
-    candidate.default_file_explorer = self._default_file_explorer
-  end
+  local core_opts = copy_without(opts, { gc = true })
+  local candidate = config.resolve_setup(core_opts, not first_setup)
+  local gc_opts = opts.gc
+  local gc_candidate = gc.resolve_setup(gc_opts)
+  if not first_setup then candidate.default_file_explorer = self._default_file_explorer end
 
-  for group_name, group in next, self.groups do
-    if next(group.instances) ~= nil and candidate.gc.groups[group_name] == nil then
-      fail("cannot remove GC group used by a live instance: " .. group_name)
-    end
-  end
-
-  local replacement_groups = {}
-  for name, capacity in next, candidate.gc.groups do
-    local existing = self.groups[name]
-    replacement_groups[name] = {
-      capacity = capacity,
-      instances = existing and existing.instances or {},
-    }
-  end
-
+  self._gc:configure(gc_candidate)
   self._setup_defaults = config.copy(candidate)
-  self.groups = replacement_groups
-  if first_setup then
-    self._default_file_explorer = candidate.default_file_explorer
-  end
-  self._gc:enforce_all()
+  if first_setup then self._default_file_explorer = candidate.default_file_explorer end
   if first_setup and candidate.default_file_explorer and self._takeover then
     self._takeover:enable()
   end
@@ -220,85 +224,45 @@ function Manager:setup(opts)
 end
 
 function Manager:resolve_instance_config(opts, normalized_root)
-  return config.resolve_instance(self._setup_defaults, opts, normalized_root)
+  opts = opts or {}
+  if type(opts) ~= "table" then error("fre.config: new options must be a table", 2) end
+  local policy = self._gc:resolve_policy(opts.gc)
+  local core_opts = copy_without(opts, { gc = true })
+  local effective = config.resolve_instance(self._setup_defaults, core_opts, normalized_root)
+  return effective, policy
 end
 
-function Manager:register(instance)
-  if type(instance) ~= "table" then
-    fail("instance must be a table")
-  end
-  if not positive_integer(instance.id) then
-    fail("instance.id must be a positive integer")
-  end
-  if not positive_integer(instance.bufnr) then
-    fail("instance.bufnr must be a positive integer")
-  end
+function Manager:register(instance, policy)
+  if type(instance) ~= "table" then fail("instance must be a table") end
+  if not positive_integer(instance.id) then fail("instance.id must be a positive integer") end
+  if not positive_integer(instance.bufnr) then fail("instance.bufnr must be a positive integer") end
   if self.instances_by_id[instance.id] ~= nil then
     fail("instance ID is already registered: " .. instance.id)
   end
   if self.instances_by_buf[instance.bufnr] ~= nil then
     fail("buffer is already registered: " .. instance.bufnr)
   end
-  local group_name = instance.config
-    and instance.config.gc
-    and instance.config.gc.group
-  local group = group_name and self.groups[group_name]
-  if not group then
-    fail("instance has unknown GC group: " .. tostring(group_name))
-  end
 
   self.instances_by_id[instance.id] = instance
   self.instances_by_buf[instance.bufnr] = instance
-  group.instances[instance.id] = instance
-  local ok, err = pcall(self._gc.on_register, self._gc, instance)
+  local ok, err = pcall(self._gc.register, self._gc, instance, policy)
   if not ok then
-    self._gc:stop(instance)
     self.instances_by_id[instance.id] = nil
     self.instances_by_buf[instance.bufnr] = nil
-    group.instances[instance.id] = nil
+    self._gc:unregister(instance)
     error(err, 0)
   end
+
+  self._gc:enforce_after_register(instance)
   return instance
 end
 
 function Manager:move_to_group(instance, group_name)
-  if type(instance) ~= "table"
-      or self.instances_by_id[instance.id] ~= instance
+  if type(instance) ~= "table" or self.instances_by_id[instance.id] ~= instance
       or self.instances_by_buf[instance.bufnr] ~= instance then
     fail("instance is not registered")
   end
-  local current_name = instance.config and instance.config.gc and instance.config.gc.group
-  local current = current_name and self.groups[current_name]
-  if not current or current.instances[instance.id] ~= instance then
-    fail("instance GC group membership is not registered")
-  end
-  local target = self.groups[group_name]
-  if not target then fail("unknown GC group: " .. tostring(group_name)) end
-  if current == target then return instance end
-
-  if not vim.api.nvim_buf_is_valid(instance.bufnr) then
-    fail("instance buffer is not valid")
-  end
-  local metadata = vim.b[instance.bufnr].fre
-  if type(metadata) ~= "table" then fail("instance GC metadata is missing") end
-  metadata.gc_group = group_name
-
-  current.instances[instance.id] = nil
-  target.instances[instance.id] = instance
-  instance.config.gc.group = group_name
-  local ok, err = pcall(function()
-    vim.b[instance.bufnr].fre = metadata
-    self._gc:enforce_group(group_name, instance)
-  end)
-  if not ok then
-    instance.config.gc.group = current_name
-    target.instances[instance.id] = nil
-    current.instances[instance.id] = instance
-    metadata.gc_group = current_name
-    pcall(function() vim.b[instance.bufnr].fre = metadata end)
-    error(err, 0)
-  end
-  return instance
+  return self._gc:move(instance, group_name)
 end
 
 function Manager:find_by_id(id)
@@ -310,39 +274,19 @@ function Manager:find_by_buf(bufnr)
 end
 
 function Manager:find_by_group(group_name)
-  local group = self.groups[group_name]
-  if not group then
-    return nil
-  end
-  local result = {}
-  for id, instance in next, group.instances do
-    result[id] = instance
-  end
-  return result
+  return self._gc:find_by_group(group_name)
 end
 
 function Manager:remove(instance_or_id)
   local instance = instance_or_id
-  if type(instance_or_id) ~= "table" then
-    instance = self.instances_by_id[instance_or_id]
-  end
-  if not instance or self.instances_by_id[instance.id] ~= instance then
-    return nil
-  end
-
-  if not instance:is_destroyed() and not instance:is_destroying() then self._gc:stop(instance) end
+  if type(instance_or_id) ~= "table" then instance = self.instances_by_id[instance_or_id] end
+  if not instance or self.instances_by_id[instance.id] ~= instance then return nil end
 
   self.instances_by_id[instance.id] = nil
-  for bufnr, indexed in next, self.instances_by_buf do
-    if indexed == instance then
-      self.instances_by_buf[bufnr] = nil
-    end
+  for bufnr, indexed in pairs(self.instances_by_buf) do
+    if indexed == instance then self.instances_by_buf[bufnr] = nil end
   end
-  for _, group in next, self.groups do
-    if group.instances[instance.id] == instance then
-      group.instances[instance.id] = nil
-    end
-  end
+  self._gc:unregister(instance)
   return instance
 end
 

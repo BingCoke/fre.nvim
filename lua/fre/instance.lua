@@ -66,7 +66,6 @@ function Instance:_complete_initial_load(err, result, _real_root, on_complete)
       self.buffer:set_lines({ self:_error_line(completion_err) })
     else
       self.sync:sync_watchers(false)
-      if self.hidden_since ~= nil then self.manager:gc_reconsider(self, true) end
     end
   end
   if not self.lifecycle:complete_load(err, result, before_observers) then return end
@@ -459,10 +458,8 @@ end
 function Instance:_start_destroy()
   if not self.lifecycle:begin_destroy() then return false end
   Events.destroying(self.id, self.bufnr)
-  local manager = self.manager
   pcall(view.hide_all, self.view)
   view.destroy(self.view)
-  manager:get_gc_controller():stop(self)
   self.buffer:clear_initial_cursors()
   self._reveal_generation = self._reveal_generation + 1
   if self.work then pcall(self.work.destroy, self.work) end
@@ -472,7 +469,6 @@ function Instance:_start_destroy()
 end
 
 function Instance:_finish_destroy()
-  local manager = self.manager
   local bufnr = self.bufnr
   local delete_error
   if vim.api.nvim_buf_is_valid(bufnr) then
@@ -489,7 +485,6 @@ function Instance:_finish_destroy()
     error("fre: failed to delete instance buffer: " .. tostring(delete_error), 2)
   end
   if self.buffer then pcall(buffer.teardown, self.buffer) end
-  manager:remove(self)
   local retained = { id = true, root = true, bufnr = true, lifecycle = true }
   for key in pairs(self) do
     if not retained[key] then self[key] = nil end
@@ -591,7 +586,6 @@ function Instance.new(manager, id, root, effective, registry)
       version = 1,
       instance_id = self.id,
       root = self.root,
-      gc_group = self.config.gc.group,
     }
     for key, value in pairs(self.config.buffer.variables or {}) do
       if key ~= "fre" then vim.b[bufnr][key] = copy(value) end
@@ -630,9 +624,6 @@ function Instance.new(manager, id, root, effective, registry)
         return require("fre.actions").write(ctx)
       end,
       request_destroy = function() return self:destroy() end,
-      reconsider_gc = function(_, deferred)
-        return manager:gc_reconsider(self, deferred)
-      end,
       report_async_error = function(err) return self:_report_async_error(err) end,
     })
     self.sync = Sync.new({
@@ -671,7 +662,6 @@ function Instance.new(manager, id, root, effective, registry)
       get_mutation_adapter = function() return manager:get_mutation_adapter() end,
       is_alive = function() return not self.lifecycle:is_dead() end,
       is_ready = function() return self.lifecycle:is_ready() end,
-      reconsider_gc = function(deferred) return manager:gc_reconsider(self, deferred) end,
       on_activity = function(activity, active) self:_emit_activity(activity, active) end,
       report_error = function(err) return self:_report_async_error(err) end,
     })
