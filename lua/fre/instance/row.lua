@@ -23,12 +23,9 @@ local function valid_integer(value, allow_zero)
 end
 
 
-local function decode_decimal(text, row_number, label, allow_zero)
+local function decode_decimal_value(text, row_number, label, allow_zero)
   if text == "" or text:find("[^0-9]") then
     fail_row(row_number, "invalid " .. label .. " decimal ID")
-  end
-  if #text > 1 and text:sub(1, 1) == "0" then
-    fail_row(row_number, "non-canonical " .. label .. " decimal ID")
   end
   local value = tonumber(text)
   if not valid_integer(value, allow_zero) then
@@ -37,7 +34,26 @@ local function decode_decimal(text, row_number, label, allow_zero)
   return value
 end
 
-function M.marker(_, instance_id, node_id)
+local function decode_canonical_decimal(text, row_number, label)
+  if #text > 1 and text:sub(1, 1) == "0" then
+    fail_row(row_number, "non-canonical " .. label .. " decimal ID")
+  end
+  return decode_decimal_value(text, row_number, label, false)
+end
+
+local function decode_aligned_node_id(text, row_number)
+  return decode_decimal_value(text, row_number, "node", true)
+end
+
+local function format_aligned_node_id(node_id, width)
+  local text = tostring(node_id)
+  if type(width) ~= "number" or width % 1 ~= 0 or width < #text then
+    fail("node marker width must fit the decimal ID", 4)
+  end
+  return string.rep("0", width - #text) .. text
+end
+
+function M.marker(_, instance_id, node_id, node_width)
   if not identity.valid(instance_id) then
     fail("instance marker ID must be a non-empty string without control characters", 3)
   end
@@ -45,7 +61,7 @@ function M.marker(_, instance_id, node_id)
     fail("node marker ID must be a non-negative integer", 3)
   end
   return PREFIX .. tostring(#instance_id) .. ":" .. instance_id .. ":"
-    .. tostring(node_id) .. US
+    .. format_aligned_node_id(node_id, node_width) .. US
 end
 
 function M.decode_marker(_, row_number, line)
@@ -55,8 +71,8 @@ function M.decode_marker(_, row_number, line)
   local length_end = line:find(":", #PREFIX + 1, true)
   if not length_end then fail_row(row_number, "malformed reserved row marker") end
   local length_text = line:sub(#PREFIX + 1, length_end - 1)
-  local instance_length = decode_decimal(
-    length_text, row_number, "instance length", false
+  local instance_length = decode_canonical_decimal(
+    length_text, row_number, "instance length"
   )
   local instance_start = length_end + 1
   local instance_end = instance_start + instance_length - 1
@@ -70,11 +86,10 @@ function M.decode_marker(_, row_number, line)
   local node_start = instance_end + 2
   local marker_end = line:find(US, node_start, true)
   if not marker_end then fail_row(row_number, "malformed reserved row marker") end
-  local node_id = decode_decimal(
-    line:sub(node_start, marker_end - 1), row_number, "node", true
-  )
+  local node_text = line:sub(node_start, marker_end - 1)
+  local node_id = decode_aligned_node_id(node_text, row_number)
   local marker_text = line:sub(1, marker_end)
-  if marker_text ~= M.marker(nil, instance_id, node_id) then
+  if marker_text ~= M.marker(nil, instance_id, node_id, #node_text) then
     fail_row(row_number, "non-canonical row marker")
   end
   return {
@@ -726,9 +741,10 @@ function M.prepare(buffer, projection, render_path, opts)
   add_rendered(tree:root_node(), navigation_path, navigation_kind)
   for _, node in ipairs(nodes) do add_rendered(node, render_path(node), nil) end
 
+  local marker_node_width = #tostring(tree:latest_node_id())
   local lines, baseline, highlights, row_templates = {}, {}, {}, {}
   for row_number, item in ipairs(rendered) do
-    local marker_text = M.marker(buffer, buffer.id, item.node_id)
+    local marker_text = M.marker(buffer, buffer.id, item.node_id, marker_node_width)
     local physical = {}
     local template = {
       instance_id = buffer.id,

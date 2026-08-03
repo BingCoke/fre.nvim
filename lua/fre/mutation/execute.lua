@@ -310,8 +310,12 @@ function M.start(plan, handlers_value, adapter, on_terminal)
     end
     local function report(detail)
       if callback_received or token ~= state.callback_token or terminal_states[state.state] then return end
-      state.detail = copy(detail)
-      emit_progress()
+      local callback_detail = copy(detail)
+      vim.schedule(function()
+        if token ~= state.callback_token or terminal_states[state.state] then return end
+        state.detail = callback_detail
+        emit_progress()
+      end)
     end
 
     local ok, request_or_err = pcall(dispatch_adapter, adapter, valid, done, report)

@@ -4,12 +4,13 @@ local mutation_fs = require("fre.mutation.fs")
 local Instance = require("fre.instance")
 local manager_module = require("fre.manager")
 local watch = require("fre.watch")
-local view = require("fre.view")
 
 local M = {}
 
 M.view = {
-  inspect = view.inspect,
+  inspect = function(instance, location)
+    return instance:inspect_view(location)
+  end,
 }
 
 function M.setup(opts)
