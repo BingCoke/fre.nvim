@@ -42,7 +42,7 @@ local function subject(view)
   local current = assert(state(view))
   return {
     bufnr = current.bufnr,
-    config = { window = { options = current.window_options } },
+    window_options = current.window_options,
   }
 end
 

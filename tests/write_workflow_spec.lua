@@ -9,6 +9,12 @@ local fs = require("tests.helpers.fs")
 local fixture
 local instances = {}
 local original_notify
+local active_ui
+local ui_adapter
+local active_mutation
+local mutation_adapter
+local active_load
+local fs_adapter
 
 local function keep(instance)
   instances[#instances + 1] = instance
@@ -190,7 +196,7 @@ local function scripted_ui(opts)
     }
     if opts.report_error then error(opts.report_error) end
   end
-  actions._set_ui_adapter(ui)
+  active_ui = ui
   return ui
 end
 
@@ -226,9 +232,27 @@ describe("fre ticket 11 write workflow", function()
     instances = {}
     original_notify = vim.notify
     vim.notify = function() end
-    actions._reset_ui_adapter()
-    fre._reset_fs_adapter()
-    fre._reset_mutation_adapter()
+    active_ui = write_ui
+    ui_adapter = {
+      confirm = function(...) return active_ui.confirm(...) end,
+      progress = function(...) return active_ui.progress(...) end,
+      report = function(...)
+        if type(active_ui.report) == "function" then return active_ui.report(...) end
+      end,
+    }
+    actions._set_ui_adapter(ui_adapter)
+    active_load = real_fs.load
+    fs_adapter = { load = function(...) return active_load(...) end }
+    fre._set_fs_adapter(fs_adapter)
+    active_mutation = mutation_fs.default
+    mutation_adapter = {
+      create_file = function(...) return active_mutation.create_file(...) end,
+      create_directory = function(...) return active_mutation.create_directory(...) end,
+      copy = function(...) return active_mutation.copy(...) end,
+      move = function(...) return active_mutation.move(...) end,
+      delete = function(...) return active_mutation.delete(...) end,
+    }
+    fre._set_mutation_adapter(mutation_adapter)
   end)
 
   after_each(function()
@@ -253,6 +277,8 @@ describe("fre ticket 11 write workflow", function()
 
   it("routes actual BufWriteCmd through confirmation, real mutations, and successful truth reconciliation", function()
     local instance = ready({ ["a.txt"] = "a", ["delete.txt"] = "d" })
+    assert.are.equal(mutation_adapter, instance.work.mutation_adapter)
+    assert.are.equal(ui_adapter, instance.work.write_ui_adapter)
     local ui = scripted_ui()
     set_lines(instance, {
       edited_line(instance, "a.txt", "moved.txt"),
@@ -387,7 +413,7 @@ describe("fre ticket 11 write workflow", function()
     local instance = ready({ ["a.txt"] = "a", ["dir/child.txt"] = "child" })
     local ui = scripted_ui()
     local pending = {}
-    fre._set_mutation_adapter(pending_adapter(pending))
+    active_mutation = pending_adapter(pending)
     set_lines(instance, {
       physical_line(instance, "a.txt"), physical_line(instance, "dir"), "held.txt",
     })
@@ -452,7 +478,7 @@ describe("fre ticket 11 write workflow", function()
   it("passes display lines verbatim and cancellation preserves the draft without execution", function()
     local instance = ready({ ["a.txt"] = "a" })
     local ui = scripted_ui()
-    fre._set_mutation_adapter(complete_adapter())
+    active_mutation = complete_adapter()
     local draft = {
       lines(instance)[1], physical_line(instance, "a.txt"), "new name  with spaces.txt",
     }
@@ -471,7 +497,7 @@ describe("fre ticket 11 write workflow", function()
   end)
 
   it("uses verbatim default confirmation and cancels progress only on explicit close", function()
-    actions._reset_ui_adapter()
+    active_ui = write_ui
     local decision
     local display = { "literal  one", "NOT DERIVED -> \"two\"" }
     local confirmation = write_ui.confirm({}, display, function(value) decision = value end)
@@ -503,7 +529,7 @@ describe("fre ticket 11 write workflow", function()
   end)
 
   it("refocuses the restored caller without overriding a later window selection", function()
-    actions._reset_ui_adapter()
+    active_ui = write_ui
     local instance = ready({ ["a.txt"] = "a" })
     instance:open({ position = "current" })
     set_lines(instance, { physical_line(instance, "a.txt"), "new.txt" })
@@ -682,7 +708,7 @@ describe("fre ticket 11 write workflow", function()
     local ui = scripted_ui()
     local count = 0
     local adapter = mutation_fs.default
-    fre._set_mutation_adapter({
+    active_mutation = {
       create_file = function(path, done, report)
         count = count + 1
         if count == 2 then done("forced second create failure", nil, false); return end
@@ -692,7 +718,7 @@ describe("fre ticket 11 write workflow", function()
       copy = adapter.copy,
       move = adapter.move,
       delete = adapter.delete,
-    })
+    }
     set_lines(instance, { physical_line(instance, "keep.txt"), "first.txt", "second.txt" })
     assert.is_true(write_command(instance))
     ui.decide(true)
@@ -712,7 +738,7 @@ describe("fre ticket 11 write workflow", function()
   it("shows progress immediately, ignores focus loss, and explicit progress close cancels then reconciles", function()
     local instance = ready({})
     local ui = scripted_ui()
-    fre._set_mutation_adapter({
+    active_mutation = {
       create_file = function(path, done)
         return {
           cancel = function()
@@ -727,7 +753,7 @@ describe("fre ticket 11 write workflow", function()
       copy = function(_, _, _, done) done(nil) end,
       move = function(_, _, done) done(nil) end,
       delete = function(_, _, done) done(nil) end,
-    })
+    }
     set_lines(instance, { "partial.txt" })
     assert.is_true(write_command(instance))
     ui.decide(true)
@@ -753,7 +779,7 @@ describe("fre ticket 11 write workflow", function()
     }
     set_lines(instance, draft)
     assert.is_true(write_command(instance))
-    fre._set_fs_adapter({ load = function(_, done) done("forced reconciliation failure") end })
+    active_load = function(_, done) done("forced reconciliation failure") end
     ui.decide(true)
     wait_unlocked(instance)
 
@@ -770,7 +796,7 @@ describe("fre ticket 11 write workflow", function()
     assert.is_truthy(tostring(ui.reports[1].reconciliation_error)
       :find("forced reconciliation failure", 1, true))
 
-    fre._set_fs_adapter(real_fs)
+    active_load = real_fs.load
     local refreshed, refresh_error = false, nil
     instance:refresh({ force = true, on_complete = function(err)
       refresh_error = err
@@ -806,11 +832,9 @@ describe("fre ticket 11 write workflow", function()
   end)
 
   it("writes retained unsupported snapshot kinds through the empty Plan path", function()
-    fre._set_fs_adapter({
-      load = function(scan_path, done)
-        done(nil, { { name = "device", kind = "char" } }, scan_path)
-      end,
-    })
+    active_load = function(scan_path, done)
+      done(nil, { { name = "device", kind = "char" } }, scan_path)
+    end
     local instance = wait_ready(keep(fre.new({ root = fixture.root, columns = {} })))
     local ui = scripted_ui()
     local baseline = lines(instance)
@@ -845,7 +869,7 @@ describe("fre ticket 11 write workflow", function()
       progress_close_error = "close exploded",
       report_error = "report exploded",
     })
-    fre._set_mutation_adapter(complete_adapter())
+    active_mutation = complete_adapter()
     set_lines(progress_instance, { physical_line(progress_instance, "a.txt"), "other.txt" })
     assert.is_true(write_command(progress_instance))
     wait_unlocked(progress_instance)
@@ -858,16 +882,16 @@ describe("fre ticket 11 write workflow", function()
 
   it("keeps direct execute isolated from write lock, UI, refresh, tree, and buffer state", function()
     local load_count = 0
-    fre._set_fs_adapter({ load = function(path, done)
+    active_load = function(path, done)
       load_count = load_count + 1
       real_fs.load(path, done)
-    end })
+    end
     local instance = ready({ ["a.txt"] = "a" })
     local ui = scripted_ui()
     local calls = 0
     local adapter = complete_adapter()
     adapter.create_file = function(_, done) calls = calls + 1; done(nil) end
-    fre._set_mutation_adapter(adapter)
+    active_mutation = adapter
     local before = {
       lines = lines(instance),
       tree = instance.tree,

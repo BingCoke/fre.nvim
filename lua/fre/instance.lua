@@ -1,12 +1,16 @@
 local config = require("fre.config")
 local buffer = require("fre.instance.buffer")
+local fs = require("fre.fs")
 local path = require("fre.path")
+local mutation_fs = require("fre.mutation.fs")
 local Work = require("fre.instance.work")
 local Tree = require("fre.instance.tree")
 local Lifecycle = require("fre.instance.lifecycle")
 local Events = require("fre.instance.events")
 local Sync = require("fre.instance.sync")
 local view = require("fre.instance.view")
+local watch = require("fre.watch")
+local write_ui = require("fre.write_ui")
 
 local Instance = {}
 Instance.__index = Instance
@@ -549,17 +553,21 @@ function Instance:_start_initial_load()
   return self
 end
 
-function Instance.new(manager, id, root, effective, registry)
+function Instance.new(manager, id, root, effective, registry, fs_adapter, watch_adapter,
+    mutation_adapter, write_ui_adapter)
   local bufnr = vim.api.nvim_create_buf(false, true)
   local self = setmetatable({
     manager = manager,
     id = id,
     bufnr = bufnr,
   }, Instance)
+  fs_adapter = fs_adapter or fs.default
+  watch_adapter = watch_adapter or watch.default
+  mutation_adapter = mutation_adapter or mutation_fs.default
+  write_ui_adapter = write_ui_adapter or write_ui
 
   local ok, result = xpcall(function()
     self.root = root
-    self.config = copy(effective)
     self.lifecycle = Lifecycle.new({
       schedule = vim.schedule,
       emit_ready = function(err, result) self:_emit_ready(err, result) end,
@@ -569,15 +577,15 @@ function Instance.new(manager, id, root, effective, registry)
       id = self.id,
       bufnr = self.bufnr,
       lifecycle = self.lifecycle,
-      layout = self.config.layout,
-      window_options = self.config.window.options,
+      layout = effective.layout,
+      window_options = effective.window.options,
     })
 
     vim.api.nvim_buf_set_name(bufnr, "fre://" .. tostring(self.id))
     for key, value in pairs(required_options) do
       vim.bo[bufnr][key] = value
     end
-    for key, value in pairs(self.config.buffer.options or {}) do
+    for key, value in pairs(effective.buffer.options or {}) do
       vim.bo[bufnr][key] = value
     end
     vim.bo[bufnr].filetype = "fre"
@@ -587,7 +595,7 @@ function Instance.new(manager, id, root, effective, registry)
       instance_id = self.id,
       root = self.root,
     }
-    for key, value in pairs(self.config.buffer.variables or {}) do
+    for key, value in pairs(effective.buffer.variables or {}) do
       if key ~= "fre" then vim.b[bufnr][key] = copy(value) end
     end
 
@@ -596,7 +604,9 @@ function Instance.new(manager, id, root, effective, registry)
       id = self.id,
       root = self.root,
       bufnr = self.bufnr,
-      config = self.config,
+      columns = effective.columns,
+      use_mapping_default = effective.use_mapping_default,
+      mapping = effective.mapping,
       tree = self.tree,
       hidden_file = effective.hidden_file,
       registry = registry,
@@ -630,10 +640,9 @@ function Instance.new(manager, id, root, effective, registry)
       root = self.root,
       tree = self.tree,
       buffer = self.buffer,
-      config = self.config,
-      load = function(load_path, done)
-        return manager:get_fs_adapter().load(load_path, done)
-      end,
+      expanded = effective.expanded,
+      auto_expand_single_directory = effective.auto_expand_single_directory,
+      fs_adapter = fs_adapter,
       schedule = vim.schedule,
       bufnr = self.bufnr,
       is_alive = function() return not self.lifecycle:is_dead() end,
@@ -650,7 +659,7 @@ function Instance.new(manager, id, root, effective, registry)
       end,
       report_error = function(err) self:_report_async_error(err) end,
       on_followup_needed = function() view.refresh_if_presented(self.view) end,
-      watch_adapter = manager:get_watch_adapter(),
+      watch_adapter = watch_adapter,
     })
     self.work = Work.new({
       root = self.root,
@@ -658,8 +667,9 @@ function Instance.new(manager, id, root, effective, registry)
       tree = self.tree,
       buffer = self.buffer,
       sync = self.sync,
-      skip_confirm_for_simple_edits = self.config.skip_confirm_for_simple_edits,
-      get_mutation_adapter = function() return manager:get_mutation_adapter() end,
+      skip_confirm_for_simple_edits = effective.skip_confirm_for_simple_edits,
+      mutation_adapter = mutation_adapter,
+      write_ui_adapter = write_ui_adapter,
       is_alive = function() return not self.lifecycle:is_dead() end,
       is_ready = function() return self.lifecycle:is_ready() end,
       on_activity = function(activity, active) self:_emit_activity(activity, active) end,

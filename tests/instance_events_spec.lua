@@ -8,6 +8,10 @@ local real_fs = require("fre.fs").default
 local fixture
 local instances
 local event_group = "FreTicket04Events"
+local active_load
+local fs_adapter
+local active_mutation
+local mutation_adapter
 
 local function keep(instance)
   instances[#instances + 1] = instance
@@ -55,8 +59,18 @@ describe("fre finite Instance User events", function()
     fixture = fs.new()
     instances = {}
     original_notify = vim.notify
-    fre._reset_fs_adapter()
-    fre._reset_mutation_adapter()
+    active_load = real_fs.load
+    fs_adapter = { load = function(...) return active_load(...) end }
+    fre._set_fs_adapter(fs_adapter)
+    active_mutation = mutation_fs.default
+    mutation_adapter = {
+      create_file = function(...) return active_mutation.create_file(...) end,
+      create_directory = function(...) return active_mutation.create_directory(...) end,
+      copy = function(...) return active_mutation.copy(...) end,
+      move = function(...) return active_mutation.move(...) end,
+      delete = function(...) return active_mutation.delete(...) end,
+    }
+    fre._set_mutation_adapter(mutation_adapter)
     actions._reset_ui_adapter()
     vim.api.nvim_create_augroup(event_group, { clear = true })
   end)
@@ -95,7 +109,7 @@ describe("fre finite Instance User events", function()
     end)
 
     local pending
-    fre._set_fs_adapter({ load = function(_, done) pending = done end })
+    active_load = function(_, done) pending = done end
     local instance = keep(fre.new({ root = fixture.root, columns = {} }))
     assert.are.same({ "created" }, order)
     assert.are.equal(instance.id, created_data.instance_id)
@@ -120,7 +134,7 @@ describe("fre finite Instance User events", function()
     local ready_data
     local observed_error
     capture("FreReady", function(data) ready_data = data end)
-    fre._set_fs_adapter({ load = function(_, done) pending = done end })
+    active_load = function(_, done) pending = done end
     local instance = keep(fre.new({
       root = fixture.root,
       columns = {},
@@ -196,7 +210,7 @@ describe("fre finite Instance User events", function()
     local instance = ready({ ["a.txt"] = "a" })
 
     local refresh_done
-    fre._set_fs_adapter({ load = function(_, done) refresh_done = done end })
+    active_load = function(_, done) refresh_done = done end
     local refresh_complete = false
     instance:refresh({ on_complete = function() refresh_complete = true end })
     assert.are.same({
@@ -220,13 +234,13 @@ describe("fre finite Instance User events", function()
     }, events[4])
 
     local execution_done
-    fre._set_mutation_adapter({
+    active_mutation = {
       create_file = function(_, done) execution_done = done end,
       create_directory = mutation_fs.default.create_directory,
       copy = mutation_fs.default.copy,
       move = mutation_fs.default.move,
       delete = mutation_fs.default.delete,
-    })
+    }
     local execution = instance:execute({
       operations = { { type = "create_file", path = "created.txt" } },
     })
@@ -256,7 +270,7 @@ describe("fre finite Instance User events", function()
     capture("FreInstanceDestroying", function() sequence[#sequence + 1] = "destroying" end)
     capture("FreInstanceDestroyed", function() sequence[#sequence + 1] = "destroyed" end)
     local instance = ready({ ["a.txt"] = "a" })
-    fre._set_fs_adapter({ load = function(_, done) refresh_done = done end })
+    active_load = function(_, done) refresh_done = done end
 
     instance:refresh({ on_complete = function() refresh_callbacks = refresh_callbacks + 1 end })
     assert.are.same({ "refresh:true" }, sequence)

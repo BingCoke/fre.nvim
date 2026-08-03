@@ -8,6 +8,8 @@ local fixture
 local instances = {}
 local watcher
 local original_notify
+local active_load
+local fs_adapter
 
 local function keep(instance)
   instances[#instances + 1] = instance
@@ -147,23 +149,23 @@ end
 
 local function loader_counts()
   local counts = {}
-  fre._set_fs_adapter({ load = function(scan_path, done)
+  active_load = function(scan_path, done)
     counts[scan_path] = (counts[scan_path] or 0) + 1
     real_fs.load(scan_path, done)
-  end })
+  end
   return counts
 end
 
 local function delayed_first_scans()
   local counts, pending = {}, {}
-  fre._set_fs_adapter({ load = function(scan_path, done)
+  active_load = function(scan_path, done)
     counts[scan_path] = (counts[scan_path] or 0) + 1
     if counts[scan_path] == 1 then
       pending[scan_path] = done
     else
       real_fs.load(scan_path, done)
     end
-  end })
+  end
   local function complete(scan_path)
     local done = assert(pending[scan_path], "missing pending scan for " .. scan_path)
     pending[scan_path] = nil
@@ -212,7 +214,9 @@ describe("fre ticket 15 directory watchers", function()
     fixture = fs.new()
     instances = {}
     original_notify = vim.notify
-    fre._reset_fs_adapter()
+    active_load = real_fs.load
+    fs_adapter = { load = function(...) return active_load(...) end }
+    fre._set_fs_adapter(fs_adapter)
     watcher = fake_watcher()
     fre._set_watch_adapter(watcher)
   end)
@@ -231,6 +235,8 @@ describe("fre ticket 15 directory watchers", function()
 
   it("watches only root and active expanded ancestor chains", function()
     local instance = ready({ ["a/n/deep.txt"] = "x", ["b/other.txt"] = "y" })
+    assert.are.equal(fs_adapter, instance.sync.fs_adapter)
+    assert.are.equal(watcher, instance.sync.watch.adapter)
     assert.are.same({ instance.root }, instance.sync:watcher_paths())
 
     instance:expand("a/n")
@@ -311,7 +317,7 @@ describe("fre ticket 15 directory watchers", function()
     local dir_path = fixture:path("dir")
     local delay_next_root, delay_next_dir = false, false
     local pending_dir
-    fre._set_fs_adapter({ load = function(scan_path, done)
+    active_load = function(scan_path, done)
       counts[scan_path] = (counts[scan_path] or 0) + 1
       if scan_path == instance.root and delay_next_root then
         delay_next_root = false
@@ -322,7 +328,7 @@ describe("fre ticket 15 directory watchers", function()
       else
         real_fs.load(scan_path, done)
       end
-    end })
+    end
 
     local function start_delayed_root_watch(filename)
       fixture:write(filename, filename)
@@ -376,14 +382,14 @@ describe("fre ticket 15 directory watchers", function()
     local a = fixture:path("a")
     local b = fixture:path("b")
     local counts, pending_a = {}, nil
-    fre._set_fs_adapter({ load = function(scan_path, done)
+    active_load = function(scan_path, done)
       counts[scan_path] = (counts[scan_path] or 0) + 1
       if scan_path == a and counts[scan_path] == 1 then
         pending_a = done
       else
         real_fs.load(scan_path, done)
       end
-    end })
+    end
 
     fixture:write("a/new.txt", "a")
     fixture:write("b/new.txt", "b")
@@ -646,11 +652,11 @@ describe("fre ticket 15 directory watchers", function()
     local instance = ready({ ["old.txt"] = "old" })
     instance:open()
     local pending, calls = nil, 0
-    fre._set_fs_adapter({ load = function(scan_path, done)
+    active_load = function(scan_path, done)
       assert.are.equal(instance.root, scan_path)
       calls = calls + 1
       pending = done
-    end })
+    end
     local generation = instance.buffer.view.projection_generation
     watcher:emit(instance.root, nil, "ignored")
     watcher:fire(instance.root)

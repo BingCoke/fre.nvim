@@ -46,7 +46,9 @@ function Buffer.new(options)
     id = options.id,
     root = options.root,
     bufnr = options.bufnr,
-    config = options.config,
+    columns = vim.deepcopy(options.columns or {}),
+    use_mapping_default = options.use_mapping_default == true,
+    mapping = vim.deepcopy(options.mapping or {}),
     tree = options.tree,
     registry = registry,
     registry_id = registry.registry_id,
@@ -71,7 +73,7 @@ function Buffer.new(options)
     id = self.id,
     root = self.root,
     bufnr = self.bufnr,
-    config = { columns = self.config.columns or {} },
+    columns = self.columns,
     tree = marker_tree_contract(self.tree),
     view = self.view,
     _column_context = marker_column_context,
@@ -917,6 +919,8 @@ function M.setup(buffer)
     })
   end
   require("fre.mapping").setup(buffer)
+  buffer.use_mapping_default = nil
+  buffer.mapping = nil
   buffer.registry:register_marker_source(buffer.id, buffer.marker_source)
   buffer.marker_source_registered = true
 end

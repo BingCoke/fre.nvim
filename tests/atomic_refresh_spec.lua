@@ -230,17 +230,20 @@ describe("fre ticket 08 atomic refresh", function()
 
   it("rejects lifecycle write-lock load and concurrent conflicts synchronously", function()
     local initial_done
+    local pending
     local calls = 0
-    fre._set_fs_adapter({ load = function(_, done) calls = calls + 1; initial_done = done end })
+    local hold_refresh = false
+    fre._set_fs_adapter({ load = function(_, done)
+      calls = calls + 1
+      if hold_refresh then pending = done else initial_done = done end
+    end })
     local creating = keep(fre.new({ root = fixture.root }))
     assert.is_truthy(error_text(function() creating:refresh() end):find("still loading", 1, true))
     assert.are.equal(1, calls)
     initial_done(nil, {}, fixture.root)
     wait_ready(creating)
 
-
-    local pending
-    fre._set_fs_adapter({ load = function(_, done) calls = calls + 1; pending = done end })
+    hold_refresh = true
     local first_count = 0
     creating:refresh({ on_complete = function() first_count = first_count + 1 end })
     assert.is_truthy(error_text(function()
@@ -369,6 +372,9 @@ describe("fre ticket 08 atomic refresh", function()
       local value, rest = suffix:match("^(%S+) +(.*)$")
       return value, rest
     end)
+    local active_load = real_fs.load
+    local fs_adapter = { load = function(...) return active_load(...) end }
+    fre._set_fs_adapter(fs_adapter)
     local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b" }, {
       columns = { descriptor },
     })
@@ -383,10 +389,10 @@ describe("fre ticket 08 atomic refresh", function()
       assert.is_true(instance.sync:is_dirty())
     end
 
-    local original_adapter = instance.manager:get_fs_adapter()
+    assert.are.equal(fs_adapter, instance.sync.fs_adapter)
     failed_refresh("scan exploded", function()
-      fre._set_fs_adapter({ load = function(_, done) done("scan exploded") end })
-    end, function() fre._set_fs_adapter(original_adapter) end)
+      active_load = function(_, done) done("scan exploded") end
+    end, function() active_load = real_fs.load end)
 
     local original_sort = instance.tree:get_comparator()
     failed_refresh("sort exploded", function()
@@ -560,16 +566,17 @@ describe("fre ticket 08 atomic refresh", function()
 
 
   it("uses protected no-callback reporting exactly once for asynchronous failures", function()
+    local active_load = real_fs.load
+    local fs_adapter = { load = function(...) return active_load(...) end }
+    fre._set_fs_adapter(fs_adapter)
     local instance = ready({ ["a.txt"] = "a" })
     local original_notify = vim.notify
     local notices = {}
     vim.notify = function(message) notices[#notices + 1] = message end
-    fre._set_fs_adapter({
-      load = function(_, done)
-        done("reported failure")
-        done("duplicate failure")
-      end,
-    })
+    active_load = function(_, done)
+      done("reported failure")
+      done("duplicate failure")
+    end
     instance._last_async_error = nil
     instance:refresh()
     wait_for(function() return instance._last_async_error ~= nil end)

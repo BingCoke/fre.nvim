@@ -9,10 +9,15 @@ local row = require("fre.instance.row")
 local Tree = require("fre.instance.tree")
 local Registry = require("fre.registry")
 local fs = require("tests.helpers.fs")
+local write_ui = require("fre.write_ui")
 
 local fixture
 local instances = {}
 local original_notify
+local active_ui
+local ui_adapter
+local active_mutation
+local mutation_adapter
 
 local function keep(instance)
   instances[#instances + 1] = instance
@@ -127,7 +132,7 @@ local function accepting_ui()
     return { update = function() end, close = function() end }
   end
   function ui.report() end
-  actions._set_ui_adapter(ui)
+  active_ui = ui
   return ui
 end
 
@@ -165,11 +170,10 @@ local function fake_plan(root_path, definitions)
     bufnr = bufnr,
     root = root_path,
     ready = true,
-    config = { columns = {} },
     tree = tree,
   }
   fake.buffer = buffer.new({
-    id = fake.id, root = fake.root, bufnr = fake.bufnr, config = fake.config,
+    id = fake.id, root = fake.root, bufnr = fake.bufnr, columns = {},
     tree = tree, registry = registry,
     can_reproject = function() return false end,
     destroyed = function() return false end,
@@ -195,9 +199,25 @@ describe("fre ticket 14 move cycle lowering", function()
     instances = {}
     original_notify = vim.notify
     vim.notify = function() end
-    actions._reset_ui_adapter()
+    active_ui = write_ui
+    ui_adapter = {
+      confirm = function(...) return active_ui.confirm(...) end,
+      progress = function(...) return active_ui.progress(...) end,
+      report = function(...)
+        if type(active_ui.report) == "function" then return active_ui.report(...) end
+      end,
+    }
+    actions._set_ui_adapter(ui_adapter)
     fre._reset_fs_adapter()
-    fre._reset_mutation_adapter()
+    active_mutation = mutation_fs.default
+    mutation_adapter = {
+      create_file = function(...) return active_mutation.create_file(...) end,
+      create_directory = function(...) return active_mutation.create_directory(...) end,
+      copy = function(...) return active_mutation.copy(...) end,
+      move = function(...) return active_mutation.move(...) end,
+      delete = function(...) return active_mutation.delete(...) end,
+    }
+    fre._set_mutation_adapter(mutation_adapter)
   end)
 
   after_each(function()
@@ -642,7 +662,7 @@ describe("fre ticket 14 move cycle lowering", function()
     local temporary = plan.operations[1].to
     local move_count = 0
     local adapter = mutation_fs.default
-    fre._set_mutation_adapter({
+    active_mutation = {
       create_file = adapter.create_file,
       create_directory = adapter.create_directory,
       copy = adapter.copy,
@@ -655,7 +675,7 @@ describe("fre ticket 14 move cycle lowering", function()
         end
         return adapter.move(from, to, done, report)
       end,
-    })
+    }
 
     assert.is_true(write_command(instance))
     ui.decide(true)
@@ -682,7 +702,7 @@ describe("fre ticket 14 move cycle lowering", function()
     local move_count = 0
     local active_request
     local adapter = mutation_fs.default
-    fre._set_mutation_adapter({
+    active_mutation = {
       create_file = adapter.create_file,
       create_directory = adapter.create_directory,
       copy = adapter.copy,
@@ -700,7 +720,7 @@ describe("fre ticket 14 move cycle lowering", function()
         end
         return adapter.move(from, to, done, report)
       end,
-    })
+    }
 
     assert.is_true(write_command(instance))
     ui.decide(true)

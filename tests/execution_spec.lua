@@ -104,8 +104,10 @@ describe("fre plan execution", function()
 
   it("starts operations strictly in array order and snapshots caller data", function()
     local calls, pending = {}, {}
-    fre._set_mutation_adapter(pending_adapter(calls, pending))
+    local adapter = pending_adapter(calls, pending)
+    fre._set_mutation_adapter(adapter)
     local instance = keep(fre.new({ root = fixture.root }))
+    assert.are.equal(adapter, instance.work.mutation_adapter)
     local plan = { operations = {
       { type = "create_file", path = "first" },
       { type = "move", from = "first", to = "second", kind = "file" },

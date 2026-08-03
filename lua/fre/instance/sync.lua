@@ -21,8 +21,9 @@ function Sync.new(options)
     root = assert(options.root),
     tree = assert(options.tree),
     buffer = assert(options.buffer),
-    config = assert(options.config),
-    load = assert(options.load),
+    expanded = vim.deepcopy(options.expanded or {}),
+    auto_expand_single_directory = options.auto_expand_single_directory == true,
+    fs_adapter = assert(options.fs_adapter),
     schedule = assert(options.schedule),
     bufnr = assert(options.bufnr),
     is_alive = assert(options.is_alive),
@@ -165,7 +166,7 @@ function Sync:_load_directory(node, mode, callback)
       for _, waiter in ipairs(waiters) do waiter(err) end
     end)
   end
-  local ok, adapter_err = pcall(self.load, load_path, done)
+  local ok, adapter_err = pcall(self.fs_adapter.load, load_path, done)
   if not ok then done(adapter_err) end
 end
 
@@ -188,7 +189,7 @@ function Sync:_apply_configured_expansions(on_complete)
     on_complete(err)
   end
   local function apply(index)
-    local relative = self.config.expanded[index]
+    local relative = self.expanded[index]
     if relative == nil then finish(nil); return end
     local ok, err = pcall(self.expand, self, relative, function(expand_err)
       if expand_err ~= nil then
@@ -233,6 +234,7 @@ function Sync:_finish_initial(generation, err, children, real_root, on_complete)
         self.dirty = false
         self.result = value
         self.on_initial_complete(nil, value, real_root, on_complete)
+        self.expanded = nil
       end
     end)
     return
@@ -268,7 +270,7 @@ function Sync:load_initial(on_complete)
       self:_finish_initial(generation, err, children, real_root, completion)
     end)
   end
-  local ok, adapter_err = pcall(self.load, self.root, done)
+  local ok, adapter_err = pcall(self.fs_adapter.load, self.root, done)
   if not ok then done(adapter_err) end
 end
 
@@ -353,7 +355,7 @@ function Sync:expand(snapshot_path, on_complete, initializing, opts)
   local function continue_explicit(child, index, became_expanded)
     if index < #segments then
       resume(child, index + 1)
-    elseif opts.auto_expand ~= false and self.config.auto_expand_single_directory
+    elseif opts.auto_expand ~= false and self.auto_expand_single_directory
         and (became_expanded or initializing) then
       resume_auto(child)
     else
@@ -384,9 +386,9 @@ function Sync:expand(snapshot_path, on_complete, initializing, opts)
         child = changed
       end
       local rescan_for_initial_auto = opts.auto_expand ~= false and initializing
-        and index == #segments and self.config.auto_expand_single_directory
+        and index == #segments and self.auto_expand_single_directory
       if opts.rescan_loaded ~= false and (became_expanded or rescan_for_initial_auto) then
-        if opts.auto_expand ~= false and self.config.auto_expand_single_directory then
+        if opts.auto_expand ~= false and self.auto_expand_single_directory then
           self:rescan(child, continue)
         else
           self:rescan(child)
@@ -609,7 +611,7 @@ function Sync:_scan_candidate(request, candidate, paths, index)
       self:_scan_candidate(request, candidate, paths, index + 1)
     end)
   end
-  local ok, adapter_err = pcall(self.load, scan_path, done)
+  local ok, adapter_err = pcall(self.fs_adapter.load, scan_path, done)
   if not ok then done(adapter_err) end
 end
 

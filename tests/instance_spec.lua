@@ -1,3 +1,4 @@
+local config = require("fre.config")
 local buffer = require("fre.instance.buffer")
 local Instance = require("fre.instance")
 local Sync = require("fre.instance.sync")
@@ -370,11 +371,92 @@ describe("fre async hidden instances", function()
       instance_id = instance.id,
       root = instance.root,
     }, vim.b[instance.bufnr].fre)
-    assert.is_nil(instance.config.gc)
+    assert.is_nil(rawget(instance, "config"))
+    assert.is_nil(rawget(instance.buffer, "config"))
+    assert.is_table(instance.buffer.columns)
+    assert.is_nil(rawget(instance.buffer, "buffer_options"))
+    assert.is_nil(rawget(instance.buffer, "buffer_variables"))
+    assert.is_nil(rawget(instance.buffer, "mapping"))
+    assert.is_nil(rawget(instance.buffer, "use_mapping_default"))
+    assert.is_nil(rawget(instance.sync, "config"))
+    wait_for(function() return instance:is_ready() end)
+    assert.is_nil(rawget(instance.sync, "expanded"))
+    assert.is_false(instance.sync.auto_expand_single_directory)
+    assert.is_nil(rawget(instance.work, "get_mutation_adapter"))
+    assert.is_table(instance.work.mutation_adapter)
+    assert.is_table(instance.work.write_ui_adapter)
     assert.is_nil(vim.b[instance.bufnr].fre.gc_group)
     assert.has_error(function()
       fre.new({ root = fixture.root, buffer = { variables = { fre = "no" } } })
     end)
+  end)
+
+  it("copies only known core inputs to their owners and accepts concrete adapters", function()
+    local registry = Registry.new()
+    local manager = manager_module.new({ registry = registry })
+    local root = path.absolute(fixture.root)
+    fixture:mkdir("dir")
+    local effective = config.resolve_instance(config.resolve_setup(), {
+      root = root,
+      expanded = { "dir" },
+      buffer = {
+        options = { modifiable = false },
+        variables = { retained_only_in_nvim = { value = 1 } },
+      },
+      mapping = { n = { x = function() end } },
+    }, root)
+    local caller_owned = { nested = { value = 1 } }
+    effective.caller_owned = caller_owned
+
+    local load_callbacks = {}
+    local fs_adapter = {
+      load = function(_, done) load_callbacks[#load_callbacks + 1] = done end,
+    }
+    local watch_adapter = require("fre.watch").default
+    local mutation_adapter = require("fre.mutation.fs").default
+    local write_ui_adapter = require("fre.write_ui")
+    local instance = keep(Instance.new(
+      manager, registry:allocate_instance_id(), root, effective, registry,
+      fs_adapter, watch_adapter, mutation_adapter, write_ui_adapter
+    ))
+
+    assert.is_nil(rawget(instance, "caller_owned"))
+    assert.is_nil(rawget(instance.buffer, "caller_owned"))
+    assert.is_nil(rawget(instance.sync, "caller_owned"))
+    assert.is_nil(rawget(instance.work, "caller_owned"))
+    assert.are.equal(fs_adapter, instance.sync.fs_adapter)
+    assert.are.equal(watch_adapter, instance.sync.watch.adapter)
+    assert.are.equal(mutation_adapter, instance.work.mutation_adapter)
+    assert.are.equal(write_ui_adapter, instance.work.write_ui_adapter)
+    assert.are.same({ "dir" }, rawget(instance.sync, "expanded"))
+    assert.are_not.equal(effective.columns, instance.buffer.columns)
+    assert.are_not.equal(effective.layout, instance.view.default_layout)
+    assert.are_not.equal(effective.window.options, instance.view.window_options)
+    assert.is_nil(rawget(instance.buffer, "buffer_options"))
+    assert.is_nil(rawget(instance.buffer, "buffer_variables"))
+    assert.is_nil(rawget(instance.buffer, "mapping"))
+    assert.is_nil(rawget(instance.buffer, "use_mapping_default"))
+
+    effective.expanded[1] = "caller-mutated"
+    effective.columns[1] = nil
+    effective.layout.size = 99
+    effective.window.options.wrap = true
+    caller_owned.nested.value = 2
+    assert.are.same({ "dir" }, rawget(instance.sync, "expanded"))
+    assert.is_not_nil(instance.buffer.columns[1])
+    assert.are_not.equal(99, instance.view.default_layout.size)
+    assert.is_false(instance.view.window_options.wrap)
+    assert.are.same({ value = 1 }, vim.b[instance.bufnr].retained_only_in_nvim)
+
+    instance:_start_initial_load()
+    assert.is_function(load_callbacks[1])
+    load_callbacks[1](nil, { { name = "dir", kind = "directory" } }, root)
+    wait_for(function() return load_callbacks[2] ~= nil end)
+    load_callbacks[2](nil, {}, path.resolve(root, "dir"))
+    wait_for(function() return instance:is_ready() end)
+    assert.is_nil(rawget(instance.sync, "expanded"))
+    assert.is_true(instance.tree.nodes_by_path[path.resolve(root, "dir")].expanded)
+    assert.is_not_nil(instance:get_pos("dir"))
   end)
 
   it("retries a failed initial load and permits explicit cleanup", function()

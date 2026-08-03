@@ -283,7 +283,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_nil(normal.l)
     assert.are.same({}, keymaps(instance.bufnr, "i"))
     assert.are.same({}, keymaps(instance.bufnr, "v"))
-    assert.is_nil(instance.config.mapping.n)
+    assert.is_nil(rawget(instance.buffer, "mapping"))
   end)
 
   it("overlays setup and new maps once, supports defaults-off, and isolates caller tables", function()
@@ -304,9 +304,7 @@ describe("fre ticket 17 actions and mappings", function()
     local instance = wait_ready(fre.new(new_opts))
     new_opts.mapping.n.x = function() error("mutated new") end
     new_opts.mapping.n.extra = new_x
-    assert.are.equal(new_x, instance.config.mapping.n.x)
-    assert.are.equal(setup_x, instance.config.mapping.n.y)
-    assert.is_nil(instance.config.mapping.n["<CR>"])
+    assert.is_nil(rawget(instance.buffer, "mapping"))
 
     local winid = open_current(instance)
     local row_a = row_for(instance, "a.txt")
@@ -1138,7 +1136,7 @@ describe("fre ticket 17 actions and mappings", function()
     local parent = wait_ready(actions.select(ctx, {
       instance = { expanded = { "child" } },
     }))
-    assert.are.same({}, parent.config.expanded)
+    assert.is_nil(rawget(parent.sync, "expanded"))
     local previous_root = parent.tree.nodes_by_path[path.absolute(fixture:path("child"))]
     assert.is_not_nil(previous_root)
     assert.is_false(previous_root.expanded)
@@ -1171,7 +1169,7 @@ describe("fre ticket 17 actions and mappings", function()
       end
       wait_ready(parent)
       local winid = vim.api.nvim_get_current_win()
-      assert.are.same({}, parent.config.expanded)
+      assert.is_nil(rawget(parent.sync, "expanded"))
       assert.is_false(parent.tree.nodes_by_path[path.absolute(fixture:path("child"))].expanded)
       assert.are.same(parent:get_pos("child"), vim.api.nvim_win_get_cursor(winid))
       parent:destroy()
@@ -1201,7 +1199,7 @@ describe("fre ticket 17 actions and mappings", function()
     local child = wait_ready(actions.select(context_for(instance, "src"), {
       instance = { expanded = { "ignored" } },
     }))
-    assert.are.same({ "x", "x/x" }, child.config.expanded)
+    assert.is_nil(rawget(child.sync, "expanded"))
     wait_for(function()
       local first = child.tree.nodes_by_path[path.absolute(fixture:path("src/x"))]
       local second = child.tree.nodes_by_path[path.absolute(fixture:path("src/x/x"))]
@@ -1232,7 +1230,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_true(vim.api.nvim_get_option_value("cursorline", { win = target }))
     assert.is_false(child.buffer:hidden_files())
     assert.are.equal(sort_fn, child.tree:get_comparator())
-    assert.is_nil(child.config.mapping.n.y)
+    assert.is_nil(rawget(child.buffer, "mapping"))
     assert.are.equal("ready", instance:status())
     wait_ready(child)
 

@@ -136,8 +136,8 @@ function M.setup(buffer)
     [actions.jump_to_path] = true,
     [actions.collapse_all] = true,
   }
-  local base = buffer.config.use_mapping_default and mapping_base() or {}
-  local installed_maps = overlay(base, copy_maps(buffer.config.mapping))
+  local base = buffer.use_mapping_default and mapping_base() or {}
+  local installed_maps = overlay(base, copy_maps(buffer.mapping))
   local installed = {}
   local ok, err = pcall(function()
     for mode, mode_map in pairs(installed_maps) do

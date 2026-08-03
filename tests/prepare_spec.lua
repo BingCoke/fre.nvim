@@ -584,11 +584,10 @@ describe("fre ticket 10 prepare basic mutations", function()
       bufnr = bufnr,
       root = root.path,
       ready = true,
-      config = { columns = {} },
       tree = tree,
     }
     fake.buffer = buffer.new({
-      id = fake.id, root = fake.root, bufnr = fake.bufnr, config = fake.config,
+      id = fake.id, root = fake.root, bufnr = fake.bufnr, columns = {},
       tree = tree, registry = registry,
       can_reproject = function() return false end,
       destroyed = function() return false end,

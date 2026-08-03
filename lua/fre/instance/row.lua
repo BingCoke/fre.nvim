@@ -218,7 +218,7 @@ end
 
 local function parse_columns(row_number, source, node, suffix, marker_end, opts)
   local tree = opts.tree or source.tree
-  local descriptors = source.config.columns or {}
+  local descriptors = source.columns or {}
   local values, ranges, separators, fields = {}, {}, {}, {}
   local navigation_kind = opts.navigation_kind
   local callback_entry
@@ -500,7 +500,7 @@ function M.decorations(buffer, row_number, line)
     add_unchanged_decoration(result, line, field.highlight)
   end
 
-  local descriptors = source.config.columns or {}
+  local descriptors = source.columns or {}
   local suffix = line:sub(identity.marker_end + 1)
   local resolved = resolve_layout(descriptors, suffix, identity.marker_end, layout)
   if not resolved then
@@ -672,7 +672,7 @@ function M.prepare(buffer, projection, render_path, opts)
   end
   local tree = opts.tree or buffer.tree
   local nodes = projection.nodes or projection
-  local descriptors = buffer.config.columns or {}
+  local descriptors = buffer.columns or {}
   local marker_widths = buffer:marker_widths()
   local rendered, widths = {}, {}
   for index = 1, #descriptors do widths[index] = 0 end

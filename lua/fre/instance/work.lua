@@ -48,7 +48,8 @@ function Work.new(options)
     buffer = assert(options.buffer),
     sync = assert(options.sync),
     skip_confirm_for_simple_edits = options.skip_confirm_for_simple_edits == true,
-    get_mutation_adapter = assert(options.get_mutation_adapter),
+    mutation_adapter = assert(options.mutation_adapter),
+    write_ui_adapter = assert(options.write_ui_adapter),
     is_alive = assert(options.is_alive),
     is_ready = assert(options.is_ready),
     report_error = assert(options.report_error),
@@ -100,7 +101,7 @@ function Work:_start_execution(plan, handlers)
   self.sync:cancel_active_watch_refresh()
   local execution
   execution = mutation_execute.start(
-    plan, handlers, self.get_mutation_adapter(), function(completed)
+    plan, handlers, self.mutation_adapter, function(completed)
       if self.execution == completed then self.execution = nil end
       self.on_activity("execution", false)
       if self.sync:is_dirty() then self.sync:schedule_followup() end
@@ -215,8 +216,8 @@ function Work:write(ctx)
       reconciliation_error = reconciliation_error,
     }
     self:_release_safely(request)
-    if type(ui_adapter.report) == "function" then
-      local ok, err = pcall(ui_adapter.report, ctx, outcome, reconciliation_error)
+    if type(self.write_ui_adapter.report) == "function" then
+      local ok, err = pcall(self.write_ui_adapter.report, ctx, outcome, reconciliation_error)
       if not ok then self:_report("write UI report failed: " .. tostring(err)) end
     end
     request.ctx = nil
@@ -248,7 +249,7 @@ function Work:write(ctx)
     request.execution = execution
     request.phase = "executing"
 
-    local progress_ok, progress_or_error = pcall(ui_adapter.progress, ctx,
+    local progress_ok, progress_or_error = pcall(self.write_ui_adapter.progress, ctx,
       execution:get_status(), function()
         if request.phase ~= "executing" or request.execution ~= execution then return end
         local cancel_ok, cancel_error = pcall(execution.cancel, execution)
@@ -312,7 +313,9 @@ function Work:write(ctx)
       start_execution(plan)
     end
     validate_display(plan.display)
-    local confirm_ok, confirmation_or_error = pcall(ui_adapter.confirm, ctx, plan.display, decide)
+    local confirm_ok, confirmation_or_error = pcall(
+      self.write_ui_adapter.confirm, ctx, plan.display, decide
+    )
     if not confirm_ok then
       sync_finish(nil, false)
       error(confirmation_or_error, 0)

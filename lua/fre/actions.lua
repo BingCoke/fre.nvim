@@ -544,10 +544,12 @@ end
 
 function M._set_ui_adapter(adapter)
   Work._set_ui_adapter(adapter)
+  require("fre.manager").default:set_write_ui_adapter(adapter)
 end
 
 function M._reset_ui_adapter()
   Work._reset_ui_adapter()
+  require("fre.manager").default:set_write_ui_adapter(require("fre.write_ui"))
 end
 
 return M

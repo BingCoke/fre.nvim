@@ -5,6 +5,7 @@ local mutation_fs = require("fre.mutation.fs")
 local registry = require("fre.registry")
 local watch = require("fre.watch")
 local takeover = require("fre.takeover")
+local write_ui = require("fre.write_ui")
 
 local Manager = {}
 Manager.__index = Manager
@@ -107,6 +108,7 @@ function Manager.new(opts)
     _fs_adapter = fs.default,
     _mutation_adapter = mutation_fs.default,
     _watch_adapter = watch.default,
+    _write_ui_adapter = write_ui,
     instances_by_id = {},
     instances_by_buf = {},
     _gc = gc.new(),
@@ -125,7 +127,10 @@ function Manager:create_instance(opts)
   local root = require("fre.path").absolute(opts.root)
   local effective, policy = self:resolve_instance_config(opts, root)
   local id = self._registry:allocate_instance_id()
-  local instance = require("fre.instance").new(self, id, root, effective, self._registry)
+  local instance = require("fre.instance").new(
+    self, id, root, effective, self._registry, self._fs_adapter, self._watch_adapter,
+    self._mutation_adapter, self._write_ui_adapter
+  )
   local ok, result = pcall(function()
     self:register(instance, policy)
     return instance:_start_initial_load()
@@ -149,9 +154,6 @@ function Manager:get_default_file_explorer()
   return self._default_file_explorer
 end
 
-function Manager:get_fs_adapter()
-  return self._fs_adapter
-end
 
 function Manager:set_fs_adapter(adapter)
   if type(adapter) ~= "table" or type(adapter.load) ~= "function" then
@@ -160,9 +162,6 @@ function Manager:set_fs_adapter(adapter)
   self._fs_adapter = adapter
 end
 
-function Manager:get_mutation_adapter()
-  return self._mutation_adapter
-end
 
 function Manager:set_mutation_adapter(adapter)
   local methods = { "create_file", "create_directory", "copy", "move", "delete" }
@@ -175,9 +174,6 @@ function Manager:set_mutation_adapter(adapter)
   self._mutation_adapter = adapter
 end
 
-function Manager:get_watch_adapter()
-  return self._watch_adapter
-end
 
 function Manager:set_watch_adapter(adapter)
   if type(adapter) ~= "table" then fail("watch adapter must be a table") end
@@ -190,6 +186,14 @@ function Manager:set_watch_adapter(adapter)
     end
   end
   self._watch_adapter = adapter
+end
+
+function Manager:set_write_ui_adapter(adapter)
+  if type(adapter) ~= "table" or type(adapter.confirm) ~= "function"
+      or type(adapter.progress) ~= "function" then
+    fail("write UI adapter must provide confirm() and progress()")
+  end
+  self._write_ui_adapter = adapter
 end
 
 function Manager:get_gc_controller()

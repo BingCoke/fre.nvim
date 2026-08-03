@@ -85,7 +85,7 @@ function M.apply(instance, winid)
       or vim.api.nvim_win_get_buf(winid) ~= instance.bufnr then
     return false
   end
-  for key, value in pairs(instance.config.window.options or {}) do
+  for key, value in pairs(instance.window_options or {}) do
     vim.api.nvim_set_option_value(key, value, { scope = "local", win = winid })
   end
   return true

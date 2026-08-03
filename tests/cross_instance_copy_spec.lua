@@ -3,10 +3,13 @@ local buffer = require("fre.instance.buffer")
 local columns = require("fre.columns")
 local fre = require("fre")
 local fs = require("tests.helpers.fs")
+local write_ui = require("fre.write_ui")
 
 local fixture
 local instances = {}
 local original_notify
+local active_ui
+local ui_adapter
 
 local function keep(instance)
   instances[#instances + 1] = instance
@@ -123,7 +126,7 @@ local function accepting_ui()
     return { update = function() end, close = function() end }
   end
   function ui.report() end
-  actions._set_ui_adapter(ui)
+  active_ui = ui
   return ui
 end
 
@@ -161,7 +164,15 @@ describe("fre ticket 13 cross-instance copy", function()
     instances = {}
     original_notify = vim.notify
     vim.notify = function() end
-    actions._reset_ui_adapter()
+    active_ui = write_ui
+    ui_adapter = {
+      confirm = function(...) return active_ui.confirm(...) end,
+      progress = function(...) return active_ui.progress(...) end,
+      report = function(...)
+        if type(active_ui.report) == "function" then return active_ui.report(...) end
+      end,
+    }
+    actions._set_ui_adapter(ui_adapter)
     fre._reset_fs_adapter()
     fre._reset_mutation_adapter()
   end)

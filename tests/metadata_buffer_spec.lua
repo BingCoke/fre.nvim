@@ -272,7 +272,7 @@ describe("fre metadata buffer rows", function()
     tree.nodes_by_path = { [root.path] = root, [node.path] = node }
     local fake = buffer.new({
       id = 777, root = root.path, bufnr = vim.api.nvim_create_buf(false, true),
-      config = { columns = {} }, tree = tree, registry = registry,
+      columns = {}, tree = tree, registry = registry,
       can_reproject = function() return false end,
       destroyed = function() return false end,
       destroying = function() return false end,
