@@ -3,7 +3,6 @@ local buffer = require("fre.instance.buffer")
 local columns = require("fre.columns")
 local row = require("fre.instance.row")
 local Tree = require("fre.instance.tree")
-local Registry = require("fre.registry")
 local fs = require("tests.helpers.fs")
 
 local instances = {}
@@ -263,16 +262,16 @@ describe("fre metadata buffer rows", function()
     local node = {
       id = 2, path = "C:/Project/plain.txt", kind = "file", name = "plain.txt",
     }
-    local registry = Registry.new()
     local tree = Tree.new(
-      root.path, 777, function(_, left, right) return left.name < right.name end, registry
+      root.path, "windows-decoration", function(_, left, right) return left.name < right.name end
     )
     tree.root = root
     tree.nodes_by_id = { [1] = root, [2] = node }
     tree.nodes_by_path = { [root.path] = root, [node.path] = node }
     local fake = buffer.new({
-      id = 777, root = root.path, bufnr = vim.api.nvim_create_buf(false, true),
-      columns = {}, tree = tree, registry = registry,
+      id = "windows-decoration", root = root.path,
+      bufnr = vim.api.nvim_create_buf(false, true),
+      columns = {}, tree = tree,
       lifecycle = {
         is_dead = function() return false end,
         is_ready = function() return false end,
@@ -485,7 +484,6 @@ describe("fre metadata buffer rows", function()
   it("restores Buffer metadata when undo-history cleanup fails after publication", function()
     local instance = ready({ ["a.txt"] = "x" })
     instance.buffer.pending_initial_cursor[999999] = true
-    instance.buffer.marker_width_stale = true
     local before_lines = lines(instance)
     local before_view = instance.buffer.view
     local before_ranges = vim.deepcopy(instance.buffer.projection_ranges)
@@ -518,7 +516,6 @@ describe("fre metadata buffer rows", function()
     assert.is_true(injected)
     assert.are.equal(before_view, instance.buffer.view)
     assert.are.same(before_ranges, instance.buffer.projection_ranges)
-    assert.is_true(instance.buffer.marker_width_stale)
     assert.are.same(before_pending, instance.buffer.pending_initial_cursor)
     assert.are.same(before_lines, lines(instance))
     vim.api.nvim_buf_call(instance.bufnr, function() vim.cmd("silent! undo") end)

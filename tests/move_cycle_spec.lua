@@ -7,7 +7,6 @@ local mutation_prepare = require("fre.mutation.prepare")
 local path = require("fre.path")
 local row = require("fre.instance.row")
 local Tree = require("fre.instance.tree")
-local Registry = require("fre.registry")
 local fs = require("tests.helpers.fs")
 local write_ui = require("fre.write_ui")
 
@@ -141,7 +140,6 @@ local function fake_plan(root_path, definitions)
   local root = { id = 1, path = root_path, kind = "directory" }
   local nodes_by_id = { [1] = root }
   local baseline, visible, replacement = {}, {}, {}
-  local marker_widths = { instance = 3, node = 3 }
   for index, definition in ipairs(definitions) do
     local id = index + 1
     local absolute = path.resolve(root_path, definition.source)
@@ -155,18 +153,17 @@ local function fake_plan(root_path, definitions)
     nodes_by_id[id] = node
     baseline[id] = absolute
     visible[#visible + 1] = node
-    replacement[#replacement + 1] = row.marker(nil, 900, id, marker_widths) .. definition.target
+    replacement[#replacement + 1] = row.marker(nil, "move-cycle", id) .. definition.target
   end
-  local registry = Registry.new()
   local tree = Tree.new(
-    root_path, 900, function(_, left, right) return left.name < right.name end, registry
+    root_path, "move-cycle", function(_, left, right) return left.name < right.name end
   )
   tree.root = root
   tree.nodes_by_id = nodes_by_id
   tree.nodes_by_path = {}
   for _, node in pairs(nodes_by_id) do tree.nodes_by_path[node.path] = node end
   local fake = {
-    id = 900,
+    id = "move-cycle",
     bufnr = bufnr,
     root = root_path,
     ready = true,
@@ -174,7 +171,7 @@ local function fake_plan(root_path, definitions)
   }
   fake.buffer = buffer.new({
     id = fake.id, root = fake.root, bufnr = fake.bufnr, columns = {},
-    tree = tree, registry = registry,
+    tree = tree,
     lifecycle = {
       is_dead = function() return false end,
       is_ready = function() return false end,

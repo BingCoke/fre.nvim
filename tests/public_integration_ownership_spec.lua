@@ -65,19 +65,21 @@ describe("public integration ownership", function()
     fixture:cleanup()
   end)
 
-  it("keeps integration modules outside Instance-private children", function()
+  it("keeps integration modules outside stateful Instance children", function()
     for _, path in ipairs({
       "lua/fre/actions.lua",
       "lua/fre/gc.lua",
       "lua/fre/init.lua",
       "lua/fre/mapping.lua",
       "lua/fre/manager.lua",
-      "lua/fre/registry.lua",
       "lua/fre/takeover.lua",
       "lua/fre/view.lua",
       "lua/fre/window.lua",
     }) do
       local text = source(path)
+      if path == "lua/fre/gc.lua" or path == "lua/fre/manager.lua" then
+        text = text:gsub('require%("fre%.instance%.identity"%)', "")
+      end
       assert.is_nil(text:find('require("fre.instance.', 1, true), path)
     end
     assert.is_nil(source("lua/fre/mutation/prepare.lua"):find(

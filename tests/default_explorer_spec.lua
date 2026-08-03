@@ -473,19 +473,18 @@ describe("fre ticket 20 default directory explorer", function()
       autocmds = autocmds(),
     }
     local allocated_id
-    local registry = manager._registry
-    local allocate_instance_id = registry.allocate_instance_id
-    registry.allocate_instance_id = function(owner)
-      allocated_id = allocate_instance_id(owner)
-      return allocated_id
+    local Instance = require("fre.instance")
+    local original_new = Instance.new
+    Instance.new = function(options)
+      allocated_id = options.id
+      return original_new(options)
     end
 
     local err = error_text(function() controller:check(source, winid) end)
-    registry.allocate_instance_id = allocate_instance_id
+    Instance.new = original_new
     fre.setup({})
     assert.is_truthy(err:lower():find("unknown option", 1, true), err)
-    assert.is_true(registry:is_instance_id_consumed(allocated_id))
-    assert.is_nil(registry:find_marker_source(allocated_id))
+    assert.is_string(allocated_id)
     assert.are.same(before.buffers, vim.api.nvim_list_bufs())
     assert.are.equal(before.instances, instance_count(manager))
     assert.are.equal(source, vim.api.nvim_win_get_buf(winid))

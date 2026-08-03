@@ -41,8 +41,6 @@ end
 
 function Buffer.new(options)
   if type(options) ~= "table" then fail("buffer options are required", 2) end
-  local registry = assert(options.registry)
-  local widths = registry:marker_widths()
   local self = setmetatable({
     id = options.id,
     root = options.root,
@@ -50,16 +48,13 @@ function Buffer.new(options)
     columns = vim.deepcopy(options.columns or {}),
     tree = assert(options.tree),
     lifecycle = assert(options.lifecycle),
-    registry = registry,
-    registry_id = registry.registry_id,
-    last_marker_generation = widths.generation,
+    _resolve_marker_source = options.resolve_marker_source,
     report_async_error = assert(options.report_async_error),
-    view = { baseline = {}, marker_generation = 0 },
+    view = { baseline = {} },
     hidden_file = options.hidden_file == true,
     row_extmarks = {},
     projection_ranges = {},
     pending_initial_cursor = {},
-    marker_width_stale = false,
   }, Buffer)
   self.marker_source = {
     id = self.id,
@@ -69,7 +64,6 @@ function Buffer.new(options)
     tree = marker_tree_contract(self.tree),
     view = self.view,
     _column_context = marker_column_context,
-    destroyed = function() return false end,
   }
   return self
 end
@@ -83,51 +77,11 @@ function M.attach(buffer, view, sync, work, request_destroy)
   buffer.request_destroy = assert(request_destroy)
 end
 
-function Buffer:can_reproject()
-  if self.lifecycle:is_dead() or not self.lifecycle:is_ready() then return false end
-  if self.work:is_write_active() or self.sync:is_busy()
-      or self.work:is_execution_active() then return false end
-  for _, node in self.tree:iter_nodes() do
-    if node.kind == "directory"
-        and (node.load_state == "loading" or node.load_state == "refreshing") then
-      return false
-    end
-  end
-  return true
-end
 
-function Buffer:marker_widths()
-  return self.registry:marker_widths()
-end
-
-function Buffer:find_marker_source(instance_id)
-  return self.registry:find_marker_source(instance_id)
-end
-
-function M:on_marker_width_changed(event)
-  if event.registry_id ~= self.registry_id
-      or event.generation <= self.last_marker_generation then return end
-  self.last_marker_generation = event.generation
-  self.marker_width_stale = true
-  if not self:can_reproject() then return end
-  if not vim.api.nvim_buf_is_valid(self.bufnr) or vim.bo[self.bufnr].modified then return end
-
-  local current_generation = self:marker_widths().generation
-  local view_generation = self.view and self.view.marker_generation or 0
-  if view_generation >= event.generation and view_generation >= current_generation then
-    self.marker_width_stale = false
-    return
-  end
-
-  local ok, result = pcall(self.render, self)
-  if not ok or result == false then
-    local err = ok and "buffer projection commit failed" or result
-    self.marker_width_stale = true
-    self.report_async_error("marker width reprojection failed: " .. tostring(err))
-    return
-  end
-  view_generation = self.view and self.view.marker_generation or 0
-  self.marker_width_stale = view_generation < self:marker_widths().generation
+function Buffer:resolve_marker_source(instance_id)
+  if instance_id == self.id then return self.marker_source end
+  if type(self._resolve_marker_source) ~= "function" then return nil end
+  return self._resolve_marker_source(instance_id)
 end
 
 function M:clear_initial_cursors()
@@ -572,7 +526,6 @@ local function snapshot(buffer)
     node_extmarks = node_extmarks,
     windows = capture_windows(buffer),
     projection_ranges = buffer.projection_ranges,
-    marker_width_stale = buffer.marker_width_stale,
     pending_initial_cursor = vim.deepcopy(buffer.pending_initial_cursor),
   }
 end
@@ -603,7 +556,6 @@ local function restore(buffer, snapshot)
   end
   for id, mark in pairs(snapshot.node_extmarks or {}) do buffer.row_extmarks[id] = mark end
   buffer.projection_ranges = snapshot.projection_ranges
-  buffer.marker_width_stale = snapshot.marker_width_stale
   buffer.pending_initial_cursor = snapshot.pending_initial_cursor
   vim.bo[buffer.bufnr].modified = snapshot.modified
   vim.bo[buffer.bufnr].modifiable = snapshot.modifiable
@@ -672,8 +624,6 @@ function M.commit(buffer, prepared)
     end
     buffer.view = {
       baseline = prepared.baseline,
-      marker_widths = prepared.marker_widths,
-      marker_generation = prepared.marker_generation,
       column_widths = prepared.column_widths,
       row_templates = prepared.row_templates,
       projection = prepared.projection,
@@ -691,8 +641,6 @@ function M.commit(buffer, prepared)
       pending[#pending + 1] = winid
     end
     for _, winid in ipairs(pending) do M.place_initial_cursor(buffer, winid) end
-    buffer.marker_width_stale = prepared.marker_generation
-      < buffer:marker_widths().generation
     clear_undo_history(buffer)
     return true
   end)
@@ -867,11 +815,6 @@ function M.setup(buffer)
 
   local group_name = "FreBuffer" .. tostring(buffer.bufnr)
   buffer.buffer_augroup = vim.api.nvim_create_augroup(group_name, { clear = true })
-  vim.api.nvim_create_autocmd("User", {
-    group = buffer.buffer_augroup,
-    pattern = "FreRegistryMarkerWidthsChanged",
-    callback = function(args) M.on_marker_width_changed(buffer, args.data) end,
-  })
   vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
     group = buffer.buffer_augroup, buffer = buffer.bufnr,
     callback = function() externally_deleted(buffer) end,
@@ -929,15 +872,9 @@ function M.setup(buffer)
       callback = function() M.constrain_cursor(buffer) end,
     })
   end
-  buffer.registry:register_marker_source(buffer.id, buffer.marker_source)
-  buffer.marker_source_registered = true
 end
 
 function M.teardown(buffer)
-  if buffer.marker_source_registered then
-    buffer.registry:remove_marker_source(buffer.id, buffer.marker_source)
-    buffer.marker_source_registered = false
-  end
   buffer.highlight_disabled = true
   buffer.highlight_pending = nil
   if buffer.buffer_augroup then

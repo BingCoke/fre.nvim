@@ -155,14 +155,13 @@ describe("fre ticket 17 actions and mappings", function()
     fixture:cleanup()
   end)
 
-  it("exports ordinary action functions without a registry protocol", function()
+  it("exports only the ordinary action interface", function()
     local names = {
       "context", "expand", "collapse", "collapse_all", "toggle_expand", "reveal", "jump_to_path",
       "open", "hidden", "toggle", "set_hidden_file", "toggle_hidden_file", "refresh",
       "select", "tab_select", "split_select", "confirm", "write", "destroy",
     }
     for _, name in ipairs(names) do assert.are.equal("function", type(actions[name]), name) end
-    assert.is_nil(actions.registry)
     assert.is_nil(actions.dispatch)
     assert.is_nil(actions.descriptors)
   end)
@@ -1254,7 +1253,6 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_false(passed.hidden_file)
     assert.are.equal(override_sort, passed.sort)
     assert.are.same(before.gc, passed.gc)
-    assert.is_nil(passed.registry)
     assert.is_nil(passed.manager)
     assert.is_nil(passed.config)
     assert.is_nil(passed.metadata)

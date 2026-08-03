@@ -39,12 +39,11 @@ local function detached_copy(value, seen)
   return result
 end
 
-function Tree.new(root_path, instance_id, comparator, registry)
+function Tree.new(root_path, instance_id, comparator)
   local self = setmetatable({
     root_path = root_path,
     instance_id = instance_id,
     comparator = comparator,
-    registry = assert(registry),
     id_state = { latest = 1 },
     nodes_by_id = {},
     nodes_by_path = {},
@@ -65,7 +64,6 @@ function Tree.new(root_path, instance_id, comparator, registry)
     children_order = {},
   }
   self.root = root
-  self.registry:observe_node_id(root.id)
   self.nodes_by_id[root.id] = root
   self.nodes_by_path[root.path] = root
   return self
@@ -213,7 +211,6 @@ function Tree.clone(source)
     root_path = source.root_path,
     instance_id = source.instance_id,
     comparator = source.comparator,
-    registry = source.registry,
     id_state = source.id_state,
     nodes_by_id = {},
     nodes_by_path = {},
@@ -259,7 +256,6 @@ end
 function Tree:_allocate_id()
   self.id_state.latest = self.id_state.latest + 1
   local id = self.id_state.latest
-  self.registry:observe_node_id(id)
   return id
 end
 

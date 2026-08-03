@@ -3,8 +3,8 @@ local manager_module = require("fre.manager")
 local next_id = 1
 
 local function instance(bufnr)
-  local id = next_id
-  next_id = id + 1
+  local id = "manager-test-" .. tostring(next_id)
+  next_id = next_id + 1
   local state = "ready"
   return {
     id = id,
@@ -82,6 +82,40 @@ describe("fre manager", function()
     assert.is_false(constructed)
   end)
 
+  it("rejects caller IDs and duplicate live opaque registration", function()
+    local manager = manager_module.new()
+    local ok, err = pcall(manager.create_instance, manager, {
+      root = ".", id = "caller-selected",
+    })
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err):find("do not accept id", 1, true))
+
+    local first_buf = vim.api.nvim_create_buf(false, true)
+    local second_buf = vim.api.nvim_create_buf(false, true)
+    local first = instance(first_buf)
+    local second = instance(second_buf)
+    second.id = first.id
+    register(manager, first)
+    local duplicate_ok, duplicate_err = pcall(register, manager, second)
+    assert.is_false(duplicate_ok)
+    assert.is_truthy(tostring(duplicate_err):find("already registered", 1, true))
+    assert.are.equal(first, manager:find_by_id(first.id))
+    assert.are.equal(first, manager:find_by_buf(first.bufnr))
+    assert.is_nil(manager:find_by_buf(second.bufnr))
+    assert.is_nil(manager:get_gc_controller():inspect(second))
+
+    assert.is_nil(manager:remove(first))
+    assert.are.equal(first, manager:find_by_id(first.id))
+    assert.are.equal(first, manager:find_by_buf(first.bufnr))
+    assert.is_not_nil(manager:get_gc_controller():inspect(first))
+    first:destroy()
+    assert.is_nil(manager:find_by_id(first.id))
+    assert.is_nil(manager:find_by_buf(first.bufnr))
+    assert.is_nil(manager:get_gc_controller():inspect(first))
+    vim.api.nvim_buf_delete(first_buf, { force = true })
+    vim.api.nvim_buf_delete(second_buf, { force = true })
+  end)
+
   it("keeps group definitions and membership exclusively in GC", function()
     local manager = manager_module.new()
     local first_buf = vim.api.nvim_create_buf(false, true)
@@ -97,8 +131,8 @@ describe("fre manager", function()
     assert.are.equal(10, manager:get_gc_controller():group_capacity("default"))
     assert.are.equal(5, manager:get_gc_controller():group_capacity("project"))
 
-    manager:remove(first)
-    manager:remove(second)
+    first:destroy()
+    second:destroy()
     vim.api.nvim_buf_delete(first_buf, { force = true })
     vim.api.nvim_buf_delete(second_buf, { force = true })
   end)
@@ -106,7 +140,7 @@ describe("fre manager", function()
   it("records complete snapshotted enrollment policy without Instance or buffer mirrors", function()
     local manager = manager_module.new()
     local bufnr = vim.api.nvim_create_buf(false, true)
-    vim.b[bufnr].fre = { version = 1, instance_id = 1, root = "." }
+    vim.b[bufnr].fre = { version = 1, instance_id = "metadata-subject", root = "." }
     local subject = instance(bufnr)
     register(manager, subject, { ttl_ms = 42, include_modified = true, group = "project" })
 
@@ -125,7 +159,7 @@ describe("fre manager", function()
     assert.is_nil(subject._gc_timer)
     assert.is_nil(vim.b[bufnr].fre.gc_group)
 
-    manager:remove(subject)
+    subject:destroy()
     vim.api.nvim_buf_delete(bufnr, { force = true })
   end)
 
@@ -144,7 +178,7 @@ describe("fre manager", function()
       instance_id = first.id, bufnr = second.bufnr, visible = true,
     })
     emit("FreInstanceActivityChanged", {
-      instance_id = first.id + 10000, bufnr = first.bufnr,
+      instance_id = first.id .. "-other", bufnr = first.bufnr,
       activity = "write", active = true,
     })
     emit("FreReady", {
@@ -191,7 +225,7 @@ describe("fre manager", function()
     assert.are.equal(second, manager:find_by_id(second.id))
     assert.is_not_nil(manager:get_gc_controller():inspect(second))
 
-    manager:remove(second)
+    second:destroy()
     vim.api.nvim_buf_delete(first_buf, { force = true })
     vim.api.nvim_buf_delete(second_buf, { force = true })
   end)

@@ -1,5 +1,4 @@
 local Tree = require("fre.instance.tree")
-local Registry = require("fre.registry")
 
 describe("fre Tree interface", function()
   local function comparator(_, left, right)
@@ -7,14 +6,7 @@ describe("fre Tree interface", function()
   end
 
   it("owns lookup sorting expansion and directory load transitions", function()
-    local observed = {}
-    local registry = Registry.new()
-    local observe_node_id = registry.observe_node_id
-    registry.observe_node_id = function(owner, id)
-      observed[#observed + 1] = id
-      return observe_node_id(owner, id)
-    end
-    local tree = Tree.new("/root", 42, comparator, registry)
+    local tree = Tree.new("/root", "tree-one", comparator)
     local root = tree:root_node()
     local ordered = tree:reconcile(root, {
       { name = "z.txt", kind = "file" },
@@ -38,11 +30,18 @@ describe("fre Tree interface", function()
     assert.are.equal("loaded", directory.load_state)
     assert.is_true(tree:collapse_all())
     assert.is_false(directory.expanded)
-    assert.are.same({ 1, 2, 3 }, observed)
+    assert.are.equal(3, tree:latest_node_id())
+
+    local peer = Tree.new("/peer", "tree-two", comparator)
+    local peer_node = peer:reconcile(peer:root_node(), {
+      { name = "same-id.txt", kind = "file" },
+    })[1]
+    assert.are.equal(2, peer_node.id)
+    assert.are.equal(2, ordered[2].id)
   end)
 
   it("restores topology without reusing IDs and adopts candidates with stable identity", function()
-    local tree = Tree.new("/root", 7, comparator, Registry.new())
+    local tree = Tree.new("/root", "tree-restore", comparator)
     local root = tree:root_node()
     local directory = tree:reconcile(root, {
       { name = "dir", kind = "directory" },

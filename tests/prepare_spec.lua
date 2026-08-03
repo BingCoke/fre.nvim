@@ -5,7 +5,6 @@ local mutation_prepare = require("fre.mutation.prepare")
 local path = require("fre.path")
 local row = require("fre.instance.row")
 local Tree = require("fre.instance.tree")
-local Registry = require("fre.registry")
 local real_fs = require("fre.fs").default
 local fs = require("tests.helpers.fs")
 
@@ -448,7 +447,7 @@ describe("fre ticket 10 prepare basic mutations", function()
   it("retains shared malformed marker metadata parser and kind errors with row numbers", function()
     local instance = ready({ ["a.txt"] = "a" }, { columns = { value_column() } })
     local original = physical_line(instance, "a.txt")
-    set_lines(instance, { unit_separator .. "fre:" .. instance.id .. ":" })
+    set_lines(instance, { unit_separator .. "fre:3:ab" })
     assert_error("row 2: malformed reserved row marker", function() instance:prepare() end)
 
     set_lines(instance, { (original:gsub("ok", "changed", 1)) })
@@ -572,15 +571,14 @@ describe("fre ticket 10 prepare basic mutations", function()
     local root = { id = 1, path = "C:/Project", kind = "directory" }
     local a = { id = 2, path = "C:/Project/A.txt", kind = "file", name = "A.txt" }
     local b = { id = 3, path = "C:/Project/B.txt", kind = "file", name = "B.txt" }
-    local registry = Registry.new()
     local tree = Tree.new(
-      root.path, 777, function(_, left, right) return left.name < right.name end, registry
+      root.path, "windows-prepare", function(_, left, right) return left.name < right.name end
     )
     tree.root = root
     tree.nodes_by_id = { [1] = root, [2] = a, [3] = b }
     tree.nodes_by_path = { [root.path] = root, [a.path] = a, [b.path] = b }
     local fake = {
-      id = 777,
+      id = "windows-prepare",
       bufnr = bufnr,
       root = root.path,
       ready = true,
@@ -588,7 +586,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     }
     fake.buffer = buffer.new({
       id = fake.id, root = fake.root, bufnr = fake.bufnr, columns = {},
-      tree = tree, registry = registry,
+      tree = tree,
       lifecycle = {
         is_dead = function() return false end,
         is_ready = function() return false end,

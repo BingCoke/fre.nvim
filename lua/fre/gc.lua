@@ -1,3 +1,5 @@
+local identity = require("fre.instance.identity")
+
 local M = {}
 
 local function fail(message, level)
@@ -11,6 +13,7 @@ end
 local function positive_integer(value)
   return type(value) == "number" and value > 0 and value % 1 == 0
 end
+
 
 local function validate_adapter(adapter)
   if type(adapter) ~= "table" then fail("adapter must be a table", 4) end
@@ -301,7 +304,7 @@ end
 
 function Controller:register(subject, policy)
   if type(subject) ~= "table" then fail("instance must be a table", 3) end
-  if not positive_integer(subject.id) then fail("instance.id must be a positive integer", 3) end
+  if not identity.valid(subject.id) then fail("instance.id must be a valid opaque string", 3) end
   if not positive_integer(subject.bufnr) then fail("instance.bufnr must be a positive integer", 3) end
   if self.entries[subject.id] ~= nil then
     fail("instance ID is already registered: " .. subject.id, 3)
@@ -323,7 +326,9 @@ function Controller:register(subject, policy)
     activities = { refresh = false, write = false, execution = false },
     deferred = false,
     eligible = false,
+    registration_order = self.next_registration_order,
   }
+  self.next_registration_order = self.next_registration_order + 1
   self.entries[subject.id] = entry
   group.members[subject.id] = entry
   local ok, err = pcall(self._arm, self, entry)
@@ -447,7 +452,7 @@ local function older(left, right)
   local left_hidden = left.hidden_since or math.huge
   local right_hidden = right.hidden_since or math.huge
   if left_hidden ~= right_hidden then return left_hidden < right_hidden end
-  return left.instance_id < right.instance_id
+  return left.registration_order < right.registration_order
 end
 
 function Controller:_eligible_group(group_name)
@@ -558,6 +563,7 @@ function M.new(adapter)
     groups = groups,
     entries = {},
     enforcing = {},
+    next_registration_order = 1,
   }, Controller)
 end
 

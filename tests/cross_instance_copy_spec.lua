@@ -197,7 +197,8 @@ describe("fre ticket 13 cross-instance copy", function()
 
     set_lines(target, { edited_line(source, "source.txt", "copied.txt") })
     local decoded = target.buffer:decode(2)
-    assert.are.equal(source.id, decoded.source_instance.id)
+    assert.are.equal(source.id, decoded.source_instance_id)
+    assert.is_nil(decoded.source_instance)
     assert.are.equal(source_entry.absolute_path, decoded.entry.absolute_path)
     assert.are.same({
       {
@@ -206,6 +207,19 @@ describe("fre ticket 13 cross-instance copy", function()
       },
       { type = "delete", path = fixture:path("target", "target.txt"), kind = "file" },
     }, target:prepare().operations)
+  end)
+
+  it("limits managed foreign resolution to the target Manager domain", function()
+    local source_manager = require("fre.manager").new()
+    local target_manager = require("fre.manager").new()
+    local source = wait_ready(keep(source_manager:create_instance({
+      root = make_root("isolated-source", { ["from.txt"] = "source" }), columns = {},
+    })))
+    local target = wait_ready(keep(target_manager:create_instance({
+      root = make_root("isolated-target", {}), columns = {},
+    })))
+    set_lines(target, { physical_line(source, "from.txt") })
+    assert_error(2, "unknown instance", function() target:prepare() end)
   end)
 
   it("uses source descriptors, widths, Entry context, and semantic validation", function()
@@ -253,7 +267,8 @@ describe("fre ticket 13 cross-instance copy", function()
       },
     }, target:prepare().operations)
 
-    local edited = foreign:gsub("SRC%-" .. source.id .. "%-file", "BAD-" .. source.id .. "-file", 1)
+    local edited = foreign:gsub("SRC%-" .. vim.pesc(source.id) .. "%-file",
+      "BAD-" .. source.id .. "-file", 1)
     set_lines(target, { physical_line(target, "keep.txt"), edited })
     assert_error(3, "column source_kind metadata changed", function() target:prepare() end)
 
@@ -264,7 +279,7 @@ describe("fre ticket 13 cross-instance copy", function()
     end)
   end)
 
-  it("rejects destroyed, removed marker sources, and missing foreign nodes with target rows", function()
+  it("rejects destroyed marker sources and missing foreign nodes with target rows", function()
     local target = ready(make_root("target", {}))
 
     local destroyed = ready(make_root("destroyed", { ["a.txt"] = "a" }))
@@ -273,11 +288,6 @@ describe("fre ticket 13 cross-instance copy", function()
     set_lines(target, { "", destroyed_line })
     assert_error(3, "unknown instance", function() target:prepare() end)
 
-    local unregistered = ready(make_root("unregistered", { ["b.txt"] = "b" }))
-    local unregistered_line = edited_line(unregistered, "b.txt", "unregistered-copy.txt")
-    buffer.teardown(unregistered.buffer)
-    set_lines(target, { unregistered_line })
-    assert_error(2, "unknown instance", function() target:prepare() end)
 
     local removed = ready(make_root("removed", { ["c.txt"] = "c" }))
     local removed_row = row_for(removed, "c.txt")

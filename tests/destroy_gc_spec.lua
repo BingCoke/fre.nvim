@@ -500,8 +500,6 @@ describe("fre managed destruction and GC", function()
     local custom_manager = manager_module.new()
     local custom = keep(custom_manager:create_instance({ root = fixture.root, columns = {} }))
     wait_ready(custom)
-    local unregistered = ready()
-    manager_module.default:remove(unregistered)
     local destroyed = ready()
     destroyed:destroy()
 
@@ -515,7 +513,6 @@ describe("fre managed destruction and GC", function()
     end
     assert_error_contains(function() fre.set_group(standalone, "project") end, "default Manager")
     assert_error_contains(function() fre.set_group(custom, "project") end, "default Manager")
-    assert_error_contains(function() fre.set_group(unregistered, "project") end, "default Manager")
     assert_error_contains(function() fre.set_group(destroyed, "project") end, "instance must be live")
     for _, group in ipairs({ false, 1, {}, function() end, "" }) do
       assert_error_contains(function()

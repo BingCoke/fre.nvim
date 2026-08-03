@@ -98,12 +98,12 @@ require("tabby").setup({
 
 | Event | 触发时机 | `args.data` |
 | --- | --- | --- |
-| `User FreInstanceCreated` | 核心组合、marker source 注册和 initial load 启动后，构造返回前 | `{ instance_id, bufnr }` |
+| `User FreInstanceCreated` | 核心组合和 initial load 启动后，构造返回前 | `{ instance_id, bufnr }` |
 | `User FreReady` | 每次 initial-load attempt 提交 ready/load-failed，且 `when_ready()` observer 已运行后 | `{ instance_id, bufnr, error, result }` |
 | `User FreInstancePresentationChanged` | 实际 View 数量跨越 0 的边界 | `{ instance_id, bufnr, visible }` |
 | `User FreInstanceActivityChanged` | `refresh`、`write` 或 `execution` 活动边界改变 | `{ instance_id, bufnr, activity, active }` |
 | `User FreInstanceDestroying` | lifecycle 提交 destroying 后、局部清理前 | `{ instance_id, bufnr }` |
-| `User FreInstanceDestroyed` | 核心 lifecycle、局部资源、buffer 和 Registry marker source 都进入终态后 | `{ instance_id, bufnr }` |
+| `User FreInstanceDestroyed` | 核心 lifecycle、局部资源和 buffer 都进入终态后 | `{ instance_id, bufnr }` |
 
 `FreInstanceDestroyed` 发出前，上表所列核心状态均已进入终态。默认 Manager 在消费该事件时才删除 managed lookup 和 GC records；在默认 Manager observer 之前运行的任意 observer 在事件 dispatch 期间仍可能通过 `fre.get_instance*()` 解析到已销毁的 Instance。默认 Manager 消费后以及事件分发完成后，managed lookup 不再存在。
 
@@ -138,7 +138,6 @@ vim.api.nvim_create_autocmd("User", {
 })
 ```
 
-Registry 另发出 `User FreRegistryMarkerWidthsChanged`，payload 精确为 `{ registry_id, instance_width, node_width, generation }`。它是 Registry 的宽度增长通知，不是第七个 Instance event。
 
 Fre 没有 `FreOpen`、`FreHide`、`FreDestroy` 或其他兼容别名，也不发布普通 refresh 完成事件。`BufUnload`、`BufWipeout`、`BufWriteCmd`、`BufWinEnter` 等是 Fre 使用或响应的 Neovim 原生事件，不是 Fre 对外发出的 `User` event；不要把内部 autocmd 当成稳定插件协议。
 

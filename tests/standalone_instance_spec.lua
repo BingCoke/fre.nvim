@@ -3,7 +3,6 @@ local fre = require("fre")
 local Instance = require("fre.instance")
 local manager_module = require("fre.manager")
 local mutation_fs = require("fre.mutation.fs")
-local Registry = require("fre.registry")
 local real_fs = require("fre.fs").default
 local real_watch = require("fre.watch").default
 local path = require("fre.path")
@@ -79,8 +78,10 @@ describe("fre standalone Instance", function()
     fixture:write("alpha.txt", "alpha")
     local instance = wait_ready(keep(Instance.new({ root = fixture.root })))
 
-    assert.are.equal(require("fre.registry").default:find_marker_source(instance.id),
-      instance.buffer.marker_source)
+    assert.is_truthy(instance.id:match(
+      "^[0-9a-f]+%-[0-9a-f]+%-4[0-9a-f]+%-8[0-9a-f]+%-[0-9a-f]+$"
+    ))
+    assert.is_nil(instance.buffer._resolve_marker_source)
     assert.are.equal(real_fs, instance.sync.fs_adapter)
     assert.are.equal(real_watch, instance.sync.watch.adapter)
     assert.are.equal(mutation_fs.default, instance.work.mutation_adapter)
@@ -95,11 +96,129 @@ describe("fre standalone Instance", function()
     assert.is_nil(manager_module.default._takeover:check(instance.bufnr, winid))
     assert.has_error(function() fre.set_group(instance, "project") end)
 
-    local bufnr, id = instance.bufnr, instance.id
+    local bufnr = instance.bufnr
     instance:destroy()
     assert.are.equal("destroyed", instance:status())
     assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
-    assert.is_nil(require("fre.registry").default:find_marker_source(id))
+  end)
+
+  it("accepts explicit opaque IDs and narrows a caller-owned resolver", function()
+    local source_root = fixture:mkdir("source")
+    local target_root = fixture:mkdir("target")
+    fixture:write("source/from.txt", "source")
+    local source = wait_ready(keep(Instance.new({
+      root = source_root, id = "source:standalone", columns = {},
+    })))
+    local target = wait_ready(keep(Instance.new({
+      root = target_root, id = "target:standalone", columns = {},
+      resolve_instance = function(id)
+        return id == source.id and source or nil
+      end,
+    })))
+    local source_row = row_for(source, "from.txt")
+    local source_line = vim.api.nvim_buf_get_lines(
+      source.bufnr, source_row - 1, source_row, false
+    )[1]
+    vim.bo[target.bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(target.bufnr, 1, -1, false, { source_line })
+    vim.bo[target.bufnr].modifiable = false
+    assert.are.same({ {
+      type = "copy",
+      from = path.resolve(source_root, "from.txt"),
+      to = path.resolve(target_root, "from.txt"),
+      kind = "file",
+    } }, target:prepare().operations)
+    assert.is_function(target.buffer._resolve_marker_source)
+    assert.is_nil(rawget(target.buffer, "resolve_instance"))
+  end)
+
+  it("rejects invalid identity inputs before creating a buffer", function()
+    local before = vim.api.nvim_list_bufs()
+    for _, options in ipairs({
+      { root = fixture.root, id = "" },
+      { root = fixture.root, id = "bad\nidentity" },
+      { root = fixture.root, resolve_instance = true },
+    }) do
+      assert.is_false(pcall(Instance.new, options))
+      assert.are.same(before, vim.api.nvim_list_bufs())
+    end
+  end)
+
+  it("never invokes a resolver for local markers", function()
+    fixture:write("local.txt", "local")
+    local calls = 0
+    local instance = wait_ready(keep(Instance.new({
+      root = fixture.root,
+      columns = {},
+      resolve_instance = function()
+        calls = calls + 1
+        error("local decode invoked resolver")
+      end,
+    })))
+    assert.is_not_nil(instance:get_entry(row_for(instance, "local.txt")))
+    assert.are.same({ operations = {}, display = {} }, instance:prepare())
+    assert.are.equal(0, calls)
+  end)
+
+  it("reports resolver exceptions with row and source context", function()
+    local source_root = fixture:mkdir("error-source")
+    local target_root = fixture:mkdir("error-target")
+    fixture:write("error-source/from.txt", "source")
+    local source = wait_ready(keep(Instance.new({
+      root = source_root, id = "resolver:error:source", columns = {},
+    })))
+    local target = wait_ready(keep(Instance.new({
+      root = target_root, id = "resolver:error:target", columns = {},
+      resolve_instance = function() error("resolver exploded") end,
+    })))
+    local source_row = row_for(source, "from.txt")
+    local source_line = vim.api.nvim_buf_get_lines(
+      source.bufnr, source_row - 1, source_row, false
+    )[1]
+    vim.bo[target.bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(target.bufnr, 1, -1, false, { source_line })
+    vim.bo[target.bufnr].modifiable = false
+    local before = vim.api.nvim_buf_get_lines(target.bufnr, 0, -1, false)
+
+    local ok, err = pcall(target.prepare, target)
+    assert.is_false(ok)
+    local text = tostring(err)
+    assert.is_truthy(text:find("row 2", 1, true), text)
+    assert.is_truthy(text:find(source.id, 1, true), text)
+    assert.is_truthy(text:find("resolver exploded", 1, true), text)
+    assert.are.same(before, vim.api.nvim_buf_get_lines(target.bufnr, 0, -1, false))
+    assert.is_false(target.work:is_write_active())
+  end)
+
+  it("reports terminal resolver sources with row and source context", function()
+    local source_root = fixture:mkdir("terminal-source")
+    local target_root = fixture:mkdir("terminal-target")
+    fixture:write("terminal-source/from.txt", "source")
+    local source = wait_ready(keep(Instance.new({
+      root = source_root, id = "resolver:terminal:source", columns = {},
+    })))
+    local target = wait_ready(keep(Instance.new({
+      root = target_root, id = "resolver:terminal:target", columns = {},
+      resolve_instance = function() return source end,
+    })))
+    local source_row = row_for(source, "from.txt")
+    local source_line = vim.api.nvim_buf_get_lines(
+      source.bufnr, source_row - 1, source_row, false
+    )[1]
+    source:destroy()
+    vim.bo[target.bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(target.bufnr, 1, -1, false, { source_line })
+    vim.bo[target.bufnr].modifiable = false
+    local before = vim.api.nvim_buf_get_lines(target.bufnr, 0, -1, false)
+
+    local ok, err = pcall(target.prepare, target)
+    assert.is_false(ok)
+    local text = tostring(err)
+    assert.is_truthy(text:find("row 2", 1, true), text)
+    assert.is_truthy(text:find(source.id, 1, true), text)
+    assert.is_truthy(text:find("terminal Instance", 1, true), text)
+    assert.are.same(before, vim.api.nvim_buf_get_lines(target.bufnr, 0, -1, false))
+    assert.is_false(target.work:is_write_active())
   end)
 
   it("does not load or install plugin mappings during core construction", function()
@@ -128,7 +247,6 @@ describe("fre standalone Instance", function()
 
   it("supports async load, presentation, edit/write, and refresh with explicit dependencies", function()
     fixture:write("old.txt", "old")
-    local registry = Registry.new()
     local pending
     local fs_adapter = {
       load = function(root, done)
@@ -145,7 +263,6 @@ describe("fre standalone Instance", function()
       root = fixture.root,
       columns = {},
       skip_confirm_for_simple_edits = true,
-      registry = registry,
       fs_adapter = fs_adapter,
       watch_adapter = real_watch,
       mutation_adapter = mutation_adapter,
@@ -183,11 +300,9 @@ describe("fre standalone Instance", function()
   end)
 
   it("keeps standalone buffer-deletion failure retryable until terminal cleanup", function()
-    local registry = Registry.new()
     local instance = wait_ready(keep(Instance.new({
       root = fixture.root,
       columns = {},
-      registry = registry,
     })))
     local id, bufnr = instance.id, instance.bufnr
     local original_delete = vim.api.nvim_buf_delete
@@ -202,21 +317,17 @@ describe("fre standalone Instance", function()
     assert.is_truthy(tostring(err):find("fallback delete failed", 1, true))
     assert.are.equal("destroying", instance:status())
     assert.is_true(vim.api.nvim_buf_is_valid(bufnr))
-    assert.is_not_nil(registry:find_marker_source(id))
     assert.is_nil(manager_module.default:find_by_id(id))
 
     instance:destroy()
     assert.are.equal("destroyed", instance:status())
     assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
-    assert.is_nil(registry:find_marker_source(id))
   end)
 
   it("finishes standalone destruction after external buffer deletion", function()
-    local registry = Registry.new()
     local instance = wait_ready(keep(Instance.new({
       root = fixture.root,
       columns = {},
-      registry = registry,
     })))
     local id, bufnr = instance.id, instance.bufnr
 
@@ -224,18 +335,11 @@ describe("fre standalone Instance", function()
     wait_for(function() return instance:is_destroyed() end)
 
     assert.is_false(vim.api.nvim_buf_is_valid(bufnr))
-    assert.is_nil(registry:find_marker_source(id))
     assert.is_nil(manager_module.default:find_by_id(id))
   end)
 
-  it("consumes identity and removes the marker source when core construction fails", function()
-    local registry = Registry.new()
-    local allocated_id
-    local allocate = registry.allocate_instance_id
-    registry.allocate_instance_id = function(owner)
-      allocated_id = allocate(owner)
-      return allocated_id
-    end
+  it("cleans an explicitly identified standalone construction failure", function()
+    local allocated_id = "failed:standalone:id"
     local original_setup = buffer.setup
     buffer.setup = function(subject)
       original_setup(subject)
@@ -245,15 +349,13 @@ describe("fre standalone Instance", function()
     local before = vim.api.nvim_list_bufs()
     local ok, err = pcall(Instance.new, {
       root = fixture.root,
+      id = allocated_id,
       columns = {},
-      registry = registry,
     })
     buffer.setup = original_setup
 
     assert.is_false(ok)
     assert.is_truthy(tostring(err):find("injected standalone constructor failure", 1, true))
-    assert.is_true(registry:is_instance_id_consumed(allocated_id))
-    assert.is_nil(registry:find_marker_source(allocated_id))
     assert.are.same(before, vim.api.nvim_list_bufs())
     assert.is_nil(manager_module.default:find_by_id(allocated_id))
   end)

@@ -1,9 +1,9 @@
 local config = require("fre.config")
 local gc = require("fre.gc")
 local fs = require("fre.fs")
+local identity = require("fre.instance.identity")
 local mapping = require("fre.mapping")
 local mutation_fs = require("fre.mutation.fs")
-local registry = require("fre.registry")
 local watch = require("fre.watch")
 local takeover = require("fre.takeover")
 local write_ui = require("fre.write_ui")
@@ -18,6 +18,7 @@ end
 local function positive_integer(value)
   return type(value) == "number" and value > 0 and value % 1 == 0
 end
+
 
 local function copy_without(source, omitted)
   local result = {}
@@ -36,7 +37,7 @@ local function observe_managed_events(manager)
   )
 
   local function resolve(data)
-    if type(data) ~= "table" or not positive_integer(data.instance_id)
+    if type(data) ~= "table" or not identity.valid(data.instance_id)
         or not positive_integer(data.bufnr) then return nil end
     local instance = manager.instances_by_id[data.instance_id]
     if not instance or manager.instances_by_buf[data.bufnr] ~= instance
@@ -103,7 +104,6 @@ end
 function Manager.new(opts)
   opts = opts or {}
   local self = setmetatable({
-    _registry = opts.registry or registry.default,
     _setup_defaults = config.resolve_setup(),
     _default_file_explorer = nil,
     _fs_adapter = fs.default,
@@ -125,11 +125,15 @@ function Manager:create_instance(opts)
   if type(opts.root) ~= "string" then error("fre: root must be a string", 2) end
   if opts.root == "" then error("fre: root must not be empty", 2) end
 
+  if opts.id ~= nil then error("fre: managed instances do not accept id", 2) end
   local root = require("fre.path").absolute(opts.root)
   local effective, policy = self:resolve_instance_config(opts, root)
   local core_options = config.copy(effective)
   core_options.root = root
-  core_options.registry = self._registry
+  core_options.id = identity.new()
+  core_options.resolve_instance = function(instance_id)
+    return self.instances_by_id[instance_id]
+  end
   core_options.fs_adapter = self._fs_adapter
   core_options.watch_adapter = self._watch_adapter
   core_options.mutation_adapter = self._mutation_adapter
@@ -251,7 +255,7 @@ end
 
 function Manager:register(instance, policy)
   if type(instance) ~= "table" then fail("instance must be a table") end
-  if not positive_integer(instance.id) then fail("instance.id must be a positive integer") end
+  if not identity.valid(instance.id) then fail("instance.id must be a valid opaque string") end
   if not positive_integer(instance.bufnr) then fail("instance.bufnr must be a positive integer") end
   if self.instances_by_id[instance.id] ~= nil then
     fail("instance ID is already registered: " .. instance.id)
@@ -294,6 +298,7 @@ function Manager:remove(instance_or_id)
   local instance = instance_or_id
   if type(instance_or_id) ~= "table" then instance = self.instances_by_id[instance_or_id] end
   if not instance or self.instances_by_id[instance.id] ~= instance then return nil end
+  if type(instance.is_destroyed) ~= "function" or not instance:is_destroyed() then return nil end
 
   self.instances_by_id[instance.id] = nil
   for bufnr, indexed in pairs(self.instances_by_buf) do

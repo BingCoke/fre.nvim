@@ -549,7 +549,7 @@ local function resolve_construction(options)
   return {
     root = root,
     effective = effective,
-    registry = options.registry or require("fre.registry").default,
+    identity = require("fre.instance.identity").resolve(options.id, options.resolve_instance),
     fs_adapter = options.fs_adapter or fs.default,
     watch_adapter = options.watch_adapter or watch.default,
     mutation_adapter = options.mutation_adapter or mutation_fs.default,
@@ -561,12 +561,12 @@ function Instance.new(options)
   local selected = resolve_construction(options)
   local root = selected.root
   local effective = selected.effective
-  local registry = selected.registry
+  local resolved_identity = selected.identity
   local fs_adapter = selected.fs_adapter
   local watch_adapter = selected.watch_adapter
   local mutation_adapter = selected.mutation_adapter
   local write_ui_adapter = selected.write_ui_adapter
-  local id = registry:allocate_instance_id()
+  local id = resolved_identity.id
   local bufnr = vim.api.nvim_create_buf(false, true)
   local self = setmetatable({
     id = id,
@@ -601,7 +601,7 @@ function Instance.new(options)
       if key ~= "fre" then vim.b[bufnr][key] = copy(value) end
     end
 
-    self.tree = Tree.new(root, id, effective.sort, registry)
+    self.tree = Tree.new(root, id, effective.sort)
     self.buffer = buffer.new({
       id = id,
       root = root,
@@ -610,7 +610,7 @@ function Instance.new(options)
       tree = self.tree,
       lifecycle = self.lifecycle,
       hidden_file = effective.hidden_file,
-      registry = registry,
+      resolve_marker_source = resolved_identity.marker_source,
       report_async_error = report_async_error,
     })
     self.view = view.new({
