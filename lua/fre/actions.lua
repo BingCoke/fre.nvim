@@ -131,7 +131,7 @@ end
 
 local function expanded_under(instance, root)
   local result = {}
-  for _, expanded_path in ipairs(instance.tree:active_expanded_paths()) do
+  for _, expanded_path in ipairs(instance:get_expanded_paths()) do
     local relative = path.relative(root, expanded_path)
     if relative and relative ~= "" then result[#result + 1] = relative end
   end
@@ -165,14 +165,13 @@ end
 local function preflight_child_options(overrides)
   if overrides == nil then return {} end
   if type(overrides) ~= "table" then fail("opts.instance must be a table", 4) end
-  if overrides.root ~= nil then fail("opts.instance.root is action-owned", 4) end
   return overrides
 end
 
 local function child_options(instance, overrides, target)
   local result = config.copy(preflight_child_options(overrides))
-  if result.sort == nil then result.sort = instance.tree:get_comparator() end
-  if result.hidden_file == nil then result.hidden_file = instance.buffer.hidden_file end
+  if result.sort == nil then result.sort = instance:get_sort() end
+  if result.hidden_file == nil then result.hidden_file = instance:get_hidden_file() end
   result.expanded = config.copy(target.expanded or {})
   result.root = target.root
   return result
@@ -217,7 +216,7 @@ local function prepare_selection(instance, target, overrides)
   local options = child_options(instance, overrides, target)
   return {
     kind = "child",
-    child = require("fre.manager").default:create_instance(options),
+    child = require("fre").new(options),
   }
 end
 

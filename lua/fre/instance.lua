@@ -159,6 +159,19 @@ end
 
 
 
+function Instance:get_sort()
+  return self.tree:get_comparator()
+end
+
+function Instance:get_hidden_file()
+  return self.buffer:hidden_files()
+end
+
+function Instance:get_expanded_paths()
+  return self.tree:active_expanded_paths()
+end
+
+
 function Instance:set_sort(sort_fn)
   if type(sort_fn) ~= "function" then fail("sort must be a function", 2) end
   self:_require_projection_change()

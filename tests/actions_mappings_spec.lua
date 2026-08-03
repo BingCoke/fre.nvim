@@ -1210,6 +1210,175 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal(path.absolute(fixture:path("src")), child.root)
   end)
 
+  it("copies child options, replaces action-owned paths, and calls public fre.new", function()
+    local source_sort = function(_, left, right) return left.name < right.name end
+    local override_sort = function(_, left, right) return left.name > right.name end
+    local instance = ready({ ["dir/nested/file.txt"] = "x" }, {
+      hidden_file = true,
+      sort = source_sort,
+    })
+    instance:expand("dir")
+    wait_for(function() return instance:get_pos("dir/nested") ~= nil end)
+    instance:expand("dir/nested")
+    local ctx = context_for(instance, "dir")
+    local overrides = {
+      root = "caller-owned-root",
+      expanded = { "caller-owned-expanded" },
+      hidden_file = false,
+      sort = override_sort,
+      gc = { ttl_ms = 321, include_modified = true, group = "project" },
+      buffer = { variables = { ticket_10 = { nested = "caller" } } },
+    }
+    local before = vim.deepcopy(overrides)
+    local original_new = fre.new
+    local calls = {}
+    fre.new = function(options)
+      calls[#calls + 1] = options
+      return original_new(options)
+    end
+
+    local ok, child = pcall(actions.select, ctx, { instance = overrides })
+    fre.new = original_new
+    assert.is_true(ok, tostring(child))
+    local passed = assert(calls[1])
+
+    assert.are.equal(1, #calls)
+    assert.are_not.equal(overrides, passed)
+    assert.are_not.equal(overrides.gc, passed.gc)
+    assert.are_not.equal(overrides.buffer, passed.buffer)
+    assert.are_not.equal(overrides.buffer.variables.ticket_10,
+      passed.buffer.variables.ticket_10)
+    assert.are.same(before, overrides)
+    assert.are.equal(path.absolute(fixture:path("dir")), passed.root)
+    assert.are.same({ "nested" }, passed.expanded)
+    assert.is_false(passed.hidden_file)
+    assert.are.equal(override_sort, passed.sort)
+    assert.are.same(before.gc, passed.gc)
+    assert.is_nil(passed.registry)
+    assert.is_nil(passed.manager)
+    assert.is_nil(passed.config)
+    assert.is_nil(passed.metadata)
+    assert.are.equal(child, fre.get_instance(child.bufnr))
+    assert.are.equal(child, manager_module.default:find_by_group("project")[child.id])
+    assert.are.same({
+      instance_id = child.id,
+      bufnr = child.bufnr,
+      group = "project",
+      ttl_ms = 321,
+      include_modified = true,
+      hidden = false,
+      eligible = false,
+    }, manager_module.default:get_gc_controller():inspect(child))
+    assert.is_false(child:get_hidden_file())
+    assert.are.equal(override_sort, child:get_sort())
+  end)
+
+  it("derives only current navigation behavior and resolves absent GC from current defaults", function()
+    local source_sort = function(_, left, right) return left.name > right.name end
+    fre.setup({
+      default_file_explorer = false,
+      columns = {},
+      gc = {
+        ttl_ms = 900, include_modified = true, default_group = "project",
+        groups = { default = 0, project = 0 },
+      },
+    })
+    local instance = ready({ ["dir/child.txt"] = "x" }, {
+      hidden_file = false,
+      sort = source_sort,
+    })
+    instance:set_hidden_file(true)
+    local source_policy = manager_module.default:get_gc_controller():inspect(instance)
+    assert.are.equal("project", source_policy.group)
+    assert.are.equal(900, source_policy.ttl_ms)
+    assert.is_true(source_policy.include_modified)
+
+    fre.setup({
+      default_file_explorer = false,
+      columns = {},
+      gc = {
+        ttl_ms = 27, include_modified = false, default_group = "default",
+        groups = { default = 0, project = 0 },
+      },
+    })
+    local original_new = fre.new
+    local passed
+    fre.new = function(options)
+      passed = options
+      return original_new(options)
+    end
+    local ok, child = pcall(actions.select, context_for(instance, "dir"))
+    fre.new = original_new
+    assert.is_true(ok, tostring(child))
+
+    assert.are.same({
+      root = path.absolute(fixture:path("dir")),
+      expanded = {},
+      sort = source_sort,
+      hidden_file = true,
+    }, passed)
+    assert.are.equal(source_sort, child:get_sort())
+    assert.is_true(child:get_hidden_file())
+    assert.are.same({
+      instance_id = child.id,
+      bufnr = child.bufnr,
+      group = "default",
+      ttl_ms = 27,
+      include_modified = false,
+      hidden = false,
+      eligible = false,
+    }, manager_module.default:get_gc_controller():inspect(child))
+    assert.are.equal(child, manager_module.default:find_by_group("default")[child.id])
+    assert.are.equal(instance, manager_module.default:find_by_group("project")[instance.id])
+  end)
+
+  it("destroys a public-new child through its normal lifecycle after precommit failure", function()
+    local instance = ready({ ["dir/child.txt"] = "x" })
+    local ctx = context_for(instance, "dir")
+    local original_new = fre.new
+    local prepared
+    local destroy_calls = 0
+    fre.new = function(options)
+      prepared = original_new(options)
+      local destroy = prepared.destroy
+      prepared.destroy = function(self)
+        destroy_calls = destroy_calls + 1
+        return destroy(self)
+      end
+      return prepared
+    end
+
+    local ok, err = pcall(actions.select, ctx, {
+      instance = { window = { options = { fre_not_a_real_option = true } } },
+    })
+    fre.new = original_new
+
+    assert.is_false(ok)
+    assert.is_truthy(tostring(err))
+    assert.are.equal(1, destroy_calls)
+    assert.are.equal("destroyed", prepared:status())
+    assert.is_nil(fre.get_instance_by_id(prepared.id))
+    assert.is_nil(fre.get_instance(prepared.bufnr))
+    assert.is_nil(manager_module.default:get_gc_controller():inspect(prepared))
+  end)
+
+  it("keeps a committed directory peer alive when the source is destroyed", function()
+    local instance = ready({ ["dir/child.txt"] = "x" })
+    local source_id = instance.id
+    local child = wait_ready(actions.select(context_for(instance, "dir")))
+    local child_win = vim.api.nvim_get_current_win()
+
+    instance:destroy()
+
+    assert.is_nil(fre.get_instance_by_id(source_id))
+    assert.are.equal("ready", child:status())
+    assert.are.equal(child, fre.get_instance_by_id(child.id))
+    assert.are.equal(child, fre.get_instance(child.bufnr))
+    assert.is_true(vim.api.nvim_win_is_valid(child_win))
+    assert.are.equal(child.bufnr, vim.api.nvim_win_get_buf(child_win))
+    assert.is_not_nil(fre.view.inspect(child, vim.api.nvim_get_current_tabpage()))
+  end)
+
   it("creates directory children in the exact target and a new tab with explicit effective overrides", function()
     local sort_fn = function(_, a, b) return a.name > b.name end
     local instance = ready({ ["same/a.txt"] = "a", ["tab/b.txt"] = "b" }, {
@@ -1878,14 +2047,13 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal(unrelated_buf, vim.api.nvim_win_get_buf(unrelated_win))
   end)
 
-  it("rejects action-owned, unknown, invalid instance, and non-split inputs before side effects", function()
+  it("rejects unknown, invalid instance, and non-split inputs before side effects", function()
     local instance = ready({ ["dir/a"] = "a", ["file.txt"] = "f" })
     local ctx = context_for(instance, "dir")
     local before_count = instance_count()
     local before_windows = window_buffers()
     local before_tabs = vim.api.nvim_list_tabpages()
     local invalid = {
-      function() actions.select(ctx, { instance = { root = "other" } }) end,
       function() actions.tab_select(ctx, { instance = { inherit = instance } }) end,
       function() actions.select(ctx, { extra = true }) end,
       function() actions.tab_select(ctx, { instance = "bad" }) end,
