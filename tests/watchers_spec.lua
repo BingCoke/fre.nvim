@@ -503,7 +503,7 @@ describe("fre ticket 15 directory watchers", function()
     watcher:emit(instance.root, nil, "ignored")
     watcher:fire(instance.root)
     wait_for(function() return instance.sync:is_dirty() end)
-    local manager = instance.manager
+    local manager = require("fre.manager").default
     manager.instances_by_id[instance.id] = nil
     manager.instances_by_buf[instance.bufnr] = nil
     instance:open()

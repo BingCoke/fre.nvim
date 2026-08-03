@@ -439,7 +439,7 @@ describe("fre managed destruction and GC", function()
     local instance = ready()
     clock:advance(25)
 
-    assert.are.equal(instance, instance:setGroup("project"))
+    assert.are.equal(instance, manager_module.default:move_to_group(instance, "project"))
     assert.is_nil(members("default")[instance.id])
     assert.are.equal(instance, members("project")[instance.id])
     assert.are.equal("project", gc_info(instance).group)
@@ -460,7 +460,7 @@ describe("fre managed destruction and GC", function()
     clock:advance(1)
     local moved = ready()
 
-    moved:setGroup("project")
+    manager_module.default:move_to_group(moved, "project")
 
     assert.are.equal("destroyed", existing:status())
     assert.are.equal("ready", moved:status())
@@ -478,7 +478,9 @@ describe("fre managed destruction and GC", function()
     local destroy = existing.destroy
     existing.destroy = function() error("injected target destroy failure") end
 
-    local ok, err = pcall(moved.setGroup, moved, "project")
+    local ok, err = pcall(
+      manager_module.default.move_to_group, manager_module.default, moved, "project"
+    )
     existing.destroy = destroy
 
     assert.is_false(ok)

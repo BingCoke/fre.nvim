@@ -739,7 +739,7 @@ describe("fre editor-derived Views", function()
   it("keeps presentation truth when Manager registration is temporarily absent", function()
     local instance = ready()
     local winid = open_view(instance, { position = "current" })
-    local manager = instance.manager
+    local manager = require("fre.manager").default
     local by_id = manager.instances_by_id[instance.id]
     local by_buf = manager.instances_by_buf[instance.bufnr]
     manager.instances_by_id[instance.id] = nil

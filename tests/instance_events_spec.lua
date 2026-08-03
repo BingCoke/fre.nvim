@@ -95,10 +95,7 @@ describe("fre finite Instance User events", function()
     capture("FreInstanceCreated", function(data)
       order[#order + 1] = "created"
       created_data = data
-      local instance = manager:find_by_id(data.instance_id)
-      assert.is_not_nil(instance)
-      assert.are.equal(instance.bufnr, data.bufnr)
-      assert.are.equal("creating", instance:status())
+      assert.is_nil(manager:find_by_id(data.instance_id))
     end)
     capture("FreReady", function(data)
       order[#order + 1] = "ready"
@@ -114,6 +111,8 @@ describe("fre finite Instance User events", function()
     assert.are.same({ "created" }, order)
     assert.are.equal(instance.id, created_data.instance_id)
     assert.are.equal(instance.bufnr, created_data.bufnr)
+    assert.are.equal(instance, manager:find_by_id(instance.id))
+    assert.are.equal(instance, manager:find_by_buf(instance.bufnr))
 
     instance:when_ready(function(err)
       assert.is_nil(err)

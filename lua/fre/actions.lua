@@ -217,7 +217,7 @@ local function prepare_selection(instance, target, overrides)
   local options = child_options(instance, overrides, target)
   return {
     kind = "child",
-    child = instance.manager:create_instance(options),
+    child = require("fre.manager").default:create_instance(options),
   }
 end
 

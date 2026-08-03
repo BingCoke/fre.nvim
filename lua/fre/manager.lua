@@ -126,15 +126,15 @@ function Manager:create_instance(opts)
 
   local root = require("fre.path").absolute(opts.root)
   local effective, policy = self:resolve_instance_config(opts, root)
-  local id = self._registry:allocate_instance_id()
-  local instance = require("fre.instance").new(
-    self, id, root, effective, self._registry, self._fs_adapter, self._watch_adapter,
-    self._mutation_adapter, self._write_ui_adapter
-  )
-  local ok, result = pcall(function()
-    self:register(instance, policy)
-    return instance:_start_initial_load()
-  end)
+  local core_options = config.copy(effective)
+  core_options.root = root
+  core_options.registry = self._registry
+  core_options.fs_adapter = self._fs_adapter
+  core_options.watch_adapter = self._watch_adapter
+  core_options.mutation_adapter = self._mutation_adapter
+  core_options.write_ui_adapter = self._write_ui_adapter
+  local instance = require("fre.instance").new(core_options)
+  local ok, result = pcall(self.register, self, instance, policy)
   if ok then return result end
 
   local cleaned, cleanup_err = pcall(instance.destroy, instance)

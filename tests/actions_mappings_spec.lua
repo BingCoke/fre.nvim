@@ -785,7 +785,7 @@ describe("fre ticket 17 actions and mappings", function()
           row = config.row, col = config.col, border = vim.deepcopy(config.border),
         }
       end
-      local manager = instance.manager
+      local manager = manager_module.default
       manager.instances_by_id[instance.id] = nil
       manager.instances_by_buf[instance.bufnr] = nil
 
@@ -948,7 +948,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal(before_count, instance_count())
   end)
 
-  it("rejects directory selection when child loading invalidates the exact source", function()
+  it("rejects directory selection when managed child registration invalidates the source", function()
     local instance = ready({ ["dir/child.txt"] = "x" })
     local ctx = context_for(instance, "dir")
     vim.cmd("vsplit")
@@ -963,23 +963,24 @@ describe("fre ticket 17 actions and mappings", function()
     local child
     local child_id
     local child_bufnr
-    fre._set_fs_adapter({
-      load = function(scan_path, _)
-        for _, candidate in ipairs(manager_instances()) do
-          if candidate ~= instance and path.equal(candidate.root, scan_path) then
-            child = candidate
-          end
-        end
-        assert.is_not_nil(child)
+    fre._set_fs_adapter({ load = function() end })
+    local manager = manager_module.default
+    local original_register = manager.register
+    manager.register = function(target, created, policy)
+      local registered = original_register(target, created, policy)
+      if created ~= instance and path.equal(created.root, fixture:path("dir")) then
+        child = created
         child_id = child.id
         child_bufnr = child.bufnr
         vim.api.nvim_win_set_buf(ctx.winid, external_source_buf)
-      end,
-    })
+      end
+      return registered
+    end
 
-    local err = error_text(function()
-      actions.select(ctx, { target_winid = target_win })
-    end)
+    local ok, err = pcall(actions.select, ctx, { target_winid = target_win })
+    manager.register = original_register
+    assert.is_false(ok)
+    err = tostring(err)
 
     assert.is_truthy(err:find("source is no longer valid", 1, true))
     assert.is_not_nil(child)
@@ -1031,25 +1032,26 @@ describe("fre ticket 17 actions and mappings", function()
     local child_id
     local child_bufnr
 
-    fre._set_fs_adapter({
-      load = function(scan_path, _)
-        for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-          local candidate = manager_module.default:find_by_buf(bufnr)
-          if candidate and candidate ~= instance and candidate ~= target_owner
-              and path.equal(candidate.root, scan_path) then
-            child_id = candidate.id
-            child_bufnr = candidate.bufnr
-          end
-        end
+    fre._set_fs_adapter({ load = function() end })
+    local manager = manager_module.default
+    local original_register = manager.register
+    manager.register = function(target, created, policy)
+      local registered = original_register(target, created, policy)
+      if created ~= instance and created ~= target_owner
+          and path.equal(created.root, fixture:path("dir")) then
+        child_id = created.id
+        child_bufnr = created.bufnr
         vim.api.nvim_set_current_win(target_win)
         target_owner:open({ position = "current" })
         vim.api.nvim_set_current_win(ctx.winid)
-      end,
-    })
+      end
+      return registered
+    end
 
-    local err = error_text(function()
-      actions.select(ctx, { target_winid = target_win })
-    end)
+    local ok, err = pcall(actions.select, ctx, { target_winid = target_win })
+    manager.register = original_register
+    assert.is_false(ok)
+    err = tostring(err)
 
     assert.is_truthy(err:find("target window changed during selection preparation", 1, true))
     assert.is_not_nil(child_id)
@@ -1747,19 +1749,19 @@ describe("fre ticket 17 actions and mappings", function()
       local child
       local child_id
       local child_bufnr
+      local manager = manager_module.default
+      local original_register = manager.register
       if case.kind == "directory" then
-        fre._set_fs_adapter({
-          load = function(scan_path, _)
-            for _, candidate in ipairs(manager_instances()) do
-              if candidate ~= instance and path.equal(candidate.root, scan_path) then
-                child = candidate
-              end
-            end
-            assert.is_not_nil(child)
+        fre._set_fs_adapter({ load = function() end })
+        manager.register = function(target, created, policy)
+          local registered = original_register(target, created, policy)
+          if created ~= instance and path.equal(created.root, selected_path) then
+            child = created
             child_id = child.id
             child_bufnr = child.bufnr
-          end,
-        })
+          end
+          return registered
+        end
       else
         assert.are.equal(-1, vim.fn.bufnr(selected_path))
       end
@@ -1789,6 +1791,7 @@ describe("fre ticket 17 actions and mappings", function()
           layout = { position = "right", size = 20 },
         })
       end
+      manager.register = original_register
       vim.api.nvim_del_augroup_by_id(group)
 
       assert.is_false(ok)

@@ -393,7 +393,6 @@ describe("fre async hidden instances", function()
 
   it("copies only known core inputs to their owners and accepts concrete adapters", function()
     local registry = Registry.new()
-    local manager = manager_module.new({ registry = registry })
     local root = path.absolute(fixture.root)
     fixture:mkdir("dir")
     local effective = config.resolve_instance(config.resolve_setup(), {
@@ -415,10 +414,14 @@ describe("fre async hidden instances", function()
     local watch_adapter = require("fre.watch").default
     local mutation_adapter = require("fre.mutation.fs").default
     local write_ui_adapter = require("fre.write_ui")
-    local instance = keep(Instance.new(
-      manager, registry:allocate_instance_id(), root, effective, registry,
-      fs_adapter, watch_adapter, mutation_adapter, write_ui_adapter
-    ))
+    local options = config.copy(effective)
+    options.root = root
+    options.registry = registry
+    options.fs_adapter = fs_adapter
+    options.watch_adapter = watch_adapter
+    options.mutation_adapter = mutation_adapter
+    options.write_ui_adapter = write_ui_adapter
+    local instance = keep(Instance.new(options))
 
     assert.is_nil(rawget(instance, "caller_owned"))
     assert.is_nil(rawget(instance.buffer, "caller_owned"))
@@ -448,7 +451,7 @@ describe("fre async hidden instances", function()
     assert.is_false(instance.view.window_options.wrap)
     assert.are.same({ value = 1 }, vim.b[instance.bufnr].retained_only_in_nvim)
 
-    instance:_start_initial_load()
+    assert.is_nil(rawget(instance, "manager"))
     assert.is_function(load_callbacks[1])
     load_callbacks[1](nil, { { name = "dir", kind = "directory" } }, root)
     wait_for(function() return load_callbacks[2] ~= nil end)
@@ -526,8 +529,12 @@ describe("fre async hidden instances", function()
     local original_new = Instance.new
     local original_register = manager.register
     local original_gc_register = manager._gc.register
-    Instance.new = function(...)
-      local created = original_new(...)
+    Instance.new = function(options, ...)
+      assert.are.equal(0, select("#", ...))
+      assert.are.equal(manager._registry, options.registry)
+      assert.is_nil(options.gc)
+      local created = original_new(options)
+      assert.is_nil(rawget(created, "manager"))
       core_returned = true
       return created
     end
@@ -675,6 +682,12 @@ describe("fre async hidden instances", function()
     manager:set_fs_adapter({ load = function(_, done) pending = done end })
     local before_buffers = vim.api.nvim_list_bufs()
     local constructed
+    local ready_events = 0
+    vim.api.nvim_create_autocmd("User", {
+      group = event_group,
+      pattern = "FreReady",
+      callback = function() ready_events = ready_events + 1 end,
+    })
     local original_gc_register = manager._gc.register
     manager._gc.register = function(controller, created, policy)
       constructed = created
@@ -689,7 +702,7 @@ describe("fre async hidden instances", function()
     local failed_id = constructed.id
     assert.is_false(ok)
     assert.is_truthy(tostring(err):find("injected managed registration failure", 1, true))
-    assert.is_nil(pending)
+    assert.is_function(pending)
     assert.are.equal("destroyed", constructed:status())
     assert.is_false(vim.api.nvim_buf_is_valid(constructed.bufnr))
     assert.is_nil(manager:find_by_id(failed_id))
@@ -698,20 +711,30 @@ describe("fre async hidden instances", function()
     assert.is_nil(registry:find_marker_source(failed_id))
     assert.are.same(before_buffers, vim.api.nvim_list_bufs())
     assert.are.same({ created = 1, stopped = 1, closed = 1 }, timers)
+    pending(nil, {})
+    vim.wait(20, function() return false end, 5)
+    assert.are.equal(0, ready_events)
+    assert.are.same(before_buffers, vim.api.nvim_list_bufs())
   end)
 
-  it("removes managed ownership when initial load start fails", function()
+  it("cleans core ownership before managed registration when initial load start fails", function()
     local registry = Registry.new()
     local manager = manager_module.new({ registry = registry })
     local pending
     manager:set_fs_adapter({ load = function(_, done) pending = done end })
     local before_buffers = vim.api.nvim_list_bufs()
-    local constructed
+    local failed_id
+    local allocate_instance_id = registry.allocate_instance_id
+    registry.allocate_instance_id = function(owner)
+      failed_id = allocate_instance_id(owner)
+      return failed_id
+    end
+    local registrations = 0
     local original_register = manager.register
     local original_load_initial = Sync.load_initial
-    manager.register = function(target, created)
-      constructed = created
-      return original_register(target, created)
+    manager.register = function(target, created, policy)
+      registrations = registrations + 1
+      return original_register(target, created, policy)
     end
     Sync.load_initial = function(sync, ...)
       original_load_initial(sync, ...)
@@ -722,14 +745,12 @@ describe("fre async hidden instances", function()
     manager.register = original_register
     Sync.load_initial = original_load_initial
 
-    local failed_id = constructed.id
     assert.is_false(ok)
     assert.is_truthy(tostring(err):find("injected load start failure", 1, true))
     assert.is_function(pending)
-    assert.are.equal("destroyed", constructed:status())
-    assert.is_false(vim.api.nvim_buf_is_valid(constructed.bufnr))
+    assert.are.equal(0, registrations)
+    assert.is_true(registry:is_instance_id_consumed(failed_id))
     assert.is_nil(manager:find_by_id(failed_id))
-    assert.is_nil(manager:find_by_buf(constructed.bufnr))
     assert.is_nil(manager:find_by_group("default")[failed_id])
     assert.is_nil(registry:find_marker_source(failed_id))
     assert.are.same(before_buffers, vim.api.nvim_list_bufs())

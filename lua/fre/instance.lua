@@ -158,15 +158,6 @@ end
 
 
 
-function Instance:setGroup(group)
-  if type(group) ~= "string" or group == "" then
-    fail("group must be a non-empty string", 2)
-  end
-  if self.lifecycle:is_dead() then
-    fail("instance is destroyed", 2)
-  end
-  return self.manager:move_to_group(self, group)
-end
 
 function Instance:set_sort(sort_fn)
   if type(sort_fn) ~= "function" then fail("sort must be a function", 2) end
@@ -553,18 +544,58 @@ function Instance:_start_initial_load()
   return self
 end
 
-function Instance.new(manager, id, root, effective, registry, fs_adapter, watch_adapter,
-    mutation_adapter, write_ui_adapter)
+local core_fields = {
+  "hidden_file",
+  "skip_confirm_for_simple_edits",
+  "auto_expand_single_directory",
+  "sort",
+  "expanded",
+  "columns",
+  "layout",
+  "use_mapping_default",
+  "mapping",
+  "buffer",
+  "window",
+}
+
+local function resolve_construction(options)
+  if type(options) ~= "table" then fail("instance options must be a table", 3) end
+  if options.root == nil then fail("root is required", 3) end
+  if type(options.root) ~= "string" then fail("root must be a string", 3) end
+  if options.root == "" then fail("root must not be empty", 3) end
+
+  local root = path.absolute(options.root)
+  local core_options = {}
+  for _, field in ipairs(core_fields) do
+    if options[field] ~= nil then core_options[field] = options[field] end
+  end
+  local effective = config.resolve_instance(config.builtins(), core_options, root)
+  return {
+    root = root,
+    effective = effective,
+    registry = options.registry or require("fre.registry").default,
+    fs_adapter = options.fs_adapter or fs.default,
+    watch_adapter = options.watch_adapter or watch.default,
+    mutation_adapter = options.mutation_adapter or mutation_fs.default,
+    write_ui_adapter = options.write_ui_adapter or write_ui,
+  }
+end
+
+function Instance.new(options)
+  local selected = resolve_construction(options)
+  local root = selected.root
+  local effective = selected.effective
+  local registry = selected.registry
+  local fs_adapter = selected.fs_adapter
+  local watch_adapter = selected.watch_adapter
+  local mutation_adapter = selected.mutation_adapter
+  local write_ui_adapter = selected.write_ui_adapter
+  local id = registry:allocate_instance_id()
   local bufnr = vim.api.nvim_create_buf(false, true)
   local self = setmetatable({
-    manager = manager,
     id = id,
     bufnr = bufnr,
   }, Instance)
-  fs_adapter = fs_adapter or fs.default
-  watch_adapter = watch_adapter or watch.default
-  mutation_adapter = mutation_adapter or mutation_fs.default
-  write_ui_adapter = write_ui_adapter or write_ui
 
   local ok, result = xpcall(function()
     self.root = root
@@ -682,7 +713,7 @@ function Instance.new(manager, id, root, effective, registry, fs_adapter, watch_
       work = self.work,
     })
     self.buffer:setup()
-    return self
+    return self:_start_initial_load()
   end, function(err) return err end)
 
   if ok then return result end
