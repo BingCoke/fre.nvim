@@ -589,14 +589,10 @@ describe("fre ticket 10 prepare basic mutations", function()
     fake.buffer = buffer.new({
       id = fake.id, root = fake.root, bufnr = fake.bufnr, columns = {},
       tree = tree, registry = registry,
-      can_reproject = function() return false end,
-      destroyed = function() return false end,
-      destroying = function() return false end,
-      list_views = function() return {} end,
-      apply_window = function() end,
-      sync_views = function() end,
-      request_write = function() end,
-      request_destroy = function() end,
+      lifecycle = {
+        is_dead = function() return false end,
+        is_ready = function() return false end,
+      },
       report_async_error = function() end,
     })
     fake.buffer.view = {

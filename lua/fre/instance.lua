@@ -35,48 +35,8 @@ local function require_ready(instance)
   if not instance.lifecycle:is_ready() then fail("instance is not ready", 4) end
 end
 
-local function safe_string(value)
-  local text = tostring(value)
-  return (text:gsub("[\r\n]", " "))
-end
-
-local function display_name(instance, node)
-  local relative = assert(path.relative(instance.root, node.path))
-  if node.kind == "directory" then
-    return relative .. "/"
-  end
-  return relative
-end
-
-
-
-
-
-function Instance:_error_line(err)
-  return "[fre] Error loading " .. safe_string(err)
-end
-
-
-
-
-
-function Instance:_emit_ready(err, result)
-  Events.ready(self.id, self.bufnr, err, result)
-end
-
-function Instance:_complete_initial_load(err, result, _real_root, on_complete)
-  local function before_observers(completion_err)
-    if completion_err ~= nil then
-      self.buffer:set_lines({ self:_error_line(completion_err) })
-    else
-      self.sync:sync_watchers(false)
-    end
-  end
-  if not self.lifecycle:complete_load(err, result, before_observers) then return end
-  if on_complete then
-    local ok, callback_err = pcall(on_complete, err)
-    if not ok then vim.schedule(function() error(callback_err) end) end
-  end
+local function report_async_error(err)
+  pcall(vim.notify, "fre: " .. tostring(err), vim.log.levels.ERROR)
 end
 
 function Instance:status()
@@ -156,21 +116,6 @@ end
 
 
 
-function Instance:_report_async_error(err)
-  self._last_async_error = tostring(err)
-  local ok, notify_err = pcall(
-    vim.notify, "fre: " .. self._last_async_error, vim.log.levels.ERROR
-  )
-  if not ok then
-    self._last_async_error = self._last_async_error
-      .. "; error reporter failed: " .. tostring(notify_err)
-  end
-end
-
-function Instance:_emit_activity(activity, active)
-  if self.lifecycle:is_destroyed() then return end
-  Events.activity_changed(self.id, self.bufnr, activity, active)
-end
 
 
 
@@ -320,7 +265,7 @@ function Instance:reveal(snapshot_path)
     request.active = false
     if err then
       if request.synchronous then fail(err, 4) end
-      self:_report_async_error(err)
+      report_async_error(err)
       return
     end
     if not target_winid then return end
@@ -494,56 +439,50 @@ function Instance:execute(plan, handlers)
   return self.work:execute(plan, handlers)
 end
 
-function Instance:_start_destroy()
-  if not self.lifecycle:begin_destroy() then return false end
-  Events.destroying(self.id, self.bufnr)
-  pcall(view.hide_all, self.view)
-  view.destroy(self.view)
-  self.buffer:clear_initial_cursors()
-  self._reveal_generation = self._reveal_generation + 1
-  if self.work then pcall(self.work.destroy, self.work) end
-  if self.sync then pcall(self.sync.destroy, self.sync) end
-  if self.tree then self.tree:invalidate_loads(self.tree:root_node()) end
-  return true
-end
+local function new_destroy_operation(
+    id, bufnr, lifecycle, view_state, buffer_state, sync, work, tree
+)
+  return function()
+    if not lifecycle:is_destroying() and not lifecycle:is_destroyed() then
+      if work:is_write_active() then fail("instance is write-locked", 3) end
+      if work:is_execution_active() then
+        fail("cannot destroy an instance with an active execution", 3)
+      end
+    end
+    if lifecycle:is_destroyed() then fail("instance is destroyed", 3) end
+    if lifecycle:begin_destroy() then
+      Events.destroying(id, bufnr)
+      pcall(view.hide_all, view_state)
+      view.destroy(view_state)
+      buffer_state:clear_initial_cursors()
+      pcall(work.destroy, work)
+      pcall(sync.destroy, sync)
+      tree:invalidate_loads(tree:root_node())
+    end
 
-function Instance:_finish_destroy()
-  local bufnr = self.bufnr
-  local delete_error
-  if vim.api.nvim_buf_is_valid(bufnr) then
-    local ok, err = pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
-    if not ok then delete_error = err end
+    local delete_error
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      local ok, err = pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+      if not ok then delete_error = err end
+    end
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
+        vim.cmd("bwipeout!")
+      end)
+      if not ok then delete_error = err end
+    end
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      error("fre: failed to delete instance buffer: " .. tostring(delete_error), 2)
+    end
+    pcall(buffer.teardown, buffer_state)
+    lifecycle:finish_destroy()
+    Events.destroyed(id, bufnr)
+    return nil
   end
-  if vim.api.nvim_buf_is_valid(bufnr) then
-    local ok, err = pcall(vim.api.nvim_buf_call, bufnr, function()
-      vim.cmd("bwipeout!")
-    end)
-    if not ok then delete_error = err end
-  end
-  if vim.api.nvim_buf_is_valid(bufnr) then
-    error("fre: failed to delete instance buffer: " .. tostring(delete_error), 2)
-  end
-  if self.buffer then pcall(buffer.teardown, self.buffer) end
-  local retained = { id = true, root = true, bufnr = true, lifecycle = true }
-  for key in pairs(self) do
-    if not retained[key] then self[key] = nil end
-  end
-  self.lifecycle:finish_destroy()
-  Events.destroyed(self.id, bufnr)
-  return nil
 end
 
 function Instance:destroy()
-  if not self.lifecycle:is_destroying() and not self.lifecycle:is_destroyed() then
-    if self.work:is_write_active() then fail("instance is write-locked", 2) end
-    if self.work:is_execution_active() then
-      fail("cannot destroy an instance with an active execution", 2)
-    end
-  end
-  if self.lifecycle:is_destroying() then return self:_finish_destroy() end
-  if self.lifecycle:is_destroyed() then fail("instance is destroyed", 2) end
-  self:_start_destroy()
-  return self:_finish_destroy()
+  return self.buffer.request_destroy()
 end
 
 local function invalidate_failed_constructor(self)
@@ -582,11 +521,6 @@ local function cleanup_failed_constructor(self, bufnr)
   return wipe_failed_buffer(bufnr)
 end
 
-function Instance:_start_initial_load()
-  self.sync:load_initial()
-  Events.created(self.id, self.bufnr)
-  return self
-end
 
 local core_fields = {
   "hidden_file",
@@ -643,18 +577,13 @@ function Instance.new(options)
     self.root = root
     self.lifecycle = Lifecycle.new({
       schedule = vim.schedule,
-      emit_ready = function(err, result) self:_emit_ready(err, result) end,
+      emit_ready = function(err, ready_result)
+        Events.ready(id, bufnr, err, ready_result)
+      end,
     })
     self._reveal_generation = 0
-    self.view = view.new({
-      id = self.id,
-      bufnr = self.bufnr,
-      lifecycle = self.lifecycle,
-      layout = effective.layout,
-      window_options = effective.window.options,
-    })
 
-    vim.api.nvim_buf_set_name(bufnr, "fre://" .. tostring(self.id))
+    vim.api.nvim_buf_set_name(bufnr, "fre://" .. tostring(id))
     for key, value in pairs(required_options) do
       vim.bo[bufnr][key] = value
     end
@@ -665,92 +594,71 @@ function Instance.new(options)
     vim.bo[bufnr].syntax = "fre"
     vim.b[bufnr].fre = {
       version = 1,
-      instance_id = self.id,
-      root = self.root,
+      instance_id = id,
+      root = root,
     }
     for key, value in pairs(effective.buffer.variables or {}) do
       if key ~= "fre" then vim.b[bufnr][key] = copy(value) end
     end
 
-    self.tree = Tree.new(root, self.id, effective.sort, registry)
+    self.tree = Tree.new(root, id, effective.sort, registry)
     self.buffer = buffer.new({
-      id = self.id,
-      root = self.root,
-      bufnr = self.bufnr,
+      id = id,
+      root = root,
+      bufnr = bufnr,
       columns = effective.columns,
       tree = self.tree,
+      lifecycle = self.lifecycle,
       hidden_file = effective.hidden_file,
       registry = registry,
-      can_reproject = function()
-        if self.lifecycle:is_dead() or not self.lifecycle:is_ready() then return false end
-        if (self.work and self.work:is_write_active()) or (self.sync and self.sync:is_busy()) then
-          return false
-        end
-        if self.work and self.work:is_execution_active() then return false end
-        for _, node in self.tree:iter_nodes() do
-          if node.kind == "directory"
-              and (node.load_state == "loading" or node.load_state == "refreshing") then
-            return false
-          end
-        end
-        return true
-      end,
-      destroyed = function() return self.lifecycle:is_destroyed() end,
-      destroying = function() return self.lifecycle:is_destroying() end,
-      list_views = function(tabpage) return view.list(self.view, tabpage) end,
-      apply_window = function(_, winid) return view.apply_window(self.view, winid) end,
-      sync_views = function(_, opts) return view.sync(self.view, opts) end,
-      request_write = function(ctx) return self:write(ctx) end,
-      request_destroy = function() return self:destroy() end,
-      report_async_error = function(err) return self:_report_async_error(err) end,
+      report_async_error = report_async_error,
+    })
+    self.view = view.new({
+      id = id,
+      bufnr = bufnr,
+      lifecycle = self.lifecycle,
+      buffer = self.buffer,
+      layout = effective.layout,
+      window_options = effective.window.options,
     })
     self.sync = Sync.new({
-      root = self.root,
+      id = id,
+      root = root,
       tree = self.tree,
       buffer = self.buffer,
+      lifecycle = self.lifecycle,
+      view = self.view,
       expanded = effective.expanded,
       auto_expand_single_directory = effective.auto_expand_single_directory,
       fs_adapter = fs_adapter,
       schedule = vim.schedule,
-      bufnr = self.bufnr,
-      is_alive = function() return not self.lifecycle:is_dead() end,
-      is_modified = function() return vim.bo[self.bufnr].modified end,
-      is_write_locked = function() return self.work and self.work:is_write_active() or false end,
-      is_ready = function() return self.lifecycle:is_ready() end,
-      is_execution_active = function()
-        return self.work and self.work:is_execution_active() or false
-      end,
-      is_presented = function() return view.has_active(self.view) end,
-      on_refresh_activity = function(active) self:_emit_activity("refresh", active) end,
-      on_initial_complete = function(err, value, real_root, on_complete)
-        self:_complete_initial_load(err, value, real_root, on_complete)
-      end,
-      report_error = function(err) self:_report_async_error(err) end,
-      on_followup_needed = function() view.refresh_if_presented(self.view) end,
+      bufnr = bufnr,
+      report_error = report_async_error,
       watch_adapter = watch_adapter,
     })
     self.work = Work.new({
-      root = self.root,
-      bufnr = self.bufnr,
+      id = id,
+      root = root,
+      bufnr = bufnr,
+      lifecycle = self.lifecycle,
       tree = self.tree,
       buffer = self.buffer,
       sync = self.sync,
       skip_confirm_for_simple_edits = effective.skip_confirm_for_simple_edits,
       mutation_adapter = mutation_adapter,
       write_ui_adapter = write_ui_adapter,
-      is_alive = function() return not self.lifecycle:is_dead() end,
-      is_ready = function() return self.lifecycle:is_ready() end,
-      on_activity = function(activity, active) self:_emit_activity(activity, active) end,
-      report_error = function(err) return self:_report_async_error(err) end,
+      report_error = report_async_error,
     })
-    view.attach(self.view, {
-      buffer = self.buffer,
-      sync = self.sync,
-      tree = self.tree,
-      work = self.work,
-    })
+    local request_destroy = new_destroy_operation(
+      id, bufnr, self.lifecycle, self.view, self.buffer, self.sync, self.work, self.tree
+    )
+    buffer.attach(self.buffer, self.view, self.sync, self.work, request_destroy)
+    self.sync:attach_work(self.work)
+    view.attach_sync(self.view, self.sync)
     self.buffer:setup()
-    return self:_start_initial_load()
+    self.sync:load_initial()
+    Events.created(id, bufnr)
+    return self
   end, function(err) return err end)
 
   if ok then return result end

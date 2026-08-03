@@ -21,16 +21,12 @@ function M.new(options)
     id = assert(options.id),
     bufnr = assert(options.bufnr),
     lifecycle = assert(options.lifecycle),
+    buffer = assert(options.buffer),
     default_layout = copy(options.layout),
     window_options = copy(options.window_options or {}),
-    buffer = options.buffer,
-    sync = options.sync,
-    tree = options.tree,
-    work = options.work,
     records = {},
     released = {},
     presented = false,
-    pending_refresh = false,
   }
 end
 
@@ -287,13 +283,6 @@ local function records(instance, tabpage)
   return result
 end
 
-local function report_async_error(message)
-  local text = "fre: " .. tostring(message)
-  local ok = pcall(vim.schedule, function()
-    pcall(vim.notify, text, vim.log.levels.ERROR)
-  end)
-  if not ok then pcall(vim.notify, text, vim.log.levels.ERROR) end
-end
 
 local error_scopes = setmetatable({}, { __mode = "k" })
 
@@ -317,37 +306,8 @@ function M.capture_errors(instance)
   end
 end
 
-function M.attach(view, dependencies)
-  local current = assert(state(view))
-  for _, key in ipairs({ "buffer", "sync", "tree", "work" }) do
-    if dependencies[key] ~= nil then current[key] = dependencies[key] end
-  end
-end
-
-function M.refresh_if_presented(view)
-  local current = state(view)
-  if not current or current.lifecycle:is_dead() or not current.presented then return end
-  local sync = current.sync
-  local work = current.work
-  local tree = current.tree
-  if not sync or not work or not tree or not current.lifecycle:is_ready()
-      or not sync:is_dirty() or current.pending_refresh or sync:is_busy()
-      or vim.bo[current.bufnr].modified or work:is_write_active()
-      or work:is_execution_active() then return end
-  for _, node in tree:iter_nodes() do
-    if node.kind == "directory"
-        and (node.load_state == "loading" or node.load_state == "refreshing") then return end
-  end
-  current.pending_refresh = true
-  local ok, err = pcall(sync.presentation_refresh, sync, function(refresh_err)
-    if current.lifecycle:is_dead() then return end
-    current.pending_refresh = false
-    if refresh_err ~= nil then report_async_error(refresh_err) end
-  end)
-  if not ok then
-    current.pending_refresh = false
-    report_async_error(err)
-  end
+function M.attach_sync(view, sync)
+  assert(state(view)).sync = assert(sync)
 end
 
 function M.sync(view, _)
@@ -357,7 +317,7 @@ function M.sync(view, _)
   if current.presented == visible then return visible end
   current.presented = visible
   Events.presentation_changed(current.id, current.bufnr, visible)
-  if visible then M.refresh_if_presented(view) end
+  if visible then current.sync:presentation_refresh_if_safe() end
   return visible
 end
 
@@ -747,7 +707,6 @@ function M.destroy(instance)
   end
   current.records = {}
   current.released = {}
-  current.pending_refresh = false
 end
 
 return M

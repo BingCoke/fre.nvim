@@ -297,12 +297,6 @@ describe("fre ticket 11 write workflow", function()
     local instance = ready({ ["a.txt"] = "a", ["delete.txt"] = "d" })
     assert.are.equal(mutation_adapter, instance.work.mutation_adapter)
     assert.are.equal(ui_adapter, instance.work.write_ui_adapter)
-    local buffer_request
-    local request_write = instance.buffer.request_write
-    instance.buffer.request_write = function(ctx)
-      buffer_request = vim.deepcopy(ctx)
-      return request_write(ctx)
-    end
     local ui = scripted_ui()
     set_lines(instance, {
       edited_line(instance, "a.txt", "moved.txt"),
@@ -313,9 +307,7 @@ describe("fre ticket 11 write workflow", function()
     assert.is_true(ok, tostring(err))
     assert.are.same({ "MOVE  a.txt -> moved.txt", "CREATE FILE  created.txt", "DELETE  delete.txt" },
       ui.confirmations[1])
-    assert_editor_context(buffer_request, instance)
     assert_editor_context(ui.confirm_context, instance)
-    assert.are.same(buffer_request, ui.confirm_context)
     assert.is_false(vim.bo[instance.bufnr].modifiable)
     ui.decide(true)
     assert_editor_context(ui.progress_context, instance)

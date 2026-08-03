@@ -1,6 +1,7 @@
 local row = require("fre.instance.row")
 local path = require("fre.path")
 local window = require("fre.window")
+local View = require("fre.instance.view")
 
 local function fail(message, level)
   error("fre: " .. message, level or 3)
@@ -47,18 +48,11 @@ function Buffer.new(options)
     root = options.root,
     bufnr = options.bufnr,
     columns = vim.deepcopy(options.columns or {}),
-    tree = options.tree,
+    tree = assert(options.tree),
+    lifecycle = assert(options.lifecycle),
     registry = registry,
     registry_id = registry.registry_id,
     last_marker_generation = widths.generation,
-    can_reproject = assert(options.can_reproject),
-    destroyed = assert(options.destroyed),
-    destroying = assert(options.destroying),
-    list_views = assert(options.list_views),
-    apply_window = assert(options.apply_window),
-    sync_views = assert(options.sync_views),
-    request_write = assert(options.request_write),
-    request_destroy = assert(options.request_destroy),
     report_async_error = assert(options.report_async_error),
     view = { baseline = {}, marker_generation = 0 },
     hidden_file = options.hidden_file == true,
@@ -82,6 +76,26 @@ end
 
 M.new = Buffer.new
 
+function M.attach(buffer, view, sync, work, request_destroy)
+  buffer.view_owner = assert(view)
+  buffer.sync = assert(sync)
+  buffer.work = assert(work)
+  buffer.request_destroy = assert(request_destroy)
+end
+
+function Buffer:can_reproject()
+  if self.lifecycle:is_dead() or not self.lifecycle:is_ready() then return false end
+  if self.work:is_write_active() or self.sync:is_busy()
+      or self.work:is_execution_active() then return false end
+  for _, node in self.tree:iter_nodes() do
+    if node.kind == "directory"
+        and (node.load_state == "loading" or node.load_state == "refreshing") then
+      return false
+    end
+  end
+  return true
+end
+
 function Buffer:marker_widths()
   return self.registry:marker_widths()
 end
@@ -95,7 +109,7 @@ function M:on_marker_width_changed(event)
       or event.generation <= self.last_marker_generation then return end
   self.last_marker_generation = event.generation
   self.marker_width_stale = true
-  if not self.can_reproject() then return end
+  if not self:can_reproject() then return end
   if not vim.api.nvim_buf_is_valid(self.bufnr) or vim.bo[self.bufnr].modified then return end
 
   local current_generation = self:marker_widths().generation
@@ -357,7 +371,7 @@ end
 
 local function managed_windows(buffer)
   local windows = {}
-  for _, inspected in ipairs(buffer.list_views()) do
+  for _, inspected in ipairs(View.list(buffer.view_owner)) do
     windows[inspected.winid] = inspected.tabpage
   end
   return windows
@@ -739,8 +753,8 @@ local function apply_pending_highlight_update(buffer)
   buffer.highlight_update_scheduled = false
   local pending = buffer.highlight_pending
   buffer.highlight_pending = nil
-  if not pending or buffer.highlight_disabled or buffer.destroyed()
-      or buffer.destroying()
+  if not pending or buffer.highlight_disabled or buffer.lifecycle:is_destroyed()
+      or buffer.lifecycle:is_destroying()
       or not vim.api.nvim_buf_is_valid(buffer.bufnr) then
     return
   end
@@ -786,8 +800,8 @@ local function attach_highlight_updates(buffer)
   buffer.highlight_update_scheduled = false
   local attached = vim.api.nvim_buf_attach(buffer.bufnr, false, {
     on_lines = function(_, bufnr, _, first_line, old_last_line, new_last_line)
-      if buffer.highlight_disabled or buffer.destroyed()
-          or buffer.destroying() then
+      if buffer.highlight_disabled or buffer.lifecycle:is_destroyed()
+          or buffer.lifecycle:is_destroying() then
         return true
       end
       if bufnr ~= buffer.bufnr then return true end
@@ -804,16 +818,16 @@ local function attach_highlight_updates(buffer)
 end
 
 local function externally_deleted(buffer)
-  if buffer.destroyed() or buffer.external_delete_cleanup_scheduled then return end
+  if buffer.lifecycle:is_destroyed() or buffer.external_delete_cleanup_scheduled then return end
   buffer.external_delete_cleanup_scheduled = true
   local ok, err = pcall(vim.schedule, function()
-    if buffer.destroyed() then
+    if buffer.lifecycle:is_destroyed() then
       buffer.external_delete_cleanup_scheduled = nil
       return
     end
-    local was_destroying = buffer.destroying()
+    local was_destroying = buffer.lifecycle:is_destroying()
     local destroy_ok, destroy_err = pcall(buffer.request_destroy)
-    if not destroy_ok and not was_destroying and buffer.destroying() then
+    if not destroy_ok and not was_destroying and buffer.lifecycle:is_destroying() then
       buffer.report_async_error(
         "external buffer deletion cleanup failed: " .. tostring(destroy_err)
       )
@@ -872,7 +886,7 @@ function M.setup(buffer)
         local cursor = vim.api.nvim_win_get_cursor(winid)
         row, col = cursor[1], cursor[2]
       end
-      buffer.request_write({
+      buffer.work:write({
         bufnr = args.buf,
         winid = winid,
         tabpage = vim.api.nvim_get_current_tabpage(),
@@ -887,8 +901,8 @@ function M.setup(buffer)
     group = buffer.buffer_augroup, buffer = buffer.bufnr,
     callback = function()
       local winid = vim.api.nvim_get_current_win()
-      buffer.apply_window(buffer, winid)
-      buffer.sync_views(buffer, { report = true })
+      View.apply_window(buffer.view_owner, winid)
+      View.sync(buffer.view_owner, { report = true })
       M.place_initial_cursor(buffer, winid)
     end,
   })
@@ -900,8 +914,8 @@ function M.setup(buffer)
         buffer.pending_initial_cursor[winid] = nil
       end
       vim.schedule(function()
-        if buffer.destroyed() then return end
-        buffer.sync_views(buffer, { report = true })
+        if buffer.lifecycle:is_destroyed() then return end
+        View.sync(buffer.view_owner, { report = true })
       end)
     end,
   })

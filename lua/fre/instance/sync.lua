@@ -1,12 +1,19 @@
 local path = require("fre.path")
 local Watch = require("fre.instance.watch")
 local Tree = require("fre.instance.tree")
+local Events = require("fre.instance.events")
+local View = require("fre.instance.view")
 
 local Sync = {}
 Sync.__index = Sync
 
 local function fail(message, level)
   error("fre: " .. message, level or 3)
+end
+
+local function error_line(err)
+  local text = tostring(err):gsub("[\r\n]", " ")
+  return "[fre] Error loading " .. text
 end
 
 local function split_relative(relative)
@@ -18,23 +25,17 @@ end
 function Sync.new(options)
   if type(options) ~= "table" then fail("sync options are required", 2) end
   local self = setmetatable({
+    id = assert(options.id),
     root = assert(options.root),
     tree = assert(options.tree),
     buffer = assert(options.buffer),
+    lifecycle = assert(options.lifecycle),
+    view = assert(options.view),
     expanded = vim.deepcopy(options.expanded or {}),
     auto_expand_single_directory = options.auto_expand_single_directory == true,
     fs_adapter = assert(options.fs_adapter),
     schedule = assert(options.schedule),
     bufnr = assert(options.bufnr),
-    is_alive = assert(options.is_alive),
-    is_modified = assert(options.is_modified),
-    is_write_locked = assert(options.is_write_locked),
-    is_ready = assert(options.is_ready),
-    is_execution_active = assert(options.is_execution_active),
-    is_presented = assert(options.is_presented),
-    on_initial_complete = assert(options.on_initial_complete),
-    on_followup_needed = assert(options.on_followup_needed),
-    on_refresh_activity = options.on_refresh_activity or function() end,
     report_error = assert(options.report_error),
     tree_generation = 0,
     real_root = nil,
@@ -55,8 +56,11 @@ function Sync.new(options)
     on_error = function(event, err) self:_on_watch_error(event, err) end,
     on_event = function(event) self:_on_watch_event(event) end,
   })
-  self.on_changed = function() if self.is_ready() then self:sync_watchers() end end
   return self
+end
+
+function Sync:attach_work(work)
+  self.work = assert(work)
 end
 
 function Sync:normalize_snapshot_path(snapshot_path)
@@ -103,7 +107,7 @@ function Sync:_commit_tree_candidate(candidate)
   if not commit_ok then return nil, result end
   if result == false then return nil, "buffer projection commit failed" end
   self.tree:adopt(candidate)
-  self.on_changed()
+  if self.lifecycle:is_ready() then self:sync_watchers() end
   return true
 end
 
@@ -127,12 +131,12 @@ function Sync:_load_directory(node, mode, callback)
     finished = true
     self.schedule(function()
       local current = self.tree:node_by_id(node_id)
-      if not self.is_alive() or self.load_requests[node_id] ~= request
+      if self.lifecycle:is_dead() or self.load_requests[node_id] ~= request
           or not current or not self.tree:is_current_load(current, generation, mode) then
         if self.load_requests[node_id] == request then self.load_requests[node_id] = nil end
         return
       end
-      if self.is_modified() or self.is_write_locked()
+      if vim.bo[self.bufnr].modified or self.work:is_write_active()
           or not self.tree:is_active_directory(current) then
         self.load_requests[node_id] = nil
         if mode == "loading" then self.tree:mark_unloaded(current)
@@ -203,8 +207,21 @@ function Sync:_apply_configured_expansions(on_complete)
   apply(1)
 end
 
+function Sync:_complete_initial_load(err, result, on_complete)
+  local function before_observers(completion_err)
+    if completion_err ~= nil then
+      self.buffer:set_lines({ error_line(completion_err) })
+    else
+      self:sync_watchers(false)
+    end
+  end
+  if not self.lifecycle:complete_load(err, result, before_observers) then return end
+  if on_complete then on_complete(err) end
+end
+
 function Sync:_finish_initial(generation, err, children, real_root, on_complete)
-  if not self.is_alive() or self.tree:root_node().load_generation ~= generation then return end
+  if self.lifecycle:is_dead()
+      or self.tree:root_node().load_generation ~= generation then return end
   local value
   if err == nil then
     local ok, result = pcall(function()
@@ -227,13 +244,13 @@ function Sync:_finish_initial(generation, err, children, real_root, on_complete)
       if expand_err ~= nil then
         self.dirty = true
         self.result = nil
-        self.on_initial_complete(expand_err, nil, nil, on_complete)
+        self:_complete_initial_load(expand_err, nil, on_complete)
       else
         self.real_root = real_root
         self.tree_generation = self.tree_generation + 1
         self.dirty = false
         self.result = value
-        self.on_initial_complete(nil, value, real_root, on_complete)
+        self:_complete_initial_load(nil, value, on_complete)
         self.expanded = nil
       end
     end)
@@ -242,7 +259,7 @@ function Sync:_finish_initial(generation, err, children, real_root, on_complete)
   self.tree:mark_unloaded(self.tree:root_node())
   self.dirty = true
   self.result = nil
-  self.on_initial_complete(err, nil, nil, on_complete)
+  self:_complete_initial_load(err, nil, on_complete)
 end
 
 function Sync:load_initial(on_complete)
@@ -266,7 +283,8 @@ function Sync:load_initial(on_complete)
     if finished then return end
     finished = true
     self.schedule(function()
-      if not self.is_alive() or generation ~= self.tree:root_node().load_generation then return end
+      if self.lifecycle:is_dead()
+          or generation ~= self.tree:root_node().load_generation then return end
       self:_finish_initial(generation, err, children, real_root, completion)
     end)
   end
@@ -287,8 +305,10 @@ end
 function Sync:expand(snapshot_path, on_complete, initializing, opts)
   opts = opts or {}
   if not initializing then
-    if self.is_modified() then fail("buffer is modified; write or discard changes before changing the tree", 3) end
-    if self.is_write_locked() then fail("instance is write-locked", 3) end
+    if vim.bo[self.bufnr].modified then
+      fail("buffer is modified; write or discard changes before changing the tree", 3)
+    end
+    if self.work:is_write_active() then fail("instance is write-locked", 3) end
   end
   local relative = self:normalize_snapshot_path(snapshot_path)
   if relative == "" then
@@ -444,7 +464,7 @@ function Sync:watch_specs()
 end
 
 function Sync:sync_watchers(recreate_failed)
-  if not self.is_alive() then return end
+  if self.lifecycle:is_dead() then return end
   self.watch:sync(self:watch_specs(), { recreate_failed = recreate_failed == true })
 end
 
@@ -464,8 +484,8 @@ function Sync:_schedule_completion(callback, err)
   self.schedule(function()
     if callback then
       local ok, callback_err = pcall(callback, err)
-      if not ok and self.is_alive() then self.report_error(callback_err) end
-    elseif err ~= nil and self.is_alive() then
+      if not ok and not self.lifecycle:is_dead() then self.report_error(callback_err) end
+    elseif err ~= nil and not self.lifecycle:is_dead() then
       self.report_error(err)
     end
   end)
@@ -479,7 +499,7 @@ function Sync:_finish_request(request, err)
   if self.initial_refresh_request == request then self.initial_refresh_request = nil end
   if request.activity_started then
     request.activity_started = false
-    self.on_refresh_activity(false)
+    Events.activity_changed(self.id, self.bufnr, "refresh", false)
   end
   if err ~= nil then self.dirty = true end
   self:_schedule_completion(request.on_complete, err)
@@ -510,8 +530,9 @@ function Sync:_current_request(request)
 end
 
 function Sync:_watch_commit_safe(event, request)
-  if not self.is_alive() or not self.is_presented() or self.is_modified()
-      or self.is_write_locked() or self.is_execution_active() then return false end
+  if self.lifecycle:is_dead() or not View.has_active(self.view)
+      or vim.bo[self.bufnr].modified or self.work:is_write_active()
+      or self.work:is_execution_active() then return false end
   if self.refresh_request and self.refresh_request ~= request then return false end
   if not request and (self.watch_refresh_request or self.dirty) then return false end
   local node = self.tree:node_by_id(event.node_id)
@@ -639,7 +660,7 @@ function Sync:refresh(force, on_complete, write_reconciliation)
   }
   self.refresh_request = request
   request.activity_started = true
-  self.on_refresh_activity(true)
+  Events.activity_changed(self.id, self.bufnr, "refresh", true)
   self.dirty = true
   local paths = { self.root }
   for _, active_path in ipairs(request.active_paths) do paths[#paths + 1] = active_path end
@@ -650,17 +671,33 @@ function Sync:_reconcile_write(on_complete)
   return self:refresh(true, on_complete, true)
 end
 
-function Sync:presentation_refresh(on_complete)
-  return self:refresh(false, on_complete, false)
+function Sync:presentation_refresh_if_safe()
+  if self.lifecycle:is_dead() or not self.lifecycle:is_ready() or not self.dirty
+      or self:is_busy() or not View.has_active(self.view)
+      or vim.bo[self.bufnr].modified or self.work:is_write_active()
+      or self.work:is_execution_active() then return false end
+  for _, node in self.tree:iter_nodes() do
+    if node.kind == "directory"
+        and (node.load_state == "loading" or node.load_state == "refreshing") then
+      return false
+    end
+  end
+  local ok, err = pcall(self.refresh, self, false, function(refresh_err)
+    if not self.lifecycle:is_dead() and refresh_err ~= nil then
+      self.report_error(refresh_err)
+    end
+  end, false)
+  if not ok then self.report_error(err); return false end
+  return true
 end
 
 function Sync:_schedule_followup()
-  if not self.is_alive() or not self.dirty or self.watch_followup_scheduled then return end
+  if self.lifecycle:is_dead() or not self.dirty or self.watch_followup_scheduled then return end
   self.watch_followup_scheduled = true
   self.schedule(function()
-    if not self.is_alive() then return end
+    if self.lifecycle:is_dead() then return end
     self.watch_followup_scheduled = false
-    if self.dirty and self.is_presented() then self.on_followup_needed() end
+    self:presentation_refresh_if_safe()
   end)
 end
 
@@ -676,13 +713,13 @@ function Sync:_mark_watch_pending(generation)
 end
 
 function Sync:_on_watch_error(event, err)
-  if not self.is_alive() then return end
+  if self.lifecycle:is_dead() then return end
   self:_mark_watch_pending()
   self.report_error("watch failed for " .. event.path .. ": " .. tostring(err))
 end
 
 function Sync:_on_watch_event(event)
-  if not self.is_alive() then return end
+  if self.lifecycle:is_dead() then return end
   local generation = self:_next_watch_event_generation()
   if not self:_watch_commit_safe(event) then
     self:_mark_watch_pending(generation)

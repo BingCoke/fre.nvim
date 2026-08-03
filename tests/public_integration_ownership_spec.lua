@@ -162,6 +162,17 @@ describe("public integration ownership", function()
     }, vim.b[instance.bufnr].fre)
   end)
 
+  it("keeps every Instance child free of retained Instance callbacks", function()
+    local instance = require("fre.instance").new({ root = fixture.root, columns = {} })
+    instances[#instances + 1] = instance
+    wait_ready(instance)
+
+    for _, child_name in ipairs({ "lifecycle", "buffer", "sync", "work", "view" }) do
+      local retained = retained_path(instance[child_name], instance)
+      assert.is_nil(retained, child_name .. " retains Instance through " .. tostring(retained))
+    end
+  end)
+
   it("keeps finite serializable event payloads free of runtime owners", function()
     local seen = {}
     local group = vim.api.nvim_create_augroup("FrePublicIntegrationOwnership", { clear = true })

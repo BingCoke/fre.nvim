@@ -396,7 +396,7 @@ describe("fre directory tree expansion", function()
     assert.are.equal(1, #notices)
     assert.is_true(instance.tree.nodes_by_path[target].expanded)
     assert.is_true(instance.tree.nodes_by_path[only].expanded)
-    assert.is_truthy(instance._last_async_error:find("recursive load exploded", 1, true))
+    assert.is_truthy(notices[1]:find("recursive load exploded", 1, true))
   end)
 
   it("lets collapse and collapse_all cancel recursive work without late errors", function()
@@ -662,7 +662,6 @@ describe("fre directory tree expansion", function()
     release(a_path, 3, "rescan failed")
     wait_for(function() return instance.tree.nodes_by_path[a_path].load_state == "loaded" end)
     vim.notify = original_notify
-    assert.is_truthy(instance._last_async_error:find("rescan failed", 1, true))
     assert.is_truthy(notice:find("rescan failed", 1, true))
     assert.are.same({ "a/", "a/n/", "a/n/z.txt", "a/new.txt" }, projected_paths(instance))
     assert.are.equal(z_id, instance.tree.nodes_by_path[z_path].id)
@@ -738,11 +737,15 @@ describe("fre directory tree expansion", function()
     wait_for(function() return pending[dir_path] and pending[dir_path][1] end)
     local expected = snapshot(instance, dir)
     local next_node_id = instance.tree:latest_node_id()
+    local original_notify = vim.notify
+    local notice
+    vim.notify = function(message) notice = message end
     release(dir_path, 1)
     wait_for(function()
-      return dir.load_state == "unloaded" and instance._last_async_error
-        and instance._last_async_error:find("directory render exploded", 1, true)
+      return dir.load_state == "unloaded" and notice
+        and notice:find("directory render exploded", 1, true)
     end)
+    vim.notify = original_notify
     assert_snapshot(instance, dir, expected)
     assert.is_true(instance.tree:latest_node_id() > next_node_id)
     assert.is_false(dir.loaded)

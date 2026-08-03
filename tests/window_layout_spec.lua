@@ -694,12 +694,14 @@ describe("fre editor-derived Views", function()
 
   it("constructs View without parent or management callback capabilities", function()
     local lifecycle = { is_dead = function() return false end }
+    local buffer_state = {}
     local configured_layout = { position = "right", size = 20 }
     local configured_options = { number = true }
     local state = instance_view.new({
       id = 91,
       bufnr = 37,
       lifecycle = lifecycle,
+      buffer = buffer_state,
       layout = configured_layout,
       window_options = configured_options,
     })
@@ -709,6 +711,7 @@ describe("fre editor-derived Views", function()
     assert.are.equal(91, state.id)
     assert.are.equal(37, state.bufnr)
     assert.are.equal(lifecycle, state.lifecycle)
+    assert.are.equal(buffer_state, state.buffer)
     assert.are.same({ position = "right", size = 20 }, state.default_layout)
     assert.are.same({ number = true }, state.window_options)
     for _, key in ipairs({

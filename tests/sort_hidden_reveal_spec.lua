@@ -275,23 +275,19 @@ describe("fre ticket 07 sort hidden and reveal", function()
     local notices = {}
     vim.notify = function(message) notices[#notices + 1] = message end
     local failing = function() error("comparator exploded") end
-    instance._last_async_error = nil
     instance:set_sort(failing)
     assert.are.equal(failing, instance.tree:get_comparator())
     wait_for(function()
-      return instance._last_async_error
-        and instance._last_async_error:find("comparator exploded", 1, true)
+      return notices[1] and notices[1]:find("comparator exploded", 1, true)
     end)
     assert_projection_snapshot(instance, before_error)
 
     local reverse = function(_, left, right) return left.name > right.name end
     explode_render = true
-    instance._last_async_error = nil
     instance:set_sort(reverse)
     assert.are.equal(reverse, instance.tree:get_comparator())
     wait_for(function()
-      return instance._last_async_error
-        and instance._last_async_error:find("projection exploded", 1, true)
+      return notices[2] and notices[2]:find("projection exploded", 1, true)
     end)
     assert_projection_snapshot(instance, before_error)
     vim.notify = original_notify
@@ -409,12 +405,11 @@ describe("fre ticket 07 sort hidden and reveal", function()
     assert.is_false(instance.tree.nodes_by_path[fixture:path("visible")].expanded)
 
     local original_notify = vim.notify
-    vim.notify = function() end
-    instance._last_async_error = nil
+    local notice
+    vim.notify = function(message) notice = message end
     instance:reveal("a/missing.txt")
     wait_for(function()
-      return instance._last_async_error
-        and instance._last_async_error:find("snapshot path does not exist", 1, true)
+      return notice and notice:find("snapshot path does not exist", 1, true)
     end)
     vim.notify = original_notify
   end)

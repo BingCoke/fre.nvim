@@ -543,8 +543,7 @@ describe("fre ticket 08 atomic refresh", function()
     instance:refresh({ on_complete = function() error("callback exploded") end })
     release(instance.root, 2)
     wait_for(function()
-      return instance._last_async_error
-        and instance._last_async_error:find("callback exploded", 1, true)
+      return notices[1] and notices[1]:find("callback exploded", 1, true)
     end)
     assert.are.equal(1, #notices)
 
@@ -577,13 +576,11 @@ describe("fre ticket 08 atomic refresh", function()
       done("reported failure")
       done("duplicate failure")
     end
-    instance._last_async_error = nil
     instance:refresh()
-    wait_for(function() return instance._last_async_error ~= nil end)
+    wait_for(function() return #notices == 1 end)
     vim.notify = original_notify
     assert.are.equal(1, #notices)
     assert.is_truthy(notices[1]:find("reported failure", 1, true))
-    assert.is_truthy(instance._last_async_error:find("reported failure", 1, true))
     assert.is_true(instance.sync:is_dirty())
   end)
 end)

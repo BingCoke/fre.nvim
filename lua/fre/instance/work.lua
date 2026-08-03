@@ -1,5 +1,6 @@
 local mutation_execute = require("fre.mutation.execute")
 local mutation_prepare = require("fre.mutation.prepare")
+local Events = require("fre.instance.events")
 
 local M = {}
 local Work = {}
@@ -40,18 +41,17 @@ end
 
 function Work.new(options)
   return setmetatable({
+    id = assert(options.id),
     root = assert(options.root),
     bufnr = assert(options.bufnr),
+    lifecycle = assert(options.lifecycle),
     tree = assert(options.tree),
     buffer = assert(options.buffer),
     sync = assert(options.sync),
     skip_confirm_for_simple_edits = options.skip_confirm_for_simple_edits == true,
     mutation_adapter = assert(options.mutation_adapter),
     write_ui_adapter = assert(options.write_ui_adapter),
-    is_alive = assert(options.is_alive),
-    is_ready = assert(options.is_ready),
     report_error = assert(options.report_error),
-    on_activity = options.on_activity or function() end,
     write_request = nil,
     execution = nil,
     last_result = nil,
@@ -64,7 +64,7 @@ function Work:_preparation_input()
     bufnr = self.bufnr,
     tree = self.tree,
     buffer = self.buffer,
-    ready = self.is_ready(),
+    ready = self.lifecycle:is_ready(),
   }
 end
 
@@ -73,7 +73,7 @@ function Work:_prepare()
 end
 
 function Work:prepare()
-  if not self.is_alive() then fail("instance is destroyed", 3) end
+  if self.lifecycle:is_dead() then fail("instance is destroyed", 3) end
   if self.write_request then fail("instance is write-locked", 3) end
   return self:_prepare()
 end
@@ -101,17 +101,17 @@ function Work:_start_execution(plan, handlers)
   execution = mutation_execute.start(
     plan, handlers, self.mutation_adapter, function(completed)
       if self.execution == completed then self.execution = nil end
-      self.on_activity("execution", false)
+      Events.activity_changed(self.id, self.bufnr, "execution", false)
       if self.sync:is_dirty() then self.sync:schedule_followup() end
     end
   )
   self.execution = execution
-  self.on_activity("execution", true)
+  Events.activity_changed(self.id, self.bufnr, "execution", true)
   return execution
 end
 
 function Work:execute(plan, handlers)
-  if not self.is_alive() then fail("instance is destroyed", 3) end
+  if self.lifecycle:is_dead() then fail("instance is destroyed", 3) end
   if self.write_request then fail("instance is write-locked", 3) end
   return self:_start_execution(plan, handlers)
 end
@@ -128,8 +128,8 @@ function Work:_safe_method(object, method, ...)
 end
 
 function Work:_acquire_write()
-  if not self.is_alive() then fail("instance is destroyed", 3) end
-  if not self.is_ready() then fail("instance is not ready", 3) end
+  if self.lifecycle:is_dead() then fail("instance is destroyed", 3) end
+  if not self.lifecycle:is_ready() then fail("instance is not ready", 3) end
   if not vim.api.nvim_buf_is_valid(self.bufnr) then fail("instance buffer is not valid", 3) end
   if self.write_request then fail("instance is already write-locked", 3) end
   if self.sync:is_full_refresh_busy() then fail("refresh is already in progress", 3) end
@@ -150,7 +150,7 @@ function Work:_acquire_write()
     request.released = true
     error(err, 0)
   end
-  self.on_activity("write", true)
+  Events.activity_changed(self.id, self.bufnr, "write", true)
   return request
 end
 
@@ -164,7 +164,7 @@ function Work:_release_write(request)
     ok, err = pcall(function() vim.bo[self.bufnr].modifiable = request.original_modifiable end)
   end
   self.write_request = nil
-  self.on_activity("write", false)
+  Events.activity_changed(self.id, self.bufnr, "write", false)
   if not ok then self:_report("write unlock failed: " .. tostring(err)) end
   return true
 end
