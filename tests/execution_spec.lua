@@ -363,6 +363,49 @@ describe("fre plan execution", function()
     end
   end)
 
+  it("delivers adapter progress from fast events on the main loop before completion", function()
+    local adapter_in_fast_event = false
+    local progress = {}
+    local adapter = complete_adapter({})
+    adapter.create_file = function(_, done, report)
+      local timer = assert(vim.uv.new_timer())
+      timer:start(0, 0, function()
+        adapter_in_fast_event = vim.in_fast_event()
+        timer:stop()
+        timer:close()
+        report({ phase = "from-fast-event" })
+        done(nil)
+      end)
+      return timer
+    end
+    fre._set_mutation_adapter(adapter)
+    local instance = keep(fre.new({ root = fixture.root }))
+    local execution = instance:execute({ operations = {
+      { type = "create_file", path = "fast-event" },
+    } }, {
+      on_progress = function(status)
+        progress[#progress + 1] = {
+          on_main_loop = not vim.in_fast_event(),
+          status = status,
+        }
+      end,
+    })
+
+    assert.are.equal("succeeded", wait_terminal(execution).state)
+    assert.is_true(adapter_in_fast_event)
+    assert.is_true(#progress >= 3)
+    local detail_index
+    for index, update in ipairs(progress) do
+      assert.is_true(update.on_main_loop)
+      if update.status.detail ~= nil then
+        assert.are.same({ phase = "from-fast-event" }, update.status.detail)
+        detail_index = index
+      end
+    end
+    assert.is_not_nil(detail_index)
+    assert.is_true(detail_index < #progress)
+    assert.are.equal("succeeded", progress[#progress].status.state)
+  end)
   it("returns defensive progress, completion, and status copies with only two methods", function()
     local done_current
     local completion_error

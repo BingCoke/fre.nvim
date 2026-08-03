@@ -140,6 +140,7 @@ local function fake_plan(root_path, definitions)
   local root = { id = 1, path = root_path, kind = "directory" }
   local nodes_by_id = { [1] = root }
   local baseline, visible, replacement = {}, {}, {}
+  local node_width = #tostring(#definitions + 1)
   for index, definition in ipairs(definitions) do
     local id = index + 1
     local absolute = path.resolve(root_path, definition.source)
@@ -153,7 +154,9 @@ local function fake_plan(root_path, definitions)
     nodes_by_id[id] = node
     baseline[id] = absolute
     visible[#visible + 1] = node
-    replacement[#replacement + 1] = row.marker(nil, "move-cycle", id) .. definition.target
+    replacement[#replacement + 1] = row.marker(
+      nil, "move-cycle", id, node_width
+    ) .. definition.target
   end
   local tree = Tree.new(
     root_path, "move-cycle", function(_, left, right) return left.name < right.name end

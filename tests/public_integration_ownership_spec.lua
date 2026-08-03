@@ -3,7 +3,6 @@ local fre = require("fre")
 local manager_module = require("fre.manager")
 local mapping = require("fre.mapping")
 local takeover_module = require("fre.takeover")
-local view = require("fre.view")
 local fs = require("tests.helpers.fs")
 
 local function source(path)
@@ -73,7 +72,6 @@ describe("public integration ownership", function()
       "lua/fre/mapping.lua",
       "lua/fre/manager.lua",
       "lua/fre/takeover.lua",
-      "lua/fre/view.lua",
       "lua/fre/window.lua",
     }) do
       local text = source(path)
@@ -123,7 +121,7 @@ describe("public integration ownership", function()
     assert.are.equal(fake, mapping.context(fake).instance)
     assert.are.equal(vim.api.nvim_win_get_cursor(0)[1], calls.context.row)
     assert.is_false(calls.context.allow)
-    assert.are.same({ winid = 77 }, view.inspect(fake, { winid = 3 }))
+    assert.are.same({ winid = 77 }, fre.view.inspect(fake, { winid = 3 }))
     assert.are.same({ winid = 3 }, calls.inspect)
     assert.are.equal("written", actions.write({ instance = fake, bufnr = fake.bufnr }))
     assert.are.equal(fake.bufnr, calls.write.bufnr)

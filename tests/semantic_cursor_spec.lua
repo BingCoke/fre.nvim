@@ -200,6 +200,35 @@ describe("fre semantic cursor preservation", function()
     assert.are.equal(second, fre.view.inspect(instance, second_tab).winid)
   end)
 
+  it("preserves the semantic cursor when the instance node width grows", function()
+    local entries = {}
+    for index = 1, 6 do entries[string.format("item-%02d.txt", index)] = "x" end
+    for index = 1, 3 do entries[string.format("a-dir/child-%02d.txt", index)] = "x" end
+    local instance = ready(entries, variable_width_columns())
+    local winid = open_current(instance)
+    local target_row = assert(instance:get_pos("item-04.txt"))[1]
+    local decoded = assert(instance.buffer:decode(target_row))
+    local anchor = { field_id = "tag", zone = "content", display_offset = 2 }
+    vim.api.nvim_win_set_cursor(winid, {
+      target_row, assert(row.cursor_column(decoded, anchor)),
+    })
+    local old_column_width = instance.buffer.view.column_widths[1]
+    assert.are.equal(1, #assert(decoded.marker:match(
+      ":([0-9]+)" .. string.char(31) .. "$"
+    )))
+
+    instance:expand("a-dir")
+    wait_for(function() return instance:get_pos("a-dir/child-03.txt") ~= nil end)
+
+    local restored, restored_anchor = cursor_state(instance, winid)
+    assert.are.equal("item-04.txt", restored.entry.relative_path)
+    assert.are.same(anchor, restored_anchor)
+    assert.is_true(instance.buffer.view.column_widths[1] > old_column_width)
+    assert.are.equal(2, #assert(restored.marker:match(
+      ":([0-9]+)" .. string.char(31) .. "$"
+    )))
+  end)
+
   it("falls back to the nearest surviving ancestor after collapse", function()
     local instance = ready({ ["dir/child/grandchild.txt"] = "x", ["tail.txt"] = "x" })
     local winid = open_current(instance)

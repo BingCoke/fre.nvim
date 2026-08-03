@@ -93,7 +93,7 @@ describe("fre stable row identity", function()
 
   it("uses canonical length-prefixed opaque markers and returns fresh exact Entries", function()
     assert.are.equal(unit_separator .. "fre:12:peer:one:two:71" .. unit_separator,
-      row.marker(nil, "peer:one:two", 71))
+      row.marker(nil, "peer:one:two", 71, 2))
 
     local instance = ready({ ["a.txt"] = "x" })
     local entry_row = row_for(instance, "a.txt")
@@ -105,7 +105,9 @@ describe("fre stable row identity", function()
     assert.are.equal("a.txt", decoded.path)
     assert.are.equal(unit_separator, marker:sub(1, 1))
     assert.are.equal(unit_separator, marker:sub(-1))
-    assert.are.equal(row.marker(nil, instance.id, decoded.node_id), marker)
+    assert.are.equal(row.marker(
+      nil, instance.id, decoded.node_id, #tostring(instance.tree:latest_node_id())
+    ), marker)
 
     assert_exact_entry(first, {
       instance_id = instance.id,
@@ -121,18 +123,38 @@ describe("fre stable row identity", function()
     assert.are.equal("a.txt", second.name)
   end)
 
-  it("parses byte-framed IDs and rejects non-canonical and legacy markers", function()
+  it("keeps node markers and rendered columns aligned within one instance", function()
+    local entries = {}
+    for index = 1, 10 do entries[string.format("file-%02d.txt", index)] = "x" end
+    local instance = ready(entries)
+    local path_start
+
+    for row_number, line in ipairs(lines(instance)) do
+      local decoded = assert(instance.buffer:decode(row_number))
+      local node_text = assert(decoded.marker:match(
+        ":([0-9]+)" .. unit_separator .. "$"
+      ))
+      assert.are.equal(2, #node_text, "node marker width on row " .. row_number)
+      path_start = path_start or decoded.path_range.start_byte
+      assert.are.equal(path_start, decoded.path_range.start_byte,
+        "rendered column alignment on row " .. row_number)
+    end
+  end)
+
+  it("parses byte-framed IDs and aligned node IDs", function()
     local opaque = "\195\169:peer"
-    local marker = row.marker(nil, opaque, 17)
+    local marker = row.marker(nil, opaque, 17, 2)
     local decoded = row.decode_marker(nil, 1, marker .. "path")
     assert.are.equal(7, #opaque)
     assert.are.equal(opaque, decoded.instance_id)
     assert.are.equal(17, decoded.node_id)
     assert.are.equal(marker, decoded.marker)
 
+    local aligned = row.marker(nil, opaque, 1, 2)
+    assert.are.equal(1, row.decode_marker(nil, 1, aligned .. "path").node_id)
+
     for _, invalid in ipairs({
       unit_separator .. "fre:01:a:1" .. unit_separator,
-      unit_separator .. "fre:1:a:01" .. unit_separator,
       unit_separator .. "fre:001:002" .. unit_separator,
       unit_separator .. "fre:4:ab:1" .. unit_separator,
     }) do
@@ -154,9 +176,9 @@ describe("fre stable row identity", function()
   it("reports malformed and unknown markers with their row numbers", function()
     local instance = ready({ ["a.txt"] = "x" })
     local malformed = unit_separator .. "fre:3:ab"
-    local unknown_instance = row.marker(instance.buffer, "unknown:instance", 2)
+    local unknown_instance = row.marker(instance.buffer, "unknown:instance", 2, 1)
       .. "foreign.txt"
-    local unknown_node = row.marker(instance.buffer, instance.id, 999) .. "missing.txt"
+    local unknown_node = row.marker(instance.buffer, instance.id, 999, 3) .. "missing.txt"
     set_lines(instance, 0, -1, { malformed, unknown_instance, unknown_node })
 
     assert_row_error(1, "malformed reserved row marker", function()
