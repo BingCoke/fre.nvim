@@ -1,6 +1,7 @@
 local config = require("fre.config")
 local gc = require("fre.gc")
 local fs = require("fre.fs")
+local mapping = require("fre.mapping")
 local mutation_fs = require("fre.mutation.fs")
 local registry = require("fre.registry")
 local watch = require("fre.watch")
@@ -134,6 +135,18 @@ function Manager:create_instance(opts)
   core_options.mutation_adapter = self._mutation_adapter
   core_options.write_ui_adapter = self._write_ui_adapter
   local instance = require("fre.instance").new(core_options)
+  local mapped, mapping_error = pcall(mapping.setup, instance, {
+    use_mapping_default = effective.use_mapping_default,
+    mapping = effective.mapping,
+  })
+  if not mapped then
+    local cleaned, cleanup_err = pcall(instance.destroy, instance)
+    if not cleaned then
+      error(tostring(mapping_error) .. "; cleanup failed: " .. tostring(cleanup_err), 0)
+    end
+    error(mapping_error, 0)
+  end
+
   local ok, result = pcall(self.register, self, instance, policy)
   if ok then return result end
 

@@ -374,10 +374,10 @@ describe("fre ticket 20 default directory explorer", function()
     reset_editor()
     local source, winid = source_buffer(fixture:path("one"))
     local calls = 0
-    controller._create_instance = function(target, root)
+    controller._create_instance = function(root)
       calls = calls + 1
       assert.is_nil(controller:check(source, winid))
-      return original_controller.create_instance(target, root)
+      return original_controller.create_instance(root)
     end
 
     local child = assert(controller:check(source, winid))
@@ -438,8 +438,8 @@ describe("fre ticket 20 default directory explorer", function()
     controller._create_instance = original_controller.create_instance
 
     local created
-    controller._create_instance = function(target, root)
-      created = original_controller.create_instance(target, root)
+    controller._create_instance = function(root)
+      created = original_controller.create_instance(root)
       return created
     end
     controller._replace_window = function() error("injected replacement failure") end
@@ -526,8 +526,8 @@ describe("fre ticket 20 default directory explorer", function()
     reset_editor()
     local source, winid = source_buffer(fixture:path("one"))
     local first_child
-    controller._create_instance = function(target, root)
-      first_child = original_controller.create_instance(target, root)
+    controller._create_instance = function(root)
+      first_child = original_controller.create_instance(root)
       return first_child
     end
     controller._delete_source = function() error("injected source delete failure") end
@@ -542,8 +542,8 @@ describe("fre ticket 20 default directory explorer", function()
     local post_source = source_buffer(fixture:path("two"))
     local post_win = vim.api.nvim_get_current_win()
     local post_child
-    controller._create_instance = function(target, root)
-      post_child = original_controller.create_instance(target, root)
+    controller._create_instance = function(root)
+      post_child = original_controller.create_instance(root)
       return post_child
     end
     controller._delete_source = function(bufnr)

@@ -1,10 +1,11 @@
 local config = require("fre.config")
-local Work = require("fre.instance.work")
 local mapping = require("fre.mapping")
 local path = require("fre.path")
 local window = require("fre.window")
+local default_ui = require("fre.write_ui")
 
 local M = {}
+local ui_adapter = default_ui
 
 local function fail(message, level)
   error("fre: " .. message, level or 3)
@@ -523,15 +524,29 @@ function M.destroy(ctx, opts)
   return instance_from(ctx):destroy()
 end
 
+local function validate_display(display)
+  if type(display) ~= "table" then fail("confirmation display must be a string array", 4) end
+  local count = 0
+  for key, line in pairs(display) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 or type(line) ~= "string" then
+      fail("confirmation display must be a string array", 4)
+    end
+    count = count + 1
+  end
+  if count ~= #display then fail("confirmation display must not contain nil holes", 4) end
+end
+
 function M.confirm(ctx, display, on_decision)
   instance_from(ctx)
-  return Work.confirm(ctx, display, on_decision)
+  validate_display(display)
+  if type(on_decision) ~= "function" then
+    fail("confirmation callback must be a function", 3)
+  end
+  return ui_adapter.confirm(ctx, display, on_decision)
 end
 
 function M.write(ctx, _opts)
-  local instance = instance_from(ctx)
-  return instance.work:write({
-    buffer = ctx.buffer,
+  return instance_from(ctx):write({
     bufnr = ctx.bufnr,
     winid = ctx.winid,
     tabpage = ctx.tabpage,
@@ -542,13 +557,17 @@ function M.write(ctx, _opts)
 end
 
 function M._set_ui_adapter(adapter)
-  Work._set_ui_adapter(adapter)
+  if type(adapter) ~= "table" or type(adapter.confirm) ~= "function"
+      or type(adapter.progress) ~= "function" then
+    fail("write UI adapter must provide confirm() and progress()", 2)
+  end
+  ui_adapter = adapter
   require("fre.manager").default:set_write_ui_adapter(adapter)
 end
 
 function M._reset_ui_adapter()
-  Work._reset_ui_adapter()
-  require("fre.manager").default:set_write_ui_adapter(require("fre.write_ui"))
+  ui_adapter = default_ui
+  require("fre.manager").default:set_write_ui_adapter(default_ui)
 end
 
 return M

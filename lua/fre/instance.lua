@@ -103,6 +103,23 @@ function Instance:result_value()
   return self.sync:result_value()
 end
 
+function Instance:inspect_action_row(row_number, allow_undecodable)
+  local decoded
+  if allow_undecodable then
+    local ok, value = pcall(self.buffer.decode, self.buffer, row_number)
+    if ok then decoded = value end
+  else
+    decoded = self.buffer:decode(row_number)
+  end
+  return {
+    row_kind = decoded and decoded.row_kind or nil,
+    navigation_kind = decoded and decoded.navigation_kind or nil,
+    source_instance_id = decoded and decoded.source_instance_id or nil,
+    entry = decoded and decoded.entry or nil,
+    path_range = decoded and decoded.path_range or nil,
+  }
+end
+
 
 
 
@@ -453,6 +470,20 @@ function Instance:toggle(layout)
   return type(result) == "number" and self or result
 end
 
+function Instance:write(ctx)
+  if self.lifecycle:is_dead() then fail("instance is destroyed", 2) end
+  if ctx == nil then ctx = {} end
+  if type(ctx) ~= "table" then fail("write context must be a table", 2) end
+  return self.work:write({
+    bufnr = ctx.bufnr,
+    winid = ctx.winid,
+    tabpage = ctx.tabpage,
+    mode = ctx.mode,
+    row = ctx.row,
+    col = ctx.col,
+  })
+end
+
 function Instance:prepare()
   if self.lifecycle:is_dead() then fail("instance is destroyed", 2) end
   return self.work:prepare()
@@ -565,8 +596,6 @@ local core_fields = {
   "expanded",
   "columns",
   "layout",
-  "use_mapping_default",
-  "mapping",
   "buffer",
   "window",
 }
@@ -649,8 +678,6 @@ function Instance.new(options)
       root = self.root,
       bufnr = self.bufnr,
       columns = effective.columns,
-      use_mapping_default = effective.use_mapping_default,
-      mapping = effective.mapping,
       tree = self.tree,
       hidden_file = effective.hidden_file,
       registry = registry,
@@ -673,10 +700,7 @@ function Instance.new(options)
       list_views = function(tabpage) return view.list(self.view, tabpage) end,
       apply_window = function(_, winid) return view.apply_window(self.view, winid) end,
       sync_views = function(_, opts) return view.sync(self.view, opts) end,
-      request_write = function(ctx)
-        ctx.instance = self
-        return require("fre.actions").write(ctx)
-      end,
+      request_write = function(ctx) return self:write(ctx) end,
       request_destroy = function() return self:destroy() end,
       report_async_error = function(err) return self:_report_async_error(err) end,
     })

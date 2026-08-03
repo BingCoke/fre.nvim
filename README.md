@@ -94,7 +94,20 @@ vim.keymap.set("n", "<leader>e", function()
 end, { desc = "Open Fre" })
 ```
 
-`fre.new()` 会立即返回实例和隐藏 buffer，目录扫描在后台完成。立即调用 `open()` 时，加载完成前 buffer 保持空白，完成后一次显示目录内容。
+`fre.new()` 是默认的 **managed** 创建路径：它通过默认 Manager 创建核心 Instance、登记 public lookup，并把 `gc` 选项交给 Manager 拥有的 GC。它会立即返回实例和隐藏 buffer，目录扫描在后台完成。立即调用 `open()` 时，加载完成前 buffer 保持空白，完成后一次显示目录内容。
+
+只需要单个核心文件系统编辑器、或要接入自定义管理层时，可以直接构造 standalone Instance：
+
+```lua
+local Instance = require("fre.instance")
+
+local instance = Instance.new({
+  root = vim.fn.getcwd(),
+})
+instance:open()
+```
+
+standalone Instance 不需要 `require("fre").setup()`，仍支持加载、窗口展示、展开、编辑、写入、刷新、watcher 和销毁；它不参加默认 Manager 的 lookup、GC group/TTL/capacity、`fre.set_group` 或默认目录 takeover。默认 takeover 始终位于插件集成层：只调用 managed `fre.new()`，并只把默认 Manager 已登记的 buffer 视为 Fre 所有。
 
 ## 编辑文件系统
 
@@ -371,9 +384,9 @@ actions.split_select(ctx, {
 })
 ```
 
-对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会使用当前实例所属的 Manager 创建一个独立实例，并把当前 sort 和点文件显示状态作为普通值选项传入。这里的 `opts.instance` 是新实例的普通值选项 table，不是 Instance 引用。进入目录时，目标目录下当前有效的展开路径会转换成新 root-relative 的 `expanded` 值；例如进入已展开的 `src` 时使用 `{ "x", "x/x" }`。选择 `../` 时固定使用空 `expanded`，因此刚离开的目录保持折叠，并在新实例 ready 后通过 `set_cursor_to_path()` 定位到它的条目。action 计算的 `expanded` 会覆盖 `opts.instance.expanded`，而 `opts.instance.root` 是参数错误。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`actions.jump_to_path()` 只把 entry 或 navigation 行的 cursor 移到 path 字段；new、缺少 path range 或不可解析的行会静默忽略。它没有默认映射。
+对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会统一调用 public `fre.new()` 创建一个由默认 Manager 管理的独立 peer Instance，并把当前 sort 和点文件显示状态作为普通值选项传入。source 与 destination 没有 parent/child 生命周期或 Manager/Registry affinity；销毁或隐藏 source 不会自动影响已提交的 destination。这里的 `opts.instance` 是新实例的普通值选项 table，不是 Instance 引用。进入目录时，目标目录下当前有效的展开路径会转换成新 root-relative 的 `expanded` 值；例如进入已展开的 `src` 时使用 `{ "x", "x/x" }`。选择 `../` 时固定使用空 `expanded`，因此刚离开的目录保持折叠，并在新实例 ready 后通过 `set_cursor_to_path()` 定位到它的条目。调用方可以提供 `opts.instance.root` 和 `opts.instance.expanded`，但 action 会用已选择目标拥有的 `root` 和计算出的 `expanded` 覆盖它们。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`actions.jump_to_path()` 只把 entry 或 navigation 行的 cursor 移到 path 字段；new、缺少 path range 或不可解析的行会静默忽略。它没有默认映射。
 
-三种 selection action 的 option table 都是 closed schema：`select` 只接受 `target_winid`、`hide_source`、`instance`；`tab_select` 只接受 `hide_source`、`instance`；`split_select` 必须提供 `layout`，此外只接受 `anchor_winid`、`hide_source`、`instance`。任何未列字段（包括 numeric key 和其他 non-string key）都会在 preflight 直接报错。`opts.instance` 仅用于 directory child，`root` 由 action 持有，action 计算的 `expanded` 会覆盖调用方值。
+三种 selection action 的 option table 都是 closed schema：`select` 只接受 `target_winid`、`hide_source`、`instance`；`tab_select` 只接受 `hide_source`、`instance`；`split_select` 必须提供 `layout`，此外只接受 `anchor_winid`、`hide_source`、`instance`。任何未列字段（包括 numeric key 和其他 non-string key）都会在 preflight 直接报错。`opts.instance` 仅用于 directory child；`root` 和 `expanded` 均由 action 持有并覆盖调用方值。
 
 三种 selection action 共享相同的 source、Entry、resource preparation、buffer install commit、window policy、cursor、focus 和 post-commit `hide_source` 语义，只是 destination shape 不同：`select` 使用 exact `target_winid`，省略时是 captured `ctx.winid`；`tab_select` 创建一个 exact 新 tab；`split_select` 相对 exact ordinary anchor 创建目标。ordinary source 省略 `anchor_winid` 时只使用 captured source window；float source 必须显式提供同 tab 的 ordinary anchor，通常直接使用 `ctx.view.origin_winid`。无效 option/source/target/anchor/layout 会在 destination、file buffer 或 child Instance 创建前报错，不会从当前焦点或其他窗口 fallback。
 
@@ -465,10 +478,24 @@ local fre = require("fre")
 
 fre.setup(opts)
 fre.new(opts)
-fre.get_instance()          -- 当前 buffer 对应的实例或 nil
+fre.get_instance()          -- 当前 buffer 对应的默认-managed Instance 或 nil
 fre.get_instance(bufnr)
-fre.get_instance_by_id(id)  -- 已销毁实例返回 nil
+fre.get_instance_by_id(id)     -- 仅返回默认 Manager 当前登记的存活 Instance
+fre.set_group(instance, group) -- 仅接受默认 Manager 登记的存活 Instance
 ```
+
+核心 Instance 可直接构造；省略 `registry` 时使用进程内默认 Registry：
+
+```lua
+local Instance = require("fre.instance")
+local Registry = require("fre.registry")
+
+local standalone = Instance.new({ root = "/project" })
+local isolated_registry = Registry.new()
+local isolated = Instance.new({ root = "/other", registry = isolated_registry })
+```
+
+`fre.new()` 与省略 `registry` 的 standalone Instance 共享默认 Registry，因此 marker identity/宽度属于同一 identity domain；但 standalone 仍不会出现在 `fre.get_instance*()` 中。显式 Registry 形成隔离 domain，只有共享同一个 Registry 的 Instances 才能解析彼此复制的 foreign marker。Registry 分配的 Instance ID 永不复用；销毁会移除 live marker source，但不会回收 ID。
 
 实例公开字段按只读方式使用：
 
@@ -476,7 +503,6 @@ fre.get_instance_by_id(id)  -- 已销毁实例返回 nil
 instance.id
 instance.bufnr
 instance.root
-instance.config
 ```
 
 常用方法：
@@ -498,7 +524,8 @@ instance:reveal(path)
 instance:set_sort(compare)
 instance:set_hidden_file(boolean)
 instance:toggle_hidden_file()
-instance:setGroup(group)
+
+require("fre").set_group(instance, group)
 
 instance:get_entry(row)
 instance:get_pos(snapshot_path) -- { row, byte_col } 或 nil
@@ -518,7 +545,7 @@ local exact = require("fre").view.inspect(instance, { winid = winid })
 -- { winid = winid, origin_winid = origin_winid, layout = normalized_layout }
 ```
 
-View 直接从实际窗口和 Fre buffer 解析，没有 active record。`tabpage` 省略时使用当前 tab：当前窗口是该 Instance 的 View 时返回 exact current View，否则唯一候选可直接返回；多个非当前候选会明确报错，调用方应传 `{ winid = ... }`。无实际 View 返回 `nil`。返回 table 和 normalized `layout` 都是 copy。Fre-established current/split/float View 带有 exact restore/close policy 与 origin；原生 ordinary duplicate 的 layout 是 `current`、origin 是自身，外部 float 不推断 ordinary origin。
+每个 Instance 的 private View child 独占 per-tab View records，并在查询/同步时按实际 Neovim window 与 buffer 状态修剪记录；Instance 本身不保存 View map。`tabpage` 省略时使用当前 tab：当前窗口是该 Instance 的 View 时返回 exact current View，否则唯一候选可直接返回；多个非当前候选会明确报错，调用方应传 `{ winid = ... }`。无实际 View 返回 `nil`。返回 table 和 normalized `layout` 都是 copy。Fre-established current/split/float View 带有 exact restore/close policy 与 origin；原生 ordinary duplicate 的 layout 是 `current`、origin 是自身，外部 float 不推断 ordinary origin。
 
 `get_entry(row)` 返回新的普通 Lua table：
 
@@ -535,7 +562,7 @@ View 直接从实际窗口和 Fre buffer 解析，没有 active record。`tabpag
 
 `expand`、`collapse`、`toggle_expand` 和 `reveal` 接受 root 内的 snapshot 相对路径，也可接受 root 内绝对路径；`collapse_all` 与光标和路径无关，会清除缓存树中全部非 root 目录的展开状态，同时保留目录缓存与元数据。`get_pos` 和 `set_cursor_to_path` 接受 snapshot 相对路径。`set_cursor_to_path` 可以在创建期间调用：它等待实例 ready 后，把指定窗口的 cursor 放到目标条目的 path 起点，不展开目录或保存 cursor 状态。会改变投影的操作在 buffer 已修改时会直接报错，以避免覆盖草稿；窗口操作和 lookup 仍可使用。每次成功投影以及成功 `:write` 后的真实状态同步都会建立新的 undo 起点，`u` 不会恢复旧树投影或已经提交的文件系统草稿。
 
-`setGroup(group)` 将实例迁移到 `setup()` 中已存在的 GC 组，并立即按目标组容量执行回收；迁移实例在本次容量约束中受保护。该操作不会重置当前隐藏区间或 TTL timer，并同步更新 `instance.config.gc.group` 与保留 buffer metadata `vim.b.fre.gc_group`。
+`fre.set_group(instance, group)` 是唯一的默认-managed group migration API；不存在 `instance:setGroup()` 兼容别名。它只接受仍由默认 Manager 登记的存活 Instance，把 GC 拥有的 membership 原子迁移到 `setup()` 中已存在的组，并立即按目标组容量执行回收；迁移 subject 在本次容量约束中受保护。迁移保留 GC-owned policy snapshot、隐藏区间和 TTL timer，不修改 Instance 字段或 buffer metadata。standalone、自定义管理层、已销毁或未登记的 Instance 会被拒绝。
 
 ### 异步就绪
 
@@ -553,7 +580,24 @@ end)
 
 配置了 `expanded` 时，root、全部初始展开目录以及 `auto_expand_single_directory` 产生的自动展开后缀完成加载后，才会调用 `when_ready` 并触发 `FreReady`。初始化展开失败时，Instance 进入 `load-failed`，错误同时传给 callback 和事件的 `data.error`。
 
-也可以监听 `User FreReady`：
+### User 事件
+
+核心 Instance 只发布以下六个有限、命名的 `User` 事件；payload 只含可序列化身份/状态，不含 Instance、Manager、GC、Buffer、callback 或命令：
+
+| pattern | `args.data` | 时机 |
+| --- | --- | --- |
+| `FreInstanceCreated` | `{ instance_id, bufnr }` | 核心组合、marker source 注册和 initial load 启动后，同步发生在构造返回前 |
+| `FreReady` | `{ instance_id, bufnr, error, result }` | 每次 initial-load attempt 提交 ready/load-failed 且 `when_ready` observer 已运行后 |
+| `FreInstancePresentationChanged` | `{ instance_id, bufnr, visible }` | 实际 View 从 0 到非 0 或从非 0 到 0；重复同步不发事件 |
+| `FreInstanceActivityChanged` | `{ instance_id, bufnr, activity, active }` | `refresh`、`write` 或 `execution` 活动边界改变时 |
+| `FreInstanceDestroying` | `{ instance_id, bufnr }` | lifecycle 提交 destroying 后、局部清理前 |
+| `FreInstanceDestroyed` | `{ instance_id, bufnr }` | 核心 lifecycle、局部资源、buffer 和 Registry marker source 都进入终态后 |
+
+每个事件都通过 protected `nvim_exec_autocmds` 分发；observer 错误会异步报告，不会回滚已经提交的核心状态。默认 Manager 只是这些事实的一个消费者。`FreInstanceDestroyed` 发出前，核心 lifecycle、局部资源、buffer 和 Registry marker source 均已进入终态；默认 Manager 在消费该事件时才删除 managed lookup 和 GC records。因此，在默认 Manager observer 之前运行的任意 observer 在事件 dispatch 期间仍可能通过 `fre.get_instance*()` 解析到已销毁的 Instance；默认 Manager 消费后以及事件分发完成后，managed lookup 不再存在。自定义管理层应按 `instance_id` 维护自己的记录，并从自己的 lookup 解析实例；默认 `fre.get_instance*()` 不会解析 standalone 或其他 Manager 的实例。
+
+Registry 另有一个独立事件：`FreRegistryMarkerWidthsChanged`，payload 精确为 `{ registry_id, instance_width, node_width, generation }`。宽度增长按 Registry/Neovim loop turn 合并；Buffer 只处理 matching `registry_id` 且 generation 更新的事件。
+
+监听 ready 的例子：
 
 ```lua
 vim.api.nvim_create_autocmd("User", {
@@ -564,20 +608,19 @@ vim.api.nvim_create_autocmd("User", {
     if data.error then
       vim.notify(tostring(data.error), vim.log.levels.ERROR)
     elseif instance then
-      -- data = { instance_id, bufnr, error, result }
+      -- managed ready instance
     end
   end,
 })
 ```
 
-每个 Fre buffer 名称为 `fre://<instance-id>`，并提供保留元数据：
+每个 Fre buffer 名称为 `fre://<instance-id>`，并只提供核心身份元数据；GC group、TTL、capacity、modified policy、Manager affinity 和 GC timer 状态都不复制到 buffer：
 
 ```lua
 vim.b.fre == {
   version = 1,
   instance_id = instance.id,
   root = instance.root,
-  gc_group = instance.config.gc.group,
 }
 ```
 
@@ -614,6 +657,8 @@ execution:cancel()
 - 隐藏实例再次显示时，会在安全条件下执行一次完整刷新。
 - watcher 行为和可靠性仍受操作系统及 libuv 限制。
 
+GC 是默认 Manager 可选使用的进程级 owner。它按 Instance identity 保存 group membership、容量、每实例 `ttl_ms`/`include_modified` policy snapshot、hidden interval、timer/generation 和 eligibility；GC 可保留 managed Instance 并只调用其 public `destroy()`。核心 Instance 不持有 Manager/GC/group/policy/runtime 状态。`fre.new({ gc = ... })` 的 managed policy 由 GC 解析；standalone constructor 不解释或应用 GC policy。
+
 GC group 的容量由组内全部存活实例占用，包括可见、写入锁定、正在执行 mutation 或带修改的实例。回收时只会选择已隐藏且当前可安全销毁的实例；若没有安全候选，group 会暂时超过容量，直到实例状态变化后再次执行约束。
 
 GC 的可见性以全部实际 View 为准，原生 duplicate 与 Fre 创建的窗口同样阻止 TTL/容量销毁。首个 View 出现会取消隐藏区间，最后一个 View 离开才重新开始计时；销毁前仍会执行最终 `win_findbuf` 检查。
@@ -624,7 +669,7 @@ GC 的可见性以全部实际 View 为准，原生 duplicate 与 Fre 创建的�
 
 每个已有条目和导航行在物理 buffer 行首都带有统一的 `\x1ffre:<instance-id>:<node-id>\x1f` 稳定身份 marker。两个 ID 都是从宽度 3 开始的零填充十进制数；没有 base36 或固定宽度上限。真实 instance/node ID 为正数，node ID `0` 是唯一导航哨兵：它根据源实例 root 表示 `../` 或 `/`，不属于 Tree、baseline 或 filesystem mutation。
 
-Marker 是隐藏的内部结构文本，不是可配置列。每个 Manager 生命周期内，instance/node 字段宽度只会随 ID 位数单调增长且不会收缩；单次投影只使用一个宽度快照，因此所有规范行的 marker 等长。宽度增长不会覆盖已修改 buffer：草稿保留旧 marker 字节，直到成功写入或显式成功刷新后才按当前宽度规范化。
+Marker 是隐藏的内部结构文本，不是可配置列。在每个 Registry identity domain 内，instance/node 字段宽度只会随 ID 位数单调增长且不会收缩；单次投影只使用一个宽度快照，因此所有规范行的 marker 等长。宽度增长不会覆盖已修改 buffer：草稿保留旧 marker 字节，直到成功写入或显式成功刷新后才按当前宽度规范化。
 
 正式的 `syntax/fre.vim` 在首个带 marker 的投影前提供 conceal；目标窗口也会在显示 Fre 前应用 conceal 等局部选项，并在离开 Fre 时恢复之前的值。Raw buffer API、`:print` 和普通 yank 仍会保留这些真实字节，这是复制身份协议的一部分。
 

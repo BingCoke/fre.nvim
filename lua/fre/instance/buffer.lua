@@ -47,8 +47,6 @@ function Buffer.new(options)
     root = options.root,
     bufnr = options.bufnr,
     columns = vim.deepcopy(options.columns or {}),
-    use_mapping_default = options.use_mapping_default == true,
-    mapping = vim.deepcopy(options.mapping or {}),
     tree = options.tree,
     registry = registry,
     registry_id = registry.registry_id,
@@ -875,7 +873,6 @@ function M.setup(buffer)
         row, col = cursor[1], cursor[2]
       end
       buffer.request_write({
-        buffer = buffer,
         bufnr = args.buf,
         winid = winid,
         tabpage = vim.api.nvim_get_current_tabpage(),
@@ -918,9 +915,6 @@ function M.setup(buffer)
       callback = function() M.constrain_cursor(buffer) end,
     })
   end
-  require("fre.mapping").setup(buffer)
-  buffer.use_mapping_default = nil
-  buffer.mapping = nil
   buffer.registry:register_marker_source(buffer.id, buffer.marker_source)
   buffer.marker_source_registered = true
 end
@@ -936,7 +930,6 @@ function M.teardown(buffer)
     pcall(vim.api.nvim_del_augroup_by_id, buffer.buffer_augroup)
     buffer.buffer_augroup = nil
   end
-  require("fre.mapping").teardown(buffer)
 end
 
 M.namespace = row_namespace

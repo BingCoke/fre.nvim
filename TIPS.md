@@ -14,18 +14,17 @@ Fre buffer 不是普通文件 buffer。第三方状态栏或 tabline 应通过 `
 | `bufhidden` | `hide` | 窗口离开后允许保留隐藏 buffer |
 | `buflisted` / `swapfile` | `false` / `false` | 不进入普通 buffer 列表，也不创建 swapfile |
 
-每个存活的 Fre buffer 都提供以下保留元数据：
+每个存活的 Fre buffer 都只提供核心身份元数据：
 
 ```lua
 vim.b.fre == {
   version = 1,
   instance_id = instance.id,
   root = instance.root,       -- 规范化后的绝对路径
-  gc_group = instance.config.gc.group,
 }
 ```
 
-`root` 才是浏览目录。需要 Instance API 时使用 `require("fre").get_instance(bufnr)`，不要解析 `fre://<instance-id>`。`gc_group` 会随 `instance:setGroup()` 更新。
+`root` 才是浏览目录。需要默认-managed Instance API 时使用 `require("fre").get_instance(bufnr)`，不要解析 `fre://<instance-id>`。standalone 或自定义 Manager 的 Instance 不会被默认 lookup 认领；调用方应保留自己的 identity-keyed 记录。GC group、TTL、capacity 和 Manager affinity 不属于 buffer metadata；默认-managed group migration 使用 `require("fre").set_group(instance, group)`，不存在 `instance:setGroup()`。
 
 ### lualine：全局 cwd 内显示相对路径，否则显示绝对路径
 
@@ -95,13 +94,20 @@ require("tabby").setup({
 
 ### Fre 发出的全部 User event
 
-Fre 当前只发出一个公共 `User` event：
+核心 Instance 精确发出以下六个公共 `User` event：
 
 | Event | 触发时机 | `args.data` |
 | --- | --- | --- |
-| `User FreReady` | root 首次加载以及配置的初始展开全部完成后；成功和失败都会触发 | `{ instance_id, bufnr, error, result }` |
+| `User FreInstanceCreated` | 核心组合、marker source 注册和 initial load 启动后，构造返回前 | `{ instance_id, bufnr }` |
+| `User FreReady` | 每次 initial-load attempt 提交 ready/load-failed，且 `when_ready()` observer 已运行后 | `{ instance_id, bufnr, error, result }` |
+| `User FreInstancePresentationChanged` | 实际 View 数量跨越 0 的边界 | `{ instance_id, bufnr, visible }` |
+| `User FreInstanceActivityChanged` | `refresh`、`write` 或 `execution` 活动边界改变 | `{ instance_id, bufnr, activity, active }` |
+| `User FreInstanceDestroying` | lifecycle 提交 destroying 后、局部清理前 | `{ instance_id, bufnr }` |
+| `User FreInstanceDestroyed` | 核心 lifecycle、局部资源、buffer 和 Registry marker source 都进入终态后 | `{ instance_id, bufnr }` |
 
-成功时 `error == nil`，`result` 的形状如下；失败时 `error` 非空且 `result == nil`：
+`FreInstanceDestroyed` 发出前，上表所列核心状态均已进入终态。默认 Manager 在消费该事件时才删除 managed lookup 和 GC records；在默认 Manager observer 之前运行的任意 observer 在事件 dispatch 期间仍可能通过 `fre.get_instance*()` 解析到已销毁的 Instance。默认 Manager 消费后以及事件分发完成后，managed lookup 不再存在。
+
+`FreReady` 成功时 `error == nil`，`result` 的形状如下；失败时 `error` 非空且 `result == nil`：
 
 ```lua
 {
@@ -132,9 +138,9 @@ vim.api.nvim_create_autocmd("User", {
 })
 ```
 
-已经注册的 `instance:when_ready()` callback 会先执行，然后才触发 `FreReady`。初始化失败后显式刷新并重新完成加载时会再次触发。Fre 不发出 `FreOpen`、`FreHide`、`FreDestroy` 或普通 refresh 完成事件。
+Registry 另发出 `User FreRegistryMarkerWidthsChanged`，payload 精确为 `{ registry_id, instance_width, node_width, generation }`。它是 Registry 的宽度增长通知，不是第七个 Instance event。
 
-`BufUnload`、`BufWipeout`、`BufWriteCmd`、`BufWinEnter` 等是 Fre 使用或响应的 Neovim 原生事件，不是 Fre 对外发出的 `User` event；不要把内部 autocmd 当成稳定插件协议。
+Fre 没有 `FreOpen`、`FreHide`、`FreDestroy` 或其他兼容别名，也不发布普通 refresh 完成事件。`BufUnload`、`BufWipeout`、`BufWriteCmd`、`BufWinEnter` 等是 Fre 使用或响应的 Neovim 原生事件，不是 Fre 对外发出的 `User` event；不要把内部 autocmd 当成稳定插件协议。
 
 ### 进入 Fre buffer 时自动 `:lcd` 到 root
 
@@ -171,7 +177,7 @@ vim.api.nvim_create_autocmd("BufEnter", {
 | `collapse_all(ctx)` | 无 | 折叠 Instance 中全部目录 |
 | `reveal(ctx)` | 无 | 对当前 entry 调用 `instance:reveal()` |
 | `open(ctx, opts)` | `{ layout? }` | 打开或聚焦当前 Instance |
-| `hidden(ctx)` | 无 | 隐藏当前 tab 的 active View |
+| `hidden(ctx)` | 无 | 隐藏该 Instance 在当前 tab 中的全部 View |
 | `toggle(ctx, opts)` | `{ layout? }` | 当前 tab 内严格切换显示/隐藏 |
 | `set_hidden_file(ctx, opts)` | `{ hidden_file = boolean }` | 明确设置点文件显示状态 |
 | `toggle_hidden_file(ctx)` | 无 | 切换点文件显示状态 |
@@ -183,7 +189,7 @@ vim.api.nvim_create_autocmd("BufEnter", {
 | `confirm(ctx, display, callback)` | 文本数组、回调 | 低层确认 UI |
 | `write(ctx)` | 无 | 完整 prepare/confirm/execute/reconcile 写入流程 |
 
-`opts.instance` 只会传给 directory child，不能包含 `root`；file/symlink selection 传入它会报错。`hide_source` 默认为 `false`，只在选择成功提交后隐藏 source 所在 tab 中该 Instance 的全部 View。
+`opts.instance` 只会传给 directory child；调用方可以提供 `root` 和 `expanded`，但 action 会像覆盖 `expanded` 一样，用已选择目标拥有的 `root` 覆盖它们。file/symlink selection 传入 `opts.instance` 会报错。`hide_source` 默认为 `false`，只在选择成功提交后隐藏 source 所在 tab 中该 Instance 的全部 View。
 
 内置默认映射只有 `<CR>`、`zv`、`zc`、`za`、`zM`、`q`、`g.` 和 `R`。下面关闭默认映射并显式配置一套日常使用所需的 actions，也展示 `tab_select` 和 float-safe `split_select`：
 

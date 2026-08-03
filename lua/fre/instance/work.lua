@@ -1,12 +1,10 @@
 local mutation_execute = require("fre.mutation.execute")
 local mutation_prepare = require("fre.mutation.prepare")
-local default_ui = require("fre.write_ui")
 
 local M = {}
 local Work = {}
 Work.__index = Work
 
-local ui_adapter = default_ui
 
 local function fail(message, level)
   error("fre: " .. message, level or 3)
@@ -341,23 +339,5 @@ function Work:destroy()
 end
 
 M.new = Work.new
-
-function M.confirm(ctx, display, on_decision)
-  validate_display(display)
-  if type(on_decision) ~= "function" then fail("confirmation callback must be a function", 3) end
-  return ui_adapter.confirm(ctx, display, on_decision)
-end
-
-function M._set_ui_adapter(adapter)
-  if type(adapter) ~= "table" or type(adapter.confirm) ~= "function"
-      or type(adapter.progress) ~= "function" then
-    fail("write UI adapter must provide confirm() and progress()", 2)
-  end
-  ui_adapter = adapter
-end
-
-function M._reset_ui_adapter()
-  ui_adapter = default_ui
-end
 
 return M

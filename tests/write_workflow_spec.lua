@@ -161,7 +161,8 @@ local function scripted_ui(opts)
     confirmation_closes = 0,
     progress_closes = 0,
   }
-  function ui.confirm(_ctx, display, on_decision)
+  function ui.confirm(ctx, display, on_decision)
+    ui.confirm_context = vim.deepcopy(ctx)
     if opts.confirm_error then error(opts.confirm_error) end
     ui.confirmations[#ui.confirmations + 1] = vim.deepcopy(display)
     ui.decide = on_decision
@@ -173,7 +174,8 @@ local function scripted_ui(opts)
     if opts.accept_synchronously then on_decision(true) end
     return handle
   end
-  function ui.progress(_ctx, status, on_cancel)
+  function ui.progress(ctx, status, on_cancel)
+    ui.progress_context = vim.deepcopy(ctx)
     if opts.progress_error then error(opts.progress_error) end
     ui.progress_statuses[#ui.progress_statuses + 1] = vim.deepcopy(status)
     ui.cancel_progress = on_cancel
@@ -189,7 +191,8 @@ local function scripted_ui(opts)
     ui.progress_handle = handle
     return handle
   end
-  function ui.report(_ctx, outcome, reconciliation_error)
+  function ui.report(ctx, outcome, reconciliation_error)
+    ui.report_context = vim.deepcopy(ctx)
     ui.reports[#ui.reports + 1] = {
       outcome = outcome and vim.deepcopy(outcome) or nil,
       reconciliation_error = reconciliation_error,
@@ -198,6 +201,21 @@ local function scripted_ui(opts)
   end
   active_ui = ui
   return ui
+end
+
+local function assert_editor_context(ctx, instance)
+  local keys = vim.tbl_keys(ctx)
+  table.sort(keys)
+  assert.are.same({ "bufnr", "col", "mode", "row", "tabpage", "winid" }, keys)
+  assert.are.equal(instance.bufnr, ctx.bufnr)
+  assert.is_number(ctx.winid)
+  assert.is_number(ctx.tabpage)
+  assert.is_string(ctx.mode)
+  assert.is_number(ctx.row)
+  assert.is_number(ctx.col)
+  for _, private in ipairs({ "buffer", "instance", "manager", "gc" }) do
+    assert.is_nil(ctx[private], private)
+  end
 end
 
 local function complete_adapter()
@@ -279,6 +297,12 @@ describe("fre ticket 11 write workflow", function()
     local instance = ready({ ["a.txt"] = "a", ["delete.txt"] = "d" })
     assert.are.equal(mutation_adapter, instance.work.mutation_adapter)
     assert.are.equal(ui_adapter, instance.work.write_ui_adapter)
+    local buffer_request
+    local request_write = instance.buffer.request_write
+    instance.buffer.request_write = function(ctx)
+      buffer_request = vim.deepcopy(ctx)
+      return request_write(ctx)
+    end
     local ui = scripted_ui()
     set_lines(instance, {
       edited_line(instance, "a.txt", "moved.txt"),
@@ -289,9 +313,16 @@ describe("fre ticket 11 write workflow", function()
     assert.is_true(ok, tostring(err))
     assert.are.same({ "MOVE  a.txt -> moved.txt", "CREATE FILE  created.txt", "DELETE  delete.txt" },
       ui.confirmations[1])
+    assert_editor_context(buffer_request, instance)
+    assert_editor_context(ui.confirm_context, instance)
+    assert.are.same(buffer_request, ui.confirm_context)
     assert.is_false(vim.bo[instance.bufnr].modifiable)
     ui.decide(true)
+    assert_editor_context(ui.progress_context, instance)
+    assert.are.same(ui.confirm_context, ui.progress_context)
     wait_unlocked(instance)
+    assert_editor_context(ui.report_context, instance)
+    assert.are.same(ui.confirm_context, ui.report_context)
 
     assert.is_nil(vim.uv.fs_lstat(fixture:path("a.txt")))
     assert.is_nil(vim.uv.fs_lstat(fixture:path("delete.txt")))

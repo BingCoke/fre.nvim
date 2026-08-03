@@ -102,6 +102,30 @@ describe("fre standalone Instance", function()
     assert.is_nil(require("fre.registry").default:find_marker_source(id))
   end)
 
+  it("does not load or install plugin mappings during core construction", function()
+    local loaded_mapping = package.loaded["fre.mapping"]
+    local preload_mapping = package.preload["fre.mapping"]
+    local loaded_instance = package.loaded["fre.instance"]
+    package.loaded["fre.mapping"] = nil
+    package.loaded["fre.instance"] = nil
+    package.preload["fre.mapping"] = function()
+      error("standalone core loaded fre.mapping")
+    end
+
+    local ok, core_or_error = pcall(require, "fre.instance")
+    package.loaded["fre.instance"] = loaded_instance
+    package.loaded["fre.mapping"] = loaded_mapping
+    package.preload["fre.mapping"] = preload_mapping
+    assert.is_true(ok, tostring(core_or_error))
+
+    local instance = wait_ready(keep(core_or_error.new({
+      root = fixture.root,
+      mapping = { n = { x = function() error("mapping should not be installed") end } },
+    })))
+    local normal = vim.api.nvim_buf_get_keymap(instance.bufnr, "n")
+    assert.are.equal(0, #normal)
+  end)
+
   it("supports async load, presentation, edit/write, and refresh with explicit dependencies", function()
     fixture:write("old.txt", "old")
     local registry = Registry.new()

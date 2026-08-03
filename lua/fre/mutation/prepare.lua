@@ -1,4 +1,3 @@
-local buffer = require("fre.instance.buffer")
 local kind_support = require("fre.mutation.kind")
 local move_graph = require("fre.mutation.move_graph")
 local path = require("fre.path")
