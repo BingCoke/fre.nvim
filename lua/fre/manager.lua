@@ -261,11 +261,7 @@ function Manager:register(instance, policy)
   return instance
 end
 
-function Manager:move_to_group(instance, group_name)
-  if type(instance) ~= "table" or self.instances_by_id[instance.id] ~= instance
-      or self.instances_by_buf[instance.bufnr] ~= instance then
-    fail("instance is not registered")
-  end
+function Manager:_set_group(instance, group_name)
   return self._gc:move(instance, group_name)
 end
 

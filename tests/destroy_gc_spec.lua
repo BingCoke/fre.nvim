@@ -1,3 +1,4 @@
+local Instance = require("fre.instance")
 local fre = require("fre")
 local manager_module = require("fre.manager")
 local fs = require("tests.helpers.fs")
@@ -432,19 +433,17 @@ describe("fre managed destruction and GC", function()
     wait_ready(created)
   end)
 
-  it("migrates authoritative membership without core or buffer GC metadata", function()
+  it("migrates membership idempotently without extending the TTL deadline", function()
     fre.setup({ columns = {}, gc = {
       ttl_ms = 100, groups = { default = 0, project = 0 },
     } })
     local instance = ready()
     clock:advance(25)
 
-    assert.are.equal(instance, manager_module.default:move_to_group(instance, "project"))
+    assert.are.equal(instance, fre.set_group(instance, "project"))
+    assert.are.equal(instance, fre.set_group(instance, "project"))
     assert.is_nil(members("default")[instance.id])
     assert.are.equal(instance, members("project")[instance.id])
-    assert.are.equal("project", gc_info(instance).group)
-    assert.is_nil(rawget(instance, "config"))
-    assert.is_nil(vim.b[instance.bufnr].fre.gc_group)
 
     clock:advance(74)
     assert.are.equal("ready", instance:status())
@@ -460,12 +459,11 @@ describe("fre managed destruction and GC", function()
     clock:advance(1)
     local moved = ready()
 
-    manager_module.default:move_to_group(moved, "project")
+    fre.set_group(moved, "project")
 
     assert.are.equal("destroyed", existing:status())
     assert.are.equal("ready", moved:status())
     assert.are.equal(moved, members("project")[moved.id])
-    assert.are.equal("project", gc_info(moved).group)
   end)
 
   it("rolls back only GC-owned membership when migration enforcement fails", function()
@@ -479,7 +477,7 @@ describe("fre managed destruction and GC", function()
     existing.destroy = function() error("injected target destroy failure") end
 
     local ok, err = pcall(
-      manager_module.default.move_to_group, manager_module.default, moved, "project"
+      fre.set_group, moved, "project"
     )
     existing.destroy = destroy
 
@@ -488,9 +486,45 @@ describe("fre managed destruction and GC", function()
     assert.are.equal(existing, members("project")[existing.id])
     assert.are.equal(moved, members("default")[moved.id])
     assert.is_nil(members("project")[moved.id])
-    assert.are.equal("default", gc_info(moved).group)
-    assert.is_nil(rawget(moved, "config"))
-    assert.is_nil(vim.b[moved.bufnr].fre.gc_group)
+
+    clock:advance(99)
+    assert.are.equal("ready", moved:status())
+    clock:advance(1)
+    assert.are.equal("destroyed", moved:status())
+  end)
+
+  it("rejects every non-default-managed and invalid public migration", function()
+    local managed = ready()
+    local standalone = keep(Instance.new({ root = fixture.root, columns = {} }))
+    wait_ready(standalone)
+    local custom_manager = manager_module.new()
+    local custom = keep(custom_manager:create_instance({ root = fixture.root, columns = {} }))
+    wait_ready(custom)
+    local unregistered = ready()
+    manager_module.default:remove(unregistered)
+    local destroyed = ready()
+    destroyed:destroy()
+
+    assert_error_contains(function()
+      fre.set_group(nil, "project")
+    end, "instance must be a live Instance")
+    for _, value in ipairs({ false, 1, {}, function() end }) do
+      assert_error_contains(function()
+        fre.set_group(value, "project")
+      end, "instance must be a live Instance")
+    end
+    assert_error_contains(function() fre.set_group(standalone, "project") end, "default Manager")
+    assert_error_contains(function() fre.set_group(custom, "project") end, "default Manager")
+    assert_error_contains(function() fre.set_group(unregistered, "project") end, "default Manager")
+    assert_error_contains(function() fre.set_group(destroyed, "project") end, "instance must be live")
+    for _, group in ipairs({ false, 1, {}, function() end, "" }) do
+      assert_error_contains(function()
+        fre.set_group(managed, group)
+      end, "group must be a non-empty string")
+    end
+    assert_error_contains(function() fre.set_group(managed, "missing") end, "unknown GC group")
+    assert.are.equal(managed, members("default")[managed.id])
+    assert.is_nil(members("project")[managed.id])
   end)
 
   it("updates GC-owned capacities and rejects removal of a live group", function()

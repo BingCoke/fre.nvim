@@ -1,6 +1,7 @@
 local fs = require("fre.fs")
 local gc = require("fre.gc")
 local mutation_fs = require("fre.mutation.fs")
+local Instance = require("fre.instance")
 local manager_module = require("fre.manager")
 local watch = require("fre.watch")
 local view = require("fre.view")
@@ -28,6 +29,24 @@ end
 
 function M.get_instance_by_id(id)
   return manager_module.default:find_by_id(id)
+end
+
+function M.set_group(instance, group)
+  if type(instance) ~= "table" or getmetatable(instance) ~= Instance then
+    error("fre: set_group instance must be a live Instance", 2)
+  end
+  if instance:is_destroying() or instance:is_destroyed() then
+    error("fre: set_group instance must be live", 2)
+  end
+  if type(group) ~= "string" or group == "" then
+    error("fre: set_group group must be a non-empty string", 2)
+  end
+  local manager = manager_module.default
+  if manager:find_by_id(instance.id) ~= instance
+      or manager:find_by_buf(instance.bufnr) ~= instance then
+    error("fre: set_group instance is not registered with the default Manager", 2)
+  end
+  return manager:_set_group(instance, group)
 end
 
 -- Internal test seam: the public filesystem contract remains fre.new/refresh,
