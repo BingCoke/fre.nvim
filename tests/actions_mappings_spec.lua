@@ -462,6 +462,24 @@ describe("fre ticket 17 actions and mappings", function()
     end
   end)
 
+  it("keeps a split-created Instance mapping selection in its own View", function()
+    local first = ready({ ["dir/second.txt"] = "second" })
+    local first_win = open_current(first)
+    vim.api.nvim_win_set_cursor(first_win, { row_for(first, "dir"), 0 })
+    local first_ctx = actions.context()
+    local second = wait_ready(actions.split_select(first_ctx, {
+      layout = { position = "right", size = 24 },
+    }))
+    local second_win = vim.api.nvim_get_current_win()
+    assert.are.equal(first.bufnr, vim.api.nvim_win_get_buf(first_win))
+    assert.are.equal(second.bufnr, vim.api.nvim_win_get_buf(second_win))
+    vim.api.nvim_win_set_cursor(second_win, { row_for(second, "second.txt"), 0 })
+    local second_file = invoke(second.bufnr, "n", "<CR>")
+    assert.are.equal(second_file, vim.api.nvim_win_get_buf(second_win))
+    assert.are.equal(path.absolute(fixture:path("dir/second.txt")), vim.api.nvim_buf_get_name(second_file))
+    assert.are.equal(first.bufnr, vim.api.nvim_win_get_buf(first_win))
+  end)
+
   it("detaches exact managed file targets and leaves ordinary targets ordinary", function()
     local instance = ready({ ["file.txt"] = "x", ["other.txt"] = "y" })
     local source_win = open_current(instance)
