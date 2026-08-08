@@ -646,7 +646,9 @@ local function restore_view_cursors(buffer, snapshots, prepared)
           validate_metadata = false,
         })
         if decoded_ok and decoded and decoded.marked then
-          local mapped_col = row.cursor_column(decoded, saved.anchor)
+          local mapped_col = row.cursor_column(
+            decoded, saved.anchor, buffer.enabled_columns
+          )
           if mapped_col ~= nil then
             col = mapped_col
             semantic_mapped = true

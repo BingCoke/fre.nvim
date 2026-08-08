@@ -605,25 +605,50 @@ function M.cursor_anchor(decoded, col)
     local separator = field.separator_range
     if separator and col >= separator.start_byte and col < separator.end_byte then
       if preceding then return content_end_anchor(decoded, preceding) end
-      return { field_id = "path", zone = "content", display_offset = 0 }
+      return {
+        field_id = "path", path_field = true, zone = "content", display_offset = 0,
+      }
     end
   end
 
   if col < decoded.path_range.start_byte then
     if preceding then return content_end_anchor(decoded, preceding) end
-    return { field_id = "path", zone = "content", display_offset = 0 }
+    return {
+      field_id = "path", path_field = true, zone = "content", display_offset = 0,
+    }
   end
   local text = range_text(decoded, decoded.path_range)
   return {
     field_id = "path",
+    path_field = true,
     zone = "content",
     display_offset = display_offset(text, col - decoded.path_range.start_byte),
   }
 end
 
-function M.cursor_column(decoded, anchor)
+local function fallback_column(decoded, anchor, ordered_descriptors)
+  local source_index
+  for index, descriptor in ipairs(ordered_descriptors or {}) do
+    if descriptor.id == anchor.field_id then
+      source_index = index
+      break
+    end
+  end
+  if not source_index then return decoded.path_range.start_byte end
+  for index = source_index + 1, #ordered_descriptors do
+    local id = ordered_descriptors[index].id
+    for _, field in ipairs(decoded.fields or {}) do
+      if field.id == id and field.navigable and field.content_range then
+        return field.content_range.start_byte
+      end
+    end
+  end
+  return decoded.path_range.start_byte
+end
+
+function M.cursor_column(decoded, anchor, ordered_descriptors)
   if not decoded or not decoded.marked or type(anchor) ~= "table" then return nil end
-  if anchor.field_id == "path" then
+  if anchor.path_field == true then
     local text = range_text(decoded, decoded.path_range)
     return decoded.path_range.start_byte
       + byte_for_display_offset(text, anchor.display_offset)
@@ -637,7 +662,7 @@ function M.cursor_column(decoded, anchor)
     end
   end
   if not selected or not selected.physical_range or not selected.content_range then
-    return decoded.path_range.start_byte
+    return fallback_column(decoded, anchor, ordered_descriptors)
   end
 
   local physical = selected.physical_range

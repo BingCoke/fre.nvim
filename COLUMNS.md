@@ -129,3 +129,13 @@ instance:toggle_columns({ "permissions", "size" })
 `hide_columns()` 隐藏有效目标，`show_columns()` 显示有效目标。`toggle_columns()` 先过滤并去重目标：全部有效目标都 hidden 时显示整组，否则隐藏整组。一次调用只提交最终可见序列，不发布中间布局；没有实际变化时不会增加投影 generation。
 
 同一 Tree snapshot 中，隐藏 column 不调用其 `render`，并保留可复用结果；再次显示已有结果的 column 不重新渲染。构建期 hidden、之前从未渲染的 column 会在首次显示时同步生成缺失结果。render、投影准备、extmark、highlight 或 Buffer 提交失败时，旧文本、highlights、row identity、hidden state 和可复用结果保持不变；失败 callback 在抛错前产生的外部副作用无法由 Fre 撤销。
+
+## Cursor 恢复
+
+Column visibility 提交前，Fre 会为显示该 Instance 的每个 View 记录当前 filesystem entry 与语义字段位置。提交后仍存在且 navigable 的字段保留字段内 display-cell offset；字段内容缩短时，位置会钳制到最后一个有效 UTF-8 character boundary。path 内的 cursor 同样保留 path display offset。
+
+字段的 leading/trailing padding 属于该字段。字段后的 separator 归属于左侧字段；第一个 configurable column 之前没有可独立导航的 separator 区域。padding 和 separator 不会成为单独的 cursor 目标。
+
+原字段变为 hidden、disabled 或 non-navigable 时，Fre 按构建时的 enabled/configured 顺序向右查找第一个 visible 且 navigable 的 column，并移动到其首字符；右侧没有目标时回退到 path 首字符。原 entry 消失时，继续使用最近 surviving ancestor，再回退到第一个 projected Entry。
+
+每个 managed View 独立恢复 entry、cursor 与相对 viewport，不切换当前 tab 或 focused window。Visibility 的文本与 hidden state 一旦提交就不会因 cursor placement 失败而回滚；一个无效 View 或 placement 失败会被跳过，其余 Views 继续恢复。
