@@ -71,6 +71,8 @@ Descriptor 字段：
 - `parse(suffix, ctx)` 返回当前字段值和未消费 suffix。
 - `equals(entry, value, ctx)` 验证解析值是否仍匹配 metadata。
 
+Callback context 的 `column_index` 与 `is_last` 相对 Instance 构建时固定的 enabled 顺序计算，不随 runtime hidden state 改变。这样同一个 entry-column 结果可以在 hide/show 之间复用；物理行中的 visible 顺序仍始终是 enabled 减去 hidden。
+
 导航行使用相同的 visible column 顺序和投影宽度。其 callback context 包含 `synthetic = true` 和 `navigation_kind = "parent" | "root"`，并提供 callback-only directory Entry；`instance:get_entry(1)` 仍返回 `nil`。
 
 ## 构建期配置
@@ -113,3 +115,17 @@ instance:is_column_visible(id)  -- boolean
 `get_columns()` 保持 configured 顺序，包括 disabled descriptors。`get_hidden_columns()` 保持 configured 顺序，但排除 configured-but-disabled IDs。两个 getter 都返回 defensive copy，修改结果不会改变 Instance。
 
 `is_column_visible(id)` 只接受 string。visible ID 返回 `true`；hidden、disabled 或 unknown ID 返回 `false`。这些查询只读取构建完成的 Buffer column 状态，可以在 Instance 初始目录加载期间调用，不会触发 projection 或 descriptor callback。
+
+## 运行时可见性
+
+```lua
+instance:hide_columns({ "permissions", "size" })
+instance:show_columns({ "permissions", "size" })
+instance:toggle_columns({ "permissions", "size" })
+```
+
+三个 mutation 都要求 Instance 已 ready、未销毁，Buffer 未修改，并且没有 write 或完整 refresh 正在占用投影；成功返回 `nil`。参数必须是无空洞的 string 数组。空数组不投影，重复 ID 使用集合语义，unknown 或 disabled ID 被静默忽略，因此同一个 column group 可以安全用于配置不同的 Instances。
+
+`hide_columns()` 隐藏有效目标，`show_columns()` 显示有效目标。`toggle_columns()` 先过滤并去重目标：全部有效目标都 hidden 时显示整组，否则隐藏整组。一次调用只提交最终可见序列，不发布中间布局；没有实际变化时不会增加投影 generation。
+
+同一 Tree snapshot 中，隐藏 column 不调用其 `render`，并保留可复用结果；再次显示已有结果的 column 不重新渲染。构建期 hidden、之前从未渲染的 column 会在首次显示时同步生成缺失结果。render、投影准备、extmark、highlight 或 Buffer 提交失败时，旧文本、highlights、row identity、hidden state 和可复用结果保持不变；失败 callback 在抛错前产生的外部副作用无法由 Fre 撤销。

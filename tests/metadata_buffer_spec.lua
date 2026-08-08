@@ -244,6 +244,220 @@ describe("fre metadata buffer rows", function()
     assert.is_nil(line:find("CUSTOM_PATH", 1, true))
   end)
 
+  it("applies batch runtime column visibility with set and group semantics", function()
+    local function descriptor(id, enabled)
+      return columns.custom({
+        id = id,
+        enable = enabled,
+        render = function() return id:upper() end,
+        parse = function(suffix)
+          local value, rest = suffix:match("^(%S+)%s+(.*)$")
+          return value, rest
+        end,
+        equals = function() return true end,
+      })
+    end
+    local instance = ready({ ["a.txt"] = "a" }, {
+      columns = {
+        descriptor("first", true),
+        descriptor("disabled", false),
+        descriptor("second", true),
+        descriptor("third", true),
+      },
+      hidden_columns = { "second", "disabled" },
+    })
+    local initial_generation = instance.buffer.view.projection_generation
+
+    for _, invalid in ipairs({
+      "first", { [2] = "first" }, { 1 },
+      { key = "first" }, { [0] = "first" }, { [1.5] = "first" },
+    }) do
+      assert.has_error(function() instance:hide_columns(invalid) end)
+    end
+    assert.are.same({ "second" }, instance:get_hidden_columns())
+    assert.are.equal(initial_generation, instance.buffer.view.projection_generation)
+
+    vim.bo[instance.bufnr].modified = true
+    local admitted, admission_error = pcall(
+      instance.hide_columns, instance, { "first" }
+    )
+    vim.bo[instance.bufnr].modified = false
+    assert.is_false(admitted)
+    assert.is_truthy(tostring(admission_error):find("buffer is modified", 1, true))
+    assert.are.same({ "second" }, instance:get_hidden_columns())
+    assert.are.equal(initial_generation, instance.buffer.view.projection_generation)
+
+    assert.is_nil(instance:hide_columns({}))
+    assert.are.equal(initial_generation, instance.buffer.view.projection_generation)
+    assert.is_nil(instance:hide_columns({
+      "first", "first", "unknown", "disabled",
+    }))
+    assert.are.same({ "first", "second" }, instance:get_hidden_columns())
+    assert.are.equal(initial_generation + 1, instance.buffer.view.projection_generation)
+    assert.is_nil(instance:hide_columns({ "first" }))
+    assert.is_nil(instance:show_columns({ "unknown", "disabled" }))
+    assert.are.equal(initial_generation + 1, instance.buffer.view.projection_generation)
+
+    assert.is_nil(instance:show_columns({ "first" }))
+    assert.are.same({ "second" }, instance:get_hidden_columns())
+    assert.are.equal(initial_generation + 2, instance.buffer.view.projection_generation)
+    assert.is_nil(instance:toggle_columns({
+      "first", "second", "first", "unknown", "disabled",
+    }))
+    assert.are.same({ "first", "second" }, instance:get_hidden_columns())
+    assert.are.equal(initial_generation + 3, instance.buffer.view.projection_generation)
+    assert.is_nil(instance:toggle_columns({ "first", "second" }))
+    assert.are.same({}, instance:get_hidden_columns())
+    assert.are.equal(initial_generation + 4, instance.buffer.view.projection_generation)
+
+    local line = lines(instance)[row_for(instance, "a.txt")]
+    assert.is_truthy(line:find("FIRST", 1, true))
+    assert.is_truthy(line:find("SECOND", 1, true))
+    assert.is_truthy(line:find("THIRD", 1, true))
+    assert.is_nil(line:find("DISABLED", 1, true))
+  end)
+
+  it("reuses rendered fields and rolls back failed visibility preparation", function()
+    local calls = {}
+    local fail_lazy = false
+    local function descriptor(id)
+      return columns.custom({
+        id = id,
+        render = function()
+          calls[id] = (calls[id] or 0) + 1
+          if id == "lazy" and fail_lazy then
+            error("injected lazy render failure")
+          end
+          return id:upper()
+        end,
+        parse = function(suffix)
+          local value, rest = suffix:match("^(%S+)%s+(.*)$")
+          return value, rest
+        end,
+        equals = function() return true end,
+      })
+    end
+    local instance = ready({ ["a.txt"] = "a" }, {
+      columns = { descriptor("stable"), descriptor("lazy") },
+      hidden_columns = { "lazy" },
+    })
+    assert.are.equal(2, calls.stable)
+    assert.is_nil(calls.lazy)
+
+    assert.is_nil(instance:hide_columns({ "stable" }))
+    assert.are.equal(2, calls.stable)
+    assert.is_nil(instance:show_columns({ "stable" }))
+    assert.are.equal(2, calls.stable)
+
+    fail_lazy = true
+    local before_lines = lines(instance)
+    local before_hidden = instance:get_hidden_columns()
+    local before_generation = instance.buffer.view.projection_generation
+    assert.has_error(function() instance:show_columns({ "lazy" }) end)
+    assert.are.same(before_lines, lines(instance))
+    assert.are.same(before_hidden, instance:get_hidden_columns())
+    assert.are.equal(before_generation, instance.buffer.view.projection_generation)
+
+    fail_lazy = false
+    assert.is_nil(instance:show_columns({ "lazy" }))
+    assert.are.equal(3, calls.lazy)
+    assert.are.equal(2, calls.stable)
+    assert.is_nil(instance:hide_columns({ "lazy" }))
+    assert.is_nil(instance:show_columns({ "lazy" }))
+    assert.are.equal(3, calls.lazy)
+    assert.are.equal(2, calls.stable)
+  end)
+
+  it("rolls back visibility and candidate cache when projection commit fails", function()
+    local calls = 0
+    local lazy = columns.custom({
+      id = "lazy",
+      render = function()
+        calls = calls + 1
+        return "LAZY", "FreTestLazy"
+      end,
+      parse = function(suffix)
+        local value, rest = suffix:match("^(%S+)%s+(.*)$")
+        return value, rest
+      end,
+      equals = function() return true end,
+    })
+    local instance = ready({ ["a.txt"] = "a" }, {
+      columns = { lazy },
+      hidden_columns = { "lazy" },
+    })
+    local before_lines = lines(instance)
+    local before_view = instance.buffer.view
+    local original_set_extmark = vim.api.nvim_buf_set_extmark
+    local injected = false
+    vim.api.nvim_buf_set_extmark = function(bufnr, namespace, row, col, opts)
+      if not injected and opts and opts.hl_group == "FreTestLazy" then
+        injected = true
+        error("injected visibility highlight failure")
+      end
+      return original_set_extmark(bufnr, namespace, row, col, opts)
+    end
+
+    local test_ok, test_err = xpcall(function()
+      local ok, err = pcall(instance.show_columns, instance, { "lazy" })
+      assert.is_false(ok)
+      assert.is_truthy(tostring(err):find(
+        "injected visibility highlight failure", 1, true
+      ))
+    end, debug.traceback)
+    vim.api.nvim_buf_set_extmark = original_set_extmark
+    if not test_ok then error(test_err) end
+
+    assert.is_true(injected)
+    assert.are.same(before_lines, lines(instance))
+    assert.are.equal(before_view, instance.buffer.view)
+    assert.are.same({ "lazy" }, instance:get_hidden_columns())
+    assert.is_false(instance:is_column_visible("lazy"))
+    assert.are.equal(2, calls)
+
+    assert.is_nil(instance:show_columns({ "lazy" }))
+    assert.are.same({}, instance:get_hidden_columns())
+    assert.is_true(instance:is_column_visible("lazy"))
+    assert.are.equal(4, calls)
+  end)
+
+  it("keeps render context stable in enabled order across visibility changes", function()
+    local calls = {}
+    local function descriptor(id)
+      return columns.custom({
+        id = id,
+        render = function(_, ctx)
+          calls[id] = (calls[id] or 0) + 1
+          return table.concat({
+            id, tostring(ctx.column_index), tostring(ctx.is_last),
+          }, ":")
+        end,
+        parse = function(suffix)
+          local value, rest = suffix:match("^(%S+)%s+(.*)$")
+          return value, rest
+        end,
+        equals = function() return true end,
+      })
+    end
+    local instance = ready({ ["a.txt"] = "a" }, {
+      columns = { descriptor("first"), descriptor("second") },
+      hidden_columns = { "second" },
+    })
+    assert.are.equal(2, calls.first)
+    assert.is_nil(calls.second)
+
+    assert.is_nil(instance:hide_columns({ "first" }))
+    assert.is_nil(instance:show_columns({ "second" }))
+    assert.are.equal(2, calls.first)
+    assert.are.equal(2, calls.second)
+    local line = lines(instance)[row_for(instance, "a.txt")]
+    assert.is_truthy(line:find("second:2:true", 1, true), line)
+
+    assert.is_nil(instance:show_columns({ "first" }))
+    assert.are.equal(2, calls.first)
+    assert.are.equal(2, calls.second)
+  end)
+
   it("identifies descriptor enable predicate failures during construction", function()
     local function broken(id, enable)
       return columns.custom({

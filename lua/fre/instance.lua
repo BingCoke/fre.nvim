@@ -142,6 +142,45 @@ function Instance:is_column_visible(id)
   return self.buffer:is_column_visible(id)
 end
 
+local function validate_column_ids(ids)
+  if type(ids) ~= "table" then
+    fail("column ids must be a proper string array", 3)
+  end
+  local count, maximum = 0, 0
+  for key in pairs(ids) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+      fail("column ids must be a proper string array", 3)
+    end
+    count = count + 1
+    maximum = math.max(maximum, key)
+  end
+  if count ~= maximum then fail("column ids must not contain nil holes", 3) end
+  for index = 1, maximum do
+    if type(ids[index]) ~= "string" then
+      fail("column ids[" .. index .. "] must be a string", 3)
+    end
+  end
+end
+
+local function change_columns(instance, mode, ids)
+  validate_column_ids(ids)
+  instance:_require_projection_change()
+  instance.buffer:change_column_visibility(mode, ids)
+  return nil
+end
+
+function Instance:hide_columns(ids)
+  return change_columns(self, "hide", ids)
+end
+
+function Instance:show_columns(ids)
+  return change_columns(self, "show", ids)
+end
+
+function Instance:toggle_columns(ids)
+  return change_columns(self, "toggle", ids)
+end
+
 function Instance:get_expanded_paths()
   return self.tree:active_expanded_paths()
 end

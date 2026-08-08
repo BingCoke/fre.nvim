@@ -467,6 +467,9 @@ instance:toggle_hidden_file()
 instance:get_columns()
 instance:get_hidden_columns()
 instance:is_column_visible(id)
+instance:hide_columns(ids)
+instance:show_columns(ids)
+instance:toggle_columns(ids)
 
 require("fre").set_group(instance, group)
 

@@ -22,6 +22,13 @@ local function marker_column_context(
   else
     mtime = { sec = tonumber(mtime) or 0, nsec = 0 }
   end
+  for enabled_index, enabled in ipairs(source.enabled_columns or {}) do
+    if enabled.id == descriptor.id then
+      index = enabled_index
+      is_last = enabled_index == #source.enabled_columns
+      break
+    end
+  end
   local context = {
     entry = entry, descriptor = descriptor, config = descriptor,
     column_index = index, is_last = is_last,
@@ -109,12 +116,14 @@ function Buffer.new(options)
     row_extmarks = {},
     projection_ranges = {},
     pending_initial_cursor = {},
+    render_cache = {},
   }, Buffer)
   self.marker_source = {
     id = self.id,
     root = self.root,
     bufnr = self.bufnr,
     visible_columns = self.visible_columns,
+    enabled_columns = self.enabled_columns,
     tree = marker_tree_contract(self.tree),
     view = self.view,
     _column_context = marker_column_context,
@@ -156,6 +165,69 @@ end
 
 function M:is_column_visible(id)
   return self.visible_column_ids[id] == true
+end
+
+local function visibility_candidate(buffer, mode, ids)
+  local enabled_ids = {}
+  for _, descriptor in ipairs(buffer.enabled_columns) do
+    enabled_ids[descriptor.id] = true
+  end
+  local targets = {}
+  for _, id in ipairs(ids) do
+    if enabled_ids[id] then targets[id] = true end
+  end
+  if next(targets) == nil then return nil end
+
+  local hidden_ids = {}
+  for _, id in ipairs(buffer.hidden_columns) do hidden_ids[id] = true end
+  local hide = mode == "hide"
+  if mode == "toggle" then
+    hide = false
+    for id in pairs(targets) do
+      if not hidden_ids[id] then
+        hide = true
+        break
+      end
+    end
+  end
+  for id in pairs(targets) do hidden_ids[id] = hide or nil end
+
+  local hidden, visible, visible_ids = {}, {}, {}
+  for _, descriptor in ipairs(buffer.enabled_columns) do
+    if hidden_ids[descriptor.id] then
+      hidden[#hidden + 1] = descriptor.id
+    else
+      visible[#visible + 1] = descriptor
+      visible_ids[descriptor.id] = true
+    end
+  end
+  if #hidden == #buffer.hidden_columns then
+    local equal = true
+    for index, id in ipairs(hidden) do
+      if buffer.hidden_columns[index] ~= id then
+        equal = false
+        break
+      end
+    end
+    if equal then return nil end
+  end
+  return {
+    hidden_columns = hidden,
+    visible_columns = visible,
+    visible_column_ids = visible_ids,
+  }
+end
+
+function M:change_column_visibility(mode, ids)
+  local candidate = visibility_candidate(self, mode, ids)
+  if not candidate then return true end
+  local prepared = self:prepare_projection(false, self.tree, {
+    descriptors = candidate.visible_columns,
+    render_cache = self.render_cache,
+  })
+  prepared.column_state = candidate
+  if not self:commit(prepared) then fail("buffer projection commit failed", 2) end
+  return true
 end
 
 function M:set_hidden_files(enabled)
@@ -238,12 +310,15 @@ function M:projection(tree)
   end)
 end
 
-function M:prepare_projection(validate, tree)
+function M:prepare_projection(validate, tree, opts)
   tree = tree or self.tree
+  opts = opts or {}
+  opts.validate = validate == true
+  opts.tree = tree
   local projection = self:projection(tree)
-  return self:prepare(projection, function(node) return self:display_name(node) end, {
-    validate = validate == true, tree = tree,
-  })
+  return self:prepare(
+    projection, function(node) return self:display_name(node) end, opts
+  )
 end
 
 function M:render(tree)
@@ -319,33 +394,57 @@ function M.decode(buffer, row_number, opts)
   return row.decode(buffer, row_number, get_line(buffer, row_number), opts)
 end
 
+local function copy_render_cache(source)
+  local copied = {}
+  for node_id, fields in pairs(source or {}) do
+    local copied_fields = {}
+    for id, field in pairs(fields) do copied_fields[id] = field end
+    copied[node_id] = copied_fields
+  end
+  return copied
+end
+
 function M.prepare(buffer, projection, render_path, opts)
   opts = opts or {}
   local tree = opts.tree or buffer.tree
-  local descriptors = buffer.visible_columns
+  local descriptors = opts.descriptors or buffer.visible_columns
+  local source_cache = opts.render_cache
+  if source_cache == nil then
+    source_cache = tree == buffer.tree and buffer.render_cache or {}
+  end
+  local candidate_cache = copy_render_cache(source_cache)
   local rendered, nodes = row.project_items(buffer, projection, render_path, tree)
   local widths = {}
   for index = 1, #descriptors do widths[index] = 0 end
   for _, item in ipairs(rendered) do
     local fields = {}
+    local cached = candidate_cache[item.node_id] or {}
+    candidate_cache[item.node_id] = cached
     for index, descriptor in ipairs(descriptors) do
-      local ctx = buffer:_column_context(
-        item.node, item.callback_entry, descriptor, index, index == #descriptors,
-        item.navigation_kind
-      )
-      local text, highlight, display_width = columns.render_text(
-        descriptor, item.callback_entry, ctx
-      )
-      fields[index] = {
-        text = text, highlight = highlight, display_width = display_width,
-      }
-      widths[index] = math.max(widths[index], display_width)
+      local field = cached[descriptor.id]
+      if not field then
+        local ctx = buffer:_column_context(
+          item.node, item.callback_entry, descriptor, index, index == #descriptors,
+          item.navigation_kind
+        )
+        local text, highlight, display_width = columns.render_text(
+          descriptor, item.callback_entry, ctx
+        )
+        field = {
+          text = text, highlight = highlight, display_width = display_width,
+        }
+        cached[descriptor.id] = field
+      end
+      fields[index] = field
+      widths[index] = math.max(widths[index], field.display_width)
     end
     item.fields = fields
   end
-  return row.prepare(buffer, projection, rendered, descriptors, widths, {
+  local prepared = row.prepare(buffer, projection, rendered, descriptors, widths, {
     validate = opts.validate, tree = tree, nodes = nodes,
   })
+  prepared.render_cache = candidate_cache
+  return prepared
 end
 
 function M.row_matches_identity(buffer, row_number, instance_id, node_id)
@@ -662,6 +761,10 @@ function M.commit(buffer, prepared)
   if not captured then cursor_snapshots = {} end
   local snapshot = snapshot(buffer)
   local previous_view = buffer.view or {}
+  local previous_render_cache = buffer.render_cache
+  local previous_hidden_columns = buffer.hidden_columns
+  local previous_visible_columns = buffer.visible_columns
+  local previous_visible_column_ids = buffer.visible_column_ids
   local ok, result = pcall(function()
     local previous_widths = previous_view.column_widths
     local current = vim.api.nvim_buf_get_lines(buffer.bufnr, 0, -1, false)
@@ -715,6 +818,13 @@ function M.commit(buffer, prepared)
         }
       )
     end
+    buffer.render_cache = prepared.render_cache or buffer.render_cache
+    if prepared.column_state then
+      buffer.hidden_columns = prepared.column_state.hidden_columns
+      buffer.visible_columns = prepared.column_state.visible_columns
+      buffer.visible_column_ids = prepared.column_state.visible_column_ids
+      buffer.marker_source.visible_columns = buffer.visible_columns
+    end
     buffer.view = {
       baseline = prepared.baseline,
       column_widths = prepared.column_widths,
@@ -740,6 +850,11 @@ function M.commit(buffer, prepared)
   if not ok or result == false then
     buffer.view = previous_view
     buffer.marker_source.view = buffer.view
+    buffer.render_cache = previous_render_cache
+    buffer.hidden_columns = previous_hidden_columns
+    buffer.visible_columns = previous_visible_columns
+    buffer.visible_column_ids = previous_visible_column_ids
+    buffer.marker_source.visible_columns = buffer.visible_columns
     local restore_ok, restore_err = pcall(restore, buffer, snapshot)
     if not restore_ok then
       error(tostring(result) .. "; rollback failed: " .. tostring(restore_err), 0)
