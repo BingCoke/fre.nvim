@@ -577,6 +577,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     tree.root = root
     tree.nodes_by_id = { [1] = root, [2] = a, [3] = b }
     tree.nodes_by_path = { [root.path] = root, [a.path] = a, [b.path] = b }
+    local node_width = #tostring(tree:latest_node_id())
     local fake = {
       id = "windows-prepare",
       bufnr = bufnr,
@@ -598,7 +599,7 @@ describe("fre ticket 10 prepare basic mutations", function()
       visible_nodes = { a, b },
     }
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
-      row.marker(fake.buffer, fake.id, a.id) .. "b.txt",
+      row.marker(fake.buffer, fake.id, a.id, node_width) .. "b.txt",
     })
     local plan = mutation_prepare.prepare(fake)
     assert.are.same({
@@ -613,7 +614,7 @@ describe("fre ticket 10 prepare basic mutations", function()
     fake.buffer.view.baseline[3] = nil
     fake.buffer.view.visible_nodes = { a }
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
-      row.marker(fake.buffer, fake.id, a.id) .. "a.txt",
+      row.marker(fake.buffer, fake.id, a.id, node_width) .. "a.txt",
     })
     plan = mutation_prepare.prepare(fake)
     assert.are.same({
