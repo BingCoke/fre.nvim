@@ -180,6 +180,10 @@ vim.api.nvim_create_autocmd("BufEnter", {
 | `toggle(ctx, opts)` | `{ layout? }` | 当前 tab 内严格切换显示/隐藏 |
 | `set_hidden_file(ctx, opts)` | `{ hidden_file = boolean }` | 明确设置点文件显示状态 |
 | `toggle_hidden_file(ctx)` | 无 | 切换点文件显示状态 |
+| `hide_columns(ctx, ids)` | string 数组 | 隐藏当前 Instance 的 column group |
+| `show_columns(ctx, ids)` | string 数组 | 显示当前 Instance 的 column group |
+| `toggle_columns(ctx, ids)` | string 数组 | 在 compact/detailed group 状态间切换 |
+| `is_column_visible(ctx, id)` | string ID | 查询当前 column 可见性 |
 | `refresh(ctx)` | 无 | 刷新；buffer modified 时会强制丢弃草稿 |
 | `select(ctx, opts)` | `{ target_winid?, hide_source?, instance? }` | 在精确目标 window 选择 |
 | `tab_select(ctx, opts)` | `{ hide_source?, instance? }` | 在新 tab 选择；API 名不是 `select_tab` |
@@ -188,7 +192,7 @@ vim.api.nvim_create_autocmd("BufEnter", {
 | `confirm(ctx, display, callback)` | 文本数组、回调 | 低层确认 UI |
 | `write(ctx)` | 无 | 完整 prepare/confirm/execute/reconcile 写入流程 |
 
-`opts.instance` 只会传给 directory child；调用方可以提供 `root` 和 `expanded`，但 action 会像覆盖 `expanded` 一样，用已选择目标拥有的 `root` 覆盖它们。file/symlink selection 传入 `opts.instance` 会报错。`hide_source` 默认为 `false`，只在选择成功提交后隐藏 source 所在 tab 中该 Instance 的全部 View。
+`opts.instance` 只会传给 directory destination。目标以 source 的完整 effective appearance 与当前 hidden 状态为基线，再按普通 Instance merge 规则应用显式覆盖；action 最后用所选目标拥有的 `root` 和 `expanded` 覆盖调用方值。source 创建后的 setup 变化不会泄漏到该 baseline，GC 则继续使用显式目标 policy 或当前 Manager 默认值。source 与 destination 是构建后互不同步的 independent peers。file/symlink selection 传入 `opts.instance` 会报错。`hide_source` 默认为 `false`，只在选择成功提交后隐藏 source 所在 tab 中该 Instance 的全部 View。
 
 内置默认映射只有 `<CR>`、`zv`、`zc`、`za`、`zM`、`q`、`g.` 和 `R`。下面关闭默认映射并显式配置一套日常使用所需的 actions，也展示 `tab_select` 和 float-safe `split_select`：
 

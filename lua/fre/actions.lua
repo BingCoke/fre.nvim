@@ -171,11 +171,11 @@ end
 
 local function child_options(instance, overrides, target)
   local result = config.copy(preflight_child_options(overrides))
-  if result.sort == nil then result.sort = instance:get_sort() end
-  if result.hidden_file == nil then result.hidden_file = instance:get_hidden_file() end
   result.expanded = config.copy(target.expanded or {})
   result.root = target.root
-  return result
+  return result, {
+    appearance_defaults = instance:_selection_appearance_snapshot(),
+  }
 end
 
 local function file_buffer(filename)
@@ -214,10 +214,10 @@ local function prepare_selection(instance, target, overrides)
     local bufnr, created = file_buffer(target.path)
     return { kind = "file", bufnr = bufnr, created = created }
   end
-  local options = child_options(instance, overrides, target)
+  local options, construction = child_options(instance, overrides, target)
   return {
     kind = "child",
-    child = require("fre").new(options),
+    child = require("fre").new(options, construction),
   }
 end
 

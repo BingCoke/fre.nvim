@@ -1314,15 +1314,17 @@ describe("fre ticket 17 actions and mappings", function()
     local before = vim.deepcopy(overrides)
     local original_new = fre.new
     local calls = {}
-    fre.new = function(options)
-      calls[#calls + 1] = options
-      return original_new(options)
+    fre.new = function(options, construction)
+      calls[#calls + 1] = { options = options, construction = construction }
+      return original_new(options, construction)
     end
 
     local ok, child = pcall(actions.select, ctx, { instance = overrides })
     fre.new = original_new
     assert.is_true(ok, tostring(child))
-    local passed = assert(calls[1])
+    local call = assert(calls[1])
+    local passed = call.options
+    local appearance = assert(call.construction.appearance_defaults)
 
     assert.are.equal(1, #calls)
     assert.are_not.equal(overrides, passed)
@@ -1336,6 +1338,15 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_false(passed.hidden_file)
     assert.are.equal(override_sort, passed.sort)
     assert.are.same(before.gc, passed.gc)
+    assert.are.equal(source_sort, appearance.sort)
+    assert.is_true(appearance.hidden_file)
+    for _, excluded in ipairs({
+      "root", "expanded", "gc", "id", "resolve_instance",
+      "fs_adapter", "watch_adapter", "mutation_adapter", "write_ui_adapter",
+      "manager", "instance", "tree", "view", "sync", "work",
+    }) do
+      assert.is_nil(appearance[excluded], excluded)
+    end
     assert.is_nil(passed.manager)
     assert.is_nil(passed.config)
     assert.is_nil(passed.metadata)
@@ -1383,10 +1394,11 @@ describe("fre ticket 17 actions and mappings", function()
       },
     })
     local original_new = fre.new
-    local passed
-    fre.new = function(options)
+    local passed, appearance
+    fre.new = function(options, construction)
       passed = options
-      return original_new(options)
+      appearance = construction.appearance_defaults
+      return original_new(options, construction)
     end
     local ok, child = pcall(actions.select, context_for(instance, "dir"))
     fre.new = original_new
@@ -1395,9 +1407,9 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.same({
       root = path.absolute(fixture:path("dir")),
       expanded = {},
-      sort = source_sort,
-      hidden_file = true,
     }, passed)
+    assert.are.equal(source_sort, appearance.sort)
+    assert.is_true(appearance.hidden_file)
     assert.are.equal(source_sort, child:get_sort())
     assert.is_true(child:get_hidden_file())
     assert.are.same({
@@ -1413,14 +1425,123 @@ describe("fre ticket 17 actions and mappings", function()
     assert.are.equal(instance, manager_module.default:find_by_group("project")[instance.id])
   end)
 
+  it("transfers complete source appearance without later setup leakage", function()
+    local function descriptor(id)
+      return columns.custom({
+        id = id,
+        render = function() return id:upper() end,
+        parse = function(suffix)
+          local value, rest = suffix:match("^(%S+)%s+(.*)$")
+          return value, rest
+        end,
+        equals = function() return true end,
+      })
+    end
+    local source_sort = function(_, left, right) return left.name > right.name end
+    local runtime_sort = function(_, left, right) return left.name < right.name end
+    local source_nested = { value = "source" }
+    local source_mapping = function() end
+    local configured = { descriptor("first"), descriptor("second") }
+    fre.setup({
+      default_file_explorer = false,
+      skip_confirm_for_simple_edits = true,
+      auto_expand_single_directory = true,
+      layout = { position = "left", size = 33 },
+      use_mapping_default = false,
+      mapping = { n = { x = source_mapping } },
+      buffer = {
+        options = { textwidth = 11 },
+        variables = { source_snapshot = source_nested },
+      },
+      window = { options = { cursorline = false, number = false } },
+    })
+    local instance = ready({ ["dir/child.txt"] = "x" }, {
+      sort = source_sort,
+      columns = configured,
+      hidden_columns = { "second" },
+    })
+    instance:set_sort(runtime_sort)
+    wait_for(function() return not instance.sync:is_full_refresh_busy() end)
+    instance:set_hidden_file(true)
+    local snapshot = instance:_selection_appearance_snapshot()
+    snapshot.hidden_columns = {}
+    snapshot.columns[1].id = "caller-mutated"
+    snapshot.buffer.variables.source_snapshot.value = "caller-mutated"
+    local fresh_snapshot = instance:_selection_appearance_snapshot()
+    assert.are.same({ "second" }, fresh_snapshot.hidden_columns)
+    assert.are.equal("first", fresh_snapshot.columns[1].id)
+    assert.are.same({ value = "source" },
+      fresh_snapshot.buffer.variables.source_snapshot)
+    instance:hide_columns({ "first" })
+
+    fre.setup({
+      default_file_explorer = false,
+      skip_confirm_for_simple_edits = false,
+      auto_expand_single_directory = false,
+      layout = { position = "right", size = 22 },
+      mapping = { n = { z = function() end } },
+      buffer = {
+        options = { textwidth = 99 },
+        variables = { leaked_from_later_setup = true },
+      },
+      window = { options = { cursorline = true, number = true } },
+    })
+    source_nested.value = "caller-mutated"
+    local explicit_nested = { value = "explicit" }
+    local explicit_mapping = function() end
+    local child = wait_ready(actions.select(context_for(instance, "dir"), {
+      instance = {
+        layout = { size = 20 },
+        mapping = { n = { y = explicit_mapping } },
+        buffer = {
+          options = { tabstop = 3 },
+          variables = { explicit_snapshot = explicit_nested },
+        },
+        window = { options = { cursorline = true } },
+      },
+    }))
+    explicit_nested.value = "caller-mutated"
+
+    assert.is_true(child:get_hidden_file())
+    assert.are.equal(runtime_sort, child:get_sort())
+    assert.are.same({ "first", "second" }, child:get_hidden_columns())
+    assert.are.same({ "first", "second" }, {
+      child:get_columns()[1].id, child:get_columns()[2].id,
+    })
+    assert.is_true(child.work.skip_confirm_for_simple_edits)
+    assert.is_true(child.sync.auto_expand_single_directory)
+    assert.are.same({ position = "left", size = 20 }, child.view.default_layout)
+
+    local maps = keymaps(child.bufnr, "n")
+    assert.is_not_nil(maps.x)
+    assert.is_not_nil(maps.y)
+    assert.is_nil(maps.z)
+    assert.is_nil(maps["<CR>"])
+    assert.are.equal(11, vim.bo[child.bufnr].textwidth)
+    assert.are.equal(3, vim.bo[child.bufnr].tabstop)
+    assert.are.same({ value = "source" }, vim.b[child.bufnr].source_snapshot)
+    assert.are.same({ value = "explicit" }, vim.b[child.bufnr].explicit_snapshot)
+    assert.is_nil(vim.b[child.bufnr].leaked_from_later_setup)
+    local child_win = vim.fn.bufwinid(child.bufnr)
+    assert.is_true(vim.api.nvim_get_option_value("cursorline", { win = child_win }))
+    assert.is_false(vim.api.nvim_get_option_value("number", { win = child_win }))
+
+    child:show_columns({ "first" })
+    assert.are.same({ "second" }, child:get_hidden_columns())
+    assert.are.same({ "first", "second" }, instance:get_hidden_columns())
+    instance:show_columns({ "second" })
+    assert.are.same({ "first" }, instance:get_hidden_columns())
+    assert.are.same({ "second" }, child:get_hidden_columns())
+  end)
+
   it("destroys a public-new child through its normal lifecycle after precommit failure", function()
     local instance = ready({ ["dir/child.txt"] = "x" })
     local ctx = context_for(instance, "dir")
     local original_new = fre.new
     local prepared
     local destroy_calls = 0
-    fre.new = function(options)
-      prepared = original_new(options)
+    fre.new = function(options, construction)
+      prepared = original_new(options, construction)
       local destroy = prepared.destroy
       prepared.destroy = function(self)
         destroy_calls = destroy_calls + 1

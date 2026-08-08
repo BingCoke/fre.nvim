@@ -152,6 +152,15 @@ Actions 提供 `hide_columns(ctx, ids)`、`show_columns(ctx, ids)`、`toggle_col
 固定 column group 使用普通 `function(ctx)` closure 绑定；Fre 不接受 string action names 或 partial-application 配置，也不安装默认 visibility mapping。上例的 group toggle 在任一目标 visible 时进入 compact 状态，在全部目标 hidden 时恢复 detailed 状态。
 
 
+## 目录选择中的 appearance
+
+对 directory entry 或本实例 `../` 执行 `select`、`tab_select` 或 `split_select` 时，destination Instance 以 source 的 effective appearance 快照为构建基线。快照包含当前 hidden-file policy、simple-edit confirmation、automatic single-directory expansion、comparator、configured descriptors、当前 hidden column IDs、layout、mapping controls/mappings、Buffer options/variables 和 window options。
+
+构建优先级是 source appearance baseline、显式 `opts.instance`，最后是 action-owned absolute `root` 与 retained root-relative `expanded`。显式 nested mapping、Buffer、window 和 layout 值继续使用普通 Instance merge 规则。source 创建后的 setup 变化不会改写其快照；GC policy 不在快照中，目标省略 `gc` 时使用当前 Manager policy。
+
+Snapshot 不转移 source identity、buffer number、adapters、Tree、Buffer、Views、同步/生命周期状态、Manager registration 或 callbacks。source 与 destination 是独立 peers；构建后任一方 hide/show columns、改变 sort、隐藏或销毁，都不会同步到另一方。
+
+
 ## Cursor 恢复
 
 Column visibility 提交前，Fre 会为显示该 Instance 的每个 View 记录当前 filesystem entry 与语义字段位置。提交后仍存在且 navigable 的字段保留字段内 display-cell offset；字段内容缩短时，位置会钳制到最后一个有效 UTF-8 character boundary。path 内的 cursor 同样保留 path display offset。

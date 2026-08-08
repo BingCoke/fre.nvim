@@ -137,6 +137,15 @@ function Instance:get_hidden_columns()
   return self.buffer:get_hidden_columns()
 end
 
+function Instance:_selection_appearance_snapshot()
+  local result = config.copy(self._selection_appearance)
+  result.hidden_file = self:get_hidden_file()
+  result.sort = self:get_sort()
+  result.columns = self:get_columns()
+  result.hidden_columns = self:get_hidden_columns()
+  return result
+end
+
 function Instance:is_column_visible(id)
   if type(id) ~= "string" then fail("column id must be a string", 2) end
   return self.buffer:is_column_visible(id)
@@ -583,6 +592,8 @@ local core_fields = {
   "columns",
   "hidden_columns",
   "layout",
+  "use_mapping_default",
+  "mapping",
   "buffer",
   "window",
 }
@@ -654,6 +665,15 @@ function Instance.new(options)
       if key ~= "fre" then vim.b[bufnr][key] = copy(value) end
     end
 
+    self._selection_appearance = config.copy({
+      skip_confirm_for_simple_edits = effective.skip_confirm_for_simple_edits,
+      auto_expand_single_directory = effective.auto_expand_single_directory,
+      layout = effective.layout,
+      use_mapping_default = effective.use_mapping_default,
+      mapping = effective.mapping,
+      buffer = effective.buffer,
+      window = effective.window,
+    })
     self.tree = Tree.new(root, id, effective.sort)
     self.buffer = buffer.new({
       id = id,

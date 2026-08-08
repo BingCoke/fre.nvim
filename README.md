@@ -150,7 +150,7 @@ Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末�
 
 | 按键 | 行为 |
 | --- | --- |
-| `<CR>` | 打开文件或 symlink；进入目录或选择 `../` 时创建独立实例，并传入普通的 `sort`/`hidden_file` 值选项；在根 `/` 上无操作 |
+| `<CR>` | 打开文件或 symlink；进入目录或选择 `../` 时以 source 的完整 effective appearance 创建独立 peer Instance；在根 `/` 上无操作 |
 | `zv` | 展开光标所在目录；非目录行无操作 |
 | `zc` | 折叠光标所在目录；非目录行无操作 |
 | `za` | 切换目录展开状态；非目录行无操作 |
@@ -380,27 +380,27 @@ actions.jump_to_path(ctx) -- 当前 entry/navigation 行的 path 字段起点
 actions.select(ctx, {
   target_winid = ctx.winid,
   hide_source = false,
-  instance = { gc = { group = "project" } }, -- 仅 directory child
+  instance = { gc = { group = "project" } }, -- 仅 directory destination
 })
 actions.tab_select(ctx, {
   hide_source = false,
-  instance = { gc = { group = "project" } }, -- 仅 directory child
+  instance = { gc = { group = "project" } }, -- 仅 directory destination
 })
 actions.split_select(ctx, {
   layout = { position = "right", size = 0.5 }, -- 必填 split layout
   anchor_winid = ctx.winid,
   hide_source = false,
-  instance = { gc = { group = "project" } }, -- 仅 directory child
+  instance = { gc = { group = "project" } }, -- 仅 directory destination
 })
 ```
 
-对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会统一调用 public `fre.new()` 创建一个由默认 Manager 管理的独立 peer Instance，并把当前 sort 和点文件显示状态作为普通值选项传入。source 与 destination 没有 parent/child 生命周期或 Manager affinity；销毁或隐藏 source 不会自动影响已提交的 destination。这里的 `opts.instance` 是新实例的普通值选项 table，不是 Instance 引用。进入目录时，目标目录下当前有效的展开路径会转换成新 root-relative 的 `expanded` 值；例如进入已展开的 `src` 时使用 `{ "x", "x/x" }`。选择 `../` 时固定使用空 `expanded`，因此刚离开的目录保持折叠，并在新实例 ready 后通过 `set_cursor_to_path()` 定位到它的条目。调用方可以提供 `opts.instance.root` 和 `opts.instance.expanded`，但 action 会用已选择目标拥有的 `root` 和计算出的 `expanded` 覆盖它们。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`actions.jump_to_path()` 只把 entry 或 navigation 行的 cursor 移到 path 字段；new、缺少 path range 或不可解析的行会静默忽略。它没有默认映射。
+对目录或本实例的 `../` 导航行执行 `select`/`tab_select`/`split_select` 时，Fre 会统一调用 public `fre.new()` 创建一个由默认 Manager 管理的独立 peer Instance。目标以 source 创建时的完整 effective appearance 和当前 hidden-file/column 状态为基线，包括 comparator、descriptors、layout、mapping controls、Buffer 与 window 选项；之后应用显式 `opts.instance`，最后由 action 覆盖所选 absolute `root` 和保留的 root-relative `expanded`。source 创建后的 setup 变化不会改写该基线；GC policy 不从 source 继承，仍按目标的显式 `gc` 或当前 Manager 默认值解析。source 与 destination 不共享生命周期、Manager affinity 或后续状态。进入目录时，目标目录下当前有效的展开路径会转换成新 root-relative 值，例如 `{ "x", "x/x" }`；选择 `../` 时固定使用空 `expanded`，并在目标 ready 后定位刚离开的目录。根目录的 `/` 和从其他实例粘贴的导航行均无操作。`actions.jump_to_path()` 只把 entry 或 navigation 行的 cursor 移到 path 字段；new、缺少 path range 或不可解析的行会静默忽略。它没有默认映射。
 
-三种 selection action 的 option table 都是 closed schema：`select` 只接受 `target_winid`、`hide_source`、`instance`；`tab_select` 只接受 `hide_source`、`instance`；`split_select` 必须提供 `layout`，此外只接受 `anchor_winid`、`hide_source`、`instance`。任何未列字段（包括 numeric key 和其他 non-string key）都会在 preflight 直接报错。`opts.instance` 仅用于 directory child；`root` 和 `expanded` 均由 action 持有并覆盖调用方值。
+三种 selection action 的 option table 都是 closed schema：`select` 只接受 `target_winid`、`hide_source`、`instance`；`tab_select` 只接受 `hide_source`、`instance`；`split_select` 必须提供 `layout`，此外只接受 `anchor_winid`、`hide_source`、`instance`。任何未列字段（包括 numeric key 和其他 non-string key）都会在 preflight 直接报错。`opts.instance` 仅用于 directory destination；`root` 和 `expanded` 均由 action 持有并覆盖调用方值。
 
-三种 selection action 共享相同的 source、Entry、resource preparation、buffer install commit、window policy、cursor、focus 和 post-commit `hide_source` 语义，只是 destination shape 不同：`select` 使用 exact `target_winid`，省略时是 captured `ctx.winid`；`tab_select` 创建一个 exact 新 tab；`split_select` 相对 exact ordinary anchor 创建目标。ordinary source 省略 `anchor_winid` 时只使用 captured source window；float source 必须显式提供同 tab 的 ordinary anchor，通常直接使用 `ctx.view.origin_winid`。无效 option/source/target/anchor/layout 会在 destination、file buffer 或 child Instance 创建前报错，不会从当前焦点或其他窗口 fallback。
+三种 selection action 共享相同的 source、Entry、resource preparation、buffer install commit、window policy、cursor、focus 和 post-commit `hide_source` 语义，只是 destination shape 不同：`select` 使用 exact `target_winid`，省略时是 captured `ctx.winid`；`tab_select` 创建一个 exact 新 tab；`split_select` 相对 exact ordinary anchor 创建目标。ordinary source 省略 `anchor_winid` 时只使用 captured source window；float source 必须显式提供同 tab 的 ordinary anchor，通常直接使用 `ctx.view.origin_winid`。无效 option/source/target/anchor/layout 会在 destination、file buffer 或 destination Instance 创建前报错，不会从当前焦点或其他窗口 fallback。
 
-`hide_source` 必须是 boolean，默认 `false`。它只在 selected buffer 成功安装后，隐藏 captured source tab 中该 source Instance 的全部实际 View；不会影响其他 tab。file/symlink 安装后 destination 是 ordinary file window，原 View 因窗口不再显示 Fre buffer 而自然消失。directory child buffer 安装后立即成为 exact destination 的 View；窗口原有 policy 会保留，ordinary target 会建立 current-position restore policy，action-created tab/split 使用 close-on-hide policy。parent/child/file 的原生 back/forward 都从实际 buffer 状态解析，不做 ownership transfer。child 的异步 load failure 保留已提交 destination，不恢复 parent。
+`hide_source` 必须是 boolean，默认 `false`。它只在 selected buffer 成功安装后，隐藏 captured source tab 中该 source Instance 的全部实际 View；不会影响其他 tab。file/symlink 安装后 destination 是 ordinary file window，原 View 因窗口不再显示 Fre buffer 而自然消失。directory destination buffer 安装后立即成为 exact destination 的 View；窗口原有 policy 会保留，ordinary target 会建立 current-position restore policy，action-created tab/split 使用 close-on-hide policy。原生 back/forward 始终从实际 buffer 状态解析，不做 ownership transfer。destination 的异步 load failure 保留已提交结果，不恢复 source。
 
 ## 列
 

@@ -17,8 +17,8 @@ function M.setup(opts)
   manager_module.default:setup(opts)
 end
 
-function M.new(opts)
-  return manager_module.default:create_instance(opts)
+function M.new(opts, construction)
+  return manager_module.default:create_instance(opts, construction)
 end
 
 function M.get_instance(bufnr)

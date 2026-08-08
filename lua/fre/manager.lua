@@ -119,7 +119,7 @@ function Manager.new(opts)
   return self
 end
 
-function Manager:create_instance(opts)
+function Manager:create_instance(opts, construction)
   if type(opts) ~= "table" then error("fre: new options must be a table", 2) end
   if opts.root == nil then error("fre: root is required", 2) end
   if type(opts.root) ~= "string" then error("fre: root must be a string", 2) end
@@ -127,7 +127,10 @@ function Manager:create_instance(opts)
 
   if opts.id ~= nil then error("fre: managed instances do not accept id", 2) end
   local root = require("fre.path").absolute(opts.root)
-  local effective, policy = self:resolve_instance_config(opts, root)
+  local appearance_defaults = construction and construction.appearance_defaults or nil
+  local effective, policy = self:resolve_instance_config(
+    opts, root, appearance_defaults
+  )
   local core_options = config.copy(effective)
   core_options.root = root
   core_options.id = identity.new()
@@ -244,12 +247,14 @@ function Manager:setup(opts)
   return self:get_setup_defaults()
 end
 
-function Manager:resolve_instance_config(opts, normalized_root)
+function Manager:resolve_instance_config(opts, normalized_root, appearance_defaults)
   opts = opts or {}
   if type(opts) ~= "table" then error("fre.config: new options must be a table", 2) end
   local policy = self._gc:resolve_policy(opts.gc)
   local core_opts = copy_without(opts, { gc = true })
-  local effective = config.resolve_instance(self._setup_defaults, core_opts, normalized_root)
+  local effective = config.resolve_instance(
+    appearance_defaults or self._setup_defaults, core_opts, normalized_root
+  )
   return effective, policy
 end
 
