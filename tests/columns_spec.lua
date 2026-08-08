@@ -192,6 +192,28 @@ describe("fre columns", function()
     end)
   end)
 
+  it("normalizes descriptor enable without evaluating predicates", function()
+    local calls = 0
+    local predicate = function() calls = calls + 1; return true end
+    local function custom(enable)
+      return columns.custom({
+        id = "enabled",
+        enable = enable,
+        render = function() return "x" end,
+        parse = function(suffix) return "x", suffix:sub(3) end,
+        equals = function() return true end,
+      })
+    end
+
+    assert.is_true(custom(nil).enable)
+    assert.is_false(custom(false).enable)
+    assert.are.equal(predicate, custom(predicate).enable)
+    assert.are.equal(0, calls)
+    for _, invalid in ipairs({ 0, "yes", {}, coroutine.create(function() end) }) do
+      error_contains("enable must be a boolean or function", function() custom(invalid) end)
+    end
+  end)
+
   it("rejects invalid renderer values, controls, and UTF-8", function()
     local function custom(render)
       return columns.custom({

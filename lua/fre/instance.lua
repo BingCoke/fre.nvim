@@ -129,6 +129,19 @@ function Instance:get_hidden_file()
   return self.buffer:hidden_files()
 end
 
+function Instance:get_columns()
+  return self.buffer:get_columns()
+end
+
+function Instance:get_hidden_columns()
+  return self.buffer:get_hidden_columns()
+end
+
+function Instance:is_column_visible(id)
+  if type(id) ~= "string" then fail("column id must be a string", 2) end
+  return self.buffer:is_column_visible(id)
+end
+
 function Instance:get_expanded_paths()
   return self.tree:active_expanded_paths()
 end
@@ -529,6 +542,7 @@ local core_fields = {
   "sort",
   "expanded",
   "columns",
+  "hidden_columns",
   "layout",
   "buffer",
   "window",
@@ -607,6 +621,7 @@ function Instance.new(options)
       root = root,
       bufnr = bufnr,
       columns = effective.columns,
+      hidden_columns = effective.hidden_columns,
       tree = self.tree,
       lifecycle = self.lifecycle,
       hidden_file = effective.hidden_file,

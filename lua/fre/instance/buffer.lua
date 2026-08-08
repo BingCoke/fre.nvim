@@ -1,3 +1,4 @@
+local columns = require("fre.columns")
 local row = require("fre.instance.row")
 local path = require("fre.path")
 local window = require("fre.window")
@@ -12,14 +13,16 @@ local M = {}
 Buffer.__index = M
 setmetatable(M, { __index = Buffer })
 
-local function marker_column_context(source, node, entry, descriptor, index, is_last)
+local function marker_column_context(
+    source, node, entry, descriptor, index, is_last, navigation_kind
+)
   local mtime = node.mtime
   if type(mtime) == "table" then
     mtime = { sec = tonumber(mtime.sec) or 0, nsec = tonumber(mtime.nsec) or 0 }
   else
     mtime = { sec = tonumber(mtime) or 0, nsec = 0 }
   end
-  return {
+  local context = {
     entry = entry, descriptor = descriptor, config = descriptor,
     column_index = index, is_last = is_last,
     instance = { id = source.id, bufnr = source.bufnr, root = source.root },
@@ -28,6 +31,12 @@ local function marker_column_context(source, node, entry, descriptor, index, is_
       size = node.stat and tonumber(node.stat.size) or nil, mtime = mtime,
     },
   }
+  if navigation_kind then
+    context.synthetic = true
+    context.navigation_kind = navigation_kind
+    context.metadata = { kind = "directory", mode = nil, size = nil, mtime = nil }
+  end
+  return context
 end
 
 local function marker_tree_contract(tree)
@@ -39,13 +48,58 @@ local function marker_tree_contract(tree)
   }
 end
 
+local function resolve_columns(configured, requested_hidden)
+  configured = vim.deepcopy(configured or {})
+  local enabled = {}
+  for _, descriptor in ipairs(configured) do
+    local value = descriptor.enable
+    if type(value) == "function" then
+      local ok, result = pcall(value)
+      if not ok then
+        fail(
+          "enable predicate for column " .. descriptor.id
+            .. " failed: " .. tostring(result), 3
+        )
+      end
+      if type(result) ~= "boolean" then
+        fail(
+          "enable predicate for column " .. descriptor.id
+            .. " must return a boolean", 3
+        )
+      end
+      value = result
+    end
+    if value then enabled[#enabled + 1] = descriptor end
+  end
+
+  local requested = {}
+  for _, id in ipairs(requested_hidden or {}) do requested[id] = true end
+  local hidden, visible, visible_ids = {}, {}, {}
+  for _, descriptor in ipairs(enabled) do
+    if requested[descriptor.id] then
+      hidden[#hidden + 1] = descriptor.id
+    else
+      visible[#visible + 1] = descriptor
+      visible_ids[descriptor.id] = true
+    end
+  end
+  return configured, enabled, hidden, visible, visible_ids
+end
+
 function Buffer.new(options)
   if type(options) ~= "table" then fail("buffer options are required", 2) end
+  local configured, enabled, hidden, visible, visible_ids = resolve_columns(
+    options.columns, options.hidden_columns
+  )
   local self = setmetatable({
     id = options.id,
     root = options.root,
     bufnr = options.bufnr,
-    columns = vim.deepcopy(options.columns or {}),
+    configured_columns = configured,
+    enabled_columns = enabled,
+    hidden_columns = hidden,
+    visible_columns = visible,
+    visible_column_ids = visible_ids,
     tree = assert(options.tree),
     lifecycle = assert(options.lifecycle),
     _resolve_marker_source = options.resolve_marker_source,
@@ -60,7 +114,7 @@ function Buffer.new(options)
     id = self.id,
     root = self.root,
     bufnr = self.bufnr,
-    columns = self.columns,
+    visible_columns = self.visible_columns,
     tree = marker_tree_contract(self.tree),
     view = self.view,
     _column_context = marker_column_context,
@@ -90,6 +144,18 @@ end
 
 function M:hidden_files()
   return self.hidden_file
+end
+
+function M:get_columns()
+  return vim.deepcopy(self.configured_columns)
+end
+
+function M:get_hidden_columns()
+  return vim.deepcopy(self.hidden_columns)
+end
+
+function M:is_column_visible(id)
+  return self.visible_column_ids[id] == true
 end
 
 function M:set_hidden_files(enabled)
@@ -128,8 +194,10 @@ function M:position(node)
   return { row_number, decoded.path_range.start_byte }
 end
 
-function M:_column_context(node, entry, descriptor, index, is_last)
-  return marker_column_context(self, node, entry, descriptor, index, is_last)
+function M:_column_context(node, entry, descriptor, index, is_last, navigation_kind)
+  return marker_column_context(
+    self, node, entry, descriptor, index, is_last, navigation_kind
+  )
 end
 
 function M:replace_lines(first, last, lines)
@@ -252,7 +320,32 @@ function M.decode(buffer, row_number, opts)
 end
 
 function M.prepare(buffer, projection, render_path, opts)
-  return row.prepare(buffer, projection, render_path, opts)
+  opts = opts or {}
+  local tree = opts.tree or buffer.tree
+  local descriptors = buffer.visible_columns
+  local rendered, nodes = row.project_items(buffer, projection, render_path, tree)
+  local widths = {}
+  for index = 1, #descriptors do widths[index] = 0 end
+  for _, item in ipairs(rendered) do
+    local fields = {}
+    for index, descriptor in ipairs(descriptors) do
+      local ctx = buffer:_column_context(
+        item.node, item.callback_entry, descriptor, index, index == #descriptors,
+        item.navigation_kind
+      )
+      local text, highlight, display_width = columns.render_text(
+        descriptor, item.callback_entry, ctx
+      )
+      fields[index] = {
+        text = text, highlight = highlight, display_width = display_width,
+      }
+      widths[index] = math.max(widths[index], display_width)
+    end
+    item.fields = fields
+  end
+  return row.prepare(buffer, projection, rendered, descriptors, widths, {
+    validate = opts.validate, tree = tree, nodes = nodes,
+  })
 end
 
 function M.row_matches_identity(buffer, row_number, instance_id, node_id)

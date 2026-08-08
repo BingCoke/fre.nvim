@@ -185,6 +185,7 @@ fre.setup({
       align = "right",
     }),
   },
+  hidden_columns = {},
 
   layout = {
     position = "left",
@@ -246,6 +247,7 @@ fre.setup({
 | `auto_expand_single_directory` | `false` | 展开目录并完成新扫描后，仅当扫描结果只有一个直接子项且它是当前可见的真实目录时才自动继续展开 |
 | `sort` | 目录优先、ASCII 不区分大小写名称排序 | 每个父目录独立调用的比较函数 |
 | `columns` | icon、permissions、size、mtime | 完整替换列描述符序列；path 始终是最后的专用字段 |
+| `hidden_columns` | `{}` | 完整替换初始 hidden column ID 数组 |
 | `gc.ttl_ms` | `60000` | 隐藏实例的回收延迟；`0` 禁用 TTL 回收 |
 | `gc.include_modified` | `false` | 是否允许 GC 销毁带未保存修改的隐藏实例 |
 | `gc.default_group` | `"default"` | 新实例默认 GC 组；仅 setup 可用 |
@@ -278,6 +280,7 @@ local instance = require("fre").new({
   sort = custom_sort,
   expanded = { "src", "src/x" }, -- 相对于 root 的初始展开目录
   columns = custom_columns,
+  hidden_columns = { "size", "mtime" },
   gc = {
     group = "project",
     ttl_ms = 30_000,
@@ -292,6 +295,8 @@ local instance = require("fre").new({
 ```
 
 实例选项覆盖 setup 默认值。每个实例完全由本次传入的值选项决定；`expanded` 是 root-relative 目录列表，会按 root 的平台路径语义规范化，并在 root 加载后通过普通展开流程逐项应用。`auto_expand_single_directory = true` 时，每次新展开都会等待该目录的新扫描完成；仅当整个扫描结果恰好只有一个直接子项、该子项是真实目录且符合当前 `hidden_file` 设置时，才展开它并重复。任何文件、symlink 或隐藏兄弟项都会使子项总数不再为一，即使该项不会投影；唯一子项是文件或 symlink 时也不会继续，且不会跟随 symlink。唯一子项是隐藏目录时，仅在 `hidden_file = true` 时继续。遇到其他情况、扫描错误或手动折叠时停止。全部初始展开及其自动后缀完成后实例才 ready；路径缺失、不是目录或加载失败都会使本次初始化失败。`fre.new()` 不接受来源实例或实例引用，也不会在实例之间建立状态关系。`default_file_explorer`、`gc.groups` 和 `gc.default_group` 是 setup-only 配置，不能传给 `fre.new()`。
+
+`columns` 和 `hidden_columns` 都使用完整替换语义；Instance 显式传入空 `hidden_columns = {}` 会清除 setup 默认值。descriptor `enable`、hidden ID 校验和可见性状态详见 [COLUMNS.md](COLUMNS.md)。
 
 ## 窗口布局
 
@@ -395,80 +400,9 @@ actions.split_select(ctx, {
 
 ## 列
 
-内置列构造器：
+内置构造器是 `columns.icon()`、`columns.permissions()`、`columns.size()` 和 `columns.mtime()`；默认 configured 顺序也是 icon、permissions、size、mtime。filesystem path 始终是最后的专用字段，不属于 column 可见性模型。
 
-```lua
-local columns = require("fre.columns")
-
-columns.icon() -- 默认 provider = "auto"
-columns.icon({ provider = "ascii", align = "left" })
-columns.permissions({ align = "left" })
-columns.size({ align = "right" })
-columns.mtime({ format = "%Y-%m-%d", align = "right" })
-```
-
-`columns.icon()` 会在构造 descriptor 时自动尝试 `nvim-web-devicons`。可用时，普通文件使用其扩展名/文件名 glyph 和 `DevIcon*` highlight；目录使用 `` 与 `FreDirectoryIcon`，symlink 使用 `` 与 `FreSymlinkIcon`。依赖不可用时自动回退到无字体要求的 `d/f/l`。在内置 provider、ASCII 模式及自定义 provider 返回 `nil` 的回退路径中，不支持的 filesystem kind 显示 `?` 与 `FreUnsupportedIcon`；自定义 provider 也可以显式处理该 kind。显式设置 `provider = "nvim-web-devicons"` 会在依赖不可用时报错；`provider = false` 或 `"ascii"` 可强制使用 ASCII。
-
-使用 glyph 时需要终端和 Neovim 字体支持 Nerd Font。目录、symlink 和不支持类型的颜色默认跟随 colorscheme 的 `Directory`、`Special` 与 `DiagnosticWarn`，文件颜色由 `nvim-web-devicons` 的 `DevIcon*` 组提供。可覆盖 Fre 的组，并在切换 colorscheme 后重新应用：
-
-```lua
-local function set_fre_icon_highlights()
-  vim.api.nvim_set_hl(0, "FreDirectoryIcon", { fg = "#7aa2f7" })
-  vim.api.nvim_set_hl(0, "FreSymlinkIcon", { fg = "#bb9af7" })
-  vim.api.nvim_set_hl(0, "FreUnsupportedIcon", { fg = "#e0af68" })
-end
-
-set_fre_icon_highlights()
-vim.api.nvim_create_autocmd("ColorScheme", {
-  callback = set_fre_icon_highlights,
-})
-```
-
-也可以传入自己的 provider；它接收当前 snapshot `Entry` 和 column context，返回 `icon, highlight`，返回 `nil` 时回退为 ASCII：
-
-```lua
-columns.icon({
-  provider = function(entry, ctx)
-    return entry.kind == "directory" and "D" or "F", "DiagnosticInfo"
-  end,
-})
-```
-
-路径高亮默认遵循 Oil 的语义：普通目录和根导航 `/` 使用 `FreDirectoryPath`（链接到 `Directory`），父导航 `../`、隐藏文件、隐藏目录以及隐藏目录下的后代路径使用 `FreHiddenPath`（链接到 `Comment`）；普通文件保持 colorscheme 的默认文本色。两个组都可以覆盖：
-
-```lua
-vim.api.nvim_set_hl(0, "FreDirectoryPath", { fg = "#7aa2f7" })
-vim.api.nvim_set_hl(0, "FreHiddenPath", { fg = "#6b7280" })
-```
-
-默认可见顺序是 `icon -> permissions -> size -> mtime -> path`。`size` 使用 `lstat.size` 和十进制单位：`999`、`1.0k`、`1.0M`、`1.0G`；目录显示自身元数据而非递归总量，symlink 显示 link 对象本身的大小，缺失值显示 `-`。
-
-列是 buffer 中真实、可选择和可 yank 的文本，但语义只读。Fre 允许把元数据修改保留为草稿，直到写入准备阶段重新解析并按行号、列 ID 验证；复制或移动带 marker 的行时，Fre 会为新位置增量恢复对应的 highlight。导航行使用相同列序和投影宽度；custom callback 会收到 `ctx.synthetic = true`、`ctx.navigation_kind` 以及代表 `..` 或 `/` 的 callback-only directory Entry，但 `instance:get_entry(1)` 仍返回 `nil`。
-
-自定义列必须提供唯一 `id`、对齐方式和 render/parse/equals 契约：
-
-```lua
-columns.custom({
-  id = "kind_name",
-  align = "left",
-  metadata = { "kind" },
-  render = function(entry)
-    return entry.kind, "Comment"
-  end,
-  parse = function(suffix)
-    local value, rest = suffix:match("^%s*(%S+)%s+(.*)$")
-    if not value then
-      error("malformed kind_name column")
-    end
-    return value, rest
-  end,
-  equals = function(entry, value)
-    return entry.kind == value
-  end,
-})
-```
-
-`metadata` 只支持 `kind`、`mode`、`size`、`mtime`。`render` 可以返回文本和可选 highlight group；文本必须是无控制字符的有效 UTF-8。每次投影会先渲染所有行并测量各列，再按 `align = "left" | "center" | "right"` 统一填充；自定义列宽可随内容增长或收缩，path 始终是最后的无界字段。列宽变化时，Fre 按字段和内容偏移恢复光标，不会把原本位于内容上的光标移入对齐空格。
+Descriptor `enable`、`hidden_columns`、configured/enabled/hidden/visible 状态、custom descriptor 契约和公开查询的完整说明见 [COLUMNS.md](COLUMNS.md)。
 
 ## Lua API
 
@@ -529,6 +463,10 @@ instance:reveal(path)
 instance:set_sort(compare)
 instance:set_hidden_file(boolean)
 instance:toggle_hidden_file()
+
+instance:get_columns()
+instance:get_hidden_columns()
+instance:is_column_visible(id)
 
 require("fre").set_group(instance, group)
 

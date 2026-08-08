@@ -42,6 +42,7 @@ describe("fre configuration", function()
       defaults.columns[4].id,
     })
     assert.are.equal("%Y-%m-%d %H:%M", defaults.columns[4].format)
+    assert.are.same({}, defaults.hidden_columns)
     assert.is_nil(defaults.gc)
     assert.are.same({
       ttl_ms = 60000, include_modified = false, default_group = "default",
@@ -241,6 +242,42 @@ describe("fre configuration", function()
     assert.are.equal(setup_y, effective.mapping.n.y)
     assert.are.equal(noop, effective.mapping.v.x)
     assert.are.same({ replaced = false }, effective.buffer.variables.nested)
+  end)
+
+  it("replaces and validates hidden column IDs against configured columns", function()
+    local manager = new_manager()
+    manager:setup({
+      columns = { custom_column("first"), custom_column("second") },
+      hidden_columns = { "first" },
+    })
+
+    assert.are.same({ "first" }, manager:get_setup_defaults().hidden_columns)
+    assert.are.same({ "first" }, manager:resolve_instance_config().hidden_columns)
+    assert.are.same({}, manager:resolve_instance_config({
+      hidden_columns = {},
+    }).hidden_columns)
+    assert.are.same({ "second" }, manager:resolve_instance_config({
+      hidden_columns = { "second" },
+    }).hidden_columns)
+
+    local invalid = {
+      "first",
+      { [1] = "first", [3] = "second" },
+      { "first", 2 },
+      { "first", "first" },
+      { "unknown" },
+    }
+    for _, hidden_columns in ipairs(invalid) do
+      assert.has_error(function()
+        manager:resolve_instance_config({ hidden_columns = hidden_columns })
+      end)
+    end
+    assert_error_contains("unknown column id first", function()
+      manager:resolve_instance_config({ columns = { custom_column("replacement") } })
+    end)
+    assert_error_contains("unknown column id path", function()
+      manager:setup({ hidden_columns = { "path" } })
+    end)
   end)
 
   it("keeps setup inputs, returned defaults, mappings, and effective snapshots independent", function()

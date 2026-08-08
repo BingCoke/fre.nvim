@@ -71,6 +71,10 @@ local function validate_descriptor(descriptor, name)
   if type(descriptor.navigable) ~= "boolean" then
     fail(name .. ".navigable must be a boolean", 4)
   end
+  if descriptor.enable == nil then descriptor.enable = true end
+  if type(descriptor.enable) ~= "boolean" and type(descriptor.enable) ~= "function" then
+    fail(name .. ".enable must be a boolean or function", 4)
+  end
   if type(descriptor.render) ~= "function" then
     fail(name .. ".render must be a function", 4)
   end

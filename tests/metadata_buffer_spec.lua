@@ -162,6 +162,112 @@ describe("fre metadata buffer rows", function()
     assert.are.equal("LEFT MID RIGHT bbbbb.txt", second_suffix)
   end)
 
+  it("constructs stable visible column state and exposes defensive queries", function()
+    local enable_order = {}
+    local render_calls = {}
+    local function descriptor(id, enabled, text, literal)
+      local enable = enabled
+      if not literal then
+        enable = function()
+          enable_order[#enable_order + 1] = id
+          return enabled
+        end
+      end
+      return columns.custom({
+        id = id,
+        enable = enable,
+        data = { source = id },
+        render = function()
+          render_calls[id] = (render_calls[id] or 0) + 1
+          return text
+        end,
+        parse = function(suffix)
+          local value, rest = suffix:match("^(%S+)%s+(.*)$")
+          return value, rest
+        end,
+        equals = function() return true end,
+      })
+    end
+    local configured = {
+      descriptor("visible", true, "VISIBLE"),
+      descriptor("disabled", false, "DISABLED"),
+      descriptor("literal_disabled", false, "LITERAL_DISABLED", true),
+      descriptor("hidden", true, "HIDDEN"),
+      descriptor("path", true, "CUSTOM_PATH"),
+    }
+    local opts = {
+      columns = configured,
+      hidden_columns = { "hidden", "disabled", "literal_disabled", "path" },
+    }
+    local instance = ready({ ["a.txt"] = "a" }, opts)
+    ready({ ["a.txt"] = "a" }, opts)
+
+    assert.are.same({
+      "visible", "disabled", "hidden", "path",
+      "visible", "disabled", "hidden", "path",
+    }, enable_order)
+    assert.are.equal(4, render_calls.visible)
+    assert.is_nil(render_calls.disabled)
+    assert.is_nil(render_calls.literal_disabled)
+    assert.is_nil(render_calls.hidden)
+    assert.is_nil(render_calls.path)
+
+    local queried = instance:get_columns()
+    assert.are.same({
+      "visible", "disabled", "literal_disabled", "hidden", "path",
+    }, {
+      queried[1].id, queried[2].id, queried[3].id, queried[4].id, queried[5].id,
+    })
+    assert.are.same({ "hidden", "path" }, instance:get_hidden_columns())
+    assert.is_true(instance:is_column_visible("visible"))
+    assert.is_false(instance:is_column_visible("disabled"))
+    assert.is_false(instance:is_column_visible("literal_disabled"))
+    assert.is_false(instance:is_column_visible("hidden"))
+    assert.is_false(instance:is_column_visible("path"))
+    assert.is_false(instance:is_column_visible("unknown"))
+    assert.has_error(function() instance:is_column_visible(1) end)
+
+    queried[1].id = "changed"
+    queried[1].data.source = "changed"
+    local hidden = instance:get_hidden_columns()
+    hidden[1] = "changed"
+    local fresh = instance:get_columns()
+    assert.are.equal("visible", fresh[1].id)
+    assert.are.equal("visible", fresh[1].data.source)
+    assert.are.same({ "hidden", "path" }, instance:get_hidden_columns())
+
+    local line = lines(instance)[row_for(instance, "a.txt")]
+    assert.is_truthy(line:find("VISIBLE", 1, true))
+    assert.is_truthy(line:find("a.txt", 1, true))
+    assert.is_nil(line:find("HIDDEN", 1, true))
+    assert.is_nil(line:find("LITERAL_DISABLED", 1, true))
+    assert.is_nil(line:find("CUSTOM_PATH", 1, true))
+  end)
+
+  it("identifies descriptor enable predicate failures during construction", function()
+    local function broken(id, enable)
+      return columns.custom({
+        id = id,
+        enable = enable,
+        render = function() return "x" end,
+        parse = function(suffix) return "x", suffix:sub(3) end,
+        equals = function() return true end,
+      })
+    end
+    local cases = {
+      broken("throws", function() error("injected enable failure") end),
+      broken("non_boolean", function() return "yes" end),
+    }
+    for _, descriptor_value in ipairs(cases) do
+      local ok, err = pcall(fre.new, {
+        root = fixture.root,
+        columns = { descriptor_value },
+      })
+      assert.is_false(ok)
+      assert.is_truthy(tostring(err):find(descriptor_value.id, 1, true), tostring(err))
+    end
+  end)
+
   it("renders Oil-like directory and hidden path highlights", function()
     local instance = ready({
       [".env"] = "x",
@@ -278,7 +384,9 @@ describe("fre metadata buffer rows", function()
       },
       report_async_error = function() end,
     })
-    local prepared = row.prepare(fake, { nodes = { node } }, function() return "plain.txt" end)
+    local prepared = fake:prepare(
+      { nodes = { node } }, function() return "plain.txt" end
+    )
     fake.view = prepared
     local template = assert(prepared.row_templates[node.id])
     local edited_path = "visible\\.hidden\\file.txt"

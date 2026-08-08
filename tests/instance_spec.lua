@@ -91,6 +91,33 @@ describe("fre async hidden instances", function()
     wait_for(function() return instance:is_ready() end)
   end)
 
+  it("applies setup and instance hidden column replacement during construction", function()
+    local manager = manager_module.new()
+    manager:setup({ hidden_columns = { "size" } })
+    local inherited = keep(manager:create_instance({ root = fixture.root }))
+    local cleared = keep(manager:create_instance({
+      root = fixture.root, hidden_columns = {},
+    }))
+    local replaced = keep(manager:create_instance({
+      root = fixture.root, hidden_columns = { "mtime" },
+    }))
+
+    assert.are.same({ "size" }, inherited:get_hidden_columns())
+    assert.are.same({}, cleared:get_hidden_columns())
+    assert.are.same({ "mtime" }, replaced:get_hidden_columns())
+    assert.is_false(inherited:is_column_visible("size"))
+    assert.is_true(cleared:is_column_visible("size"))
+    assert.is_false(replaced:is_column_visible("mtime"))
+    assert.has_error(function()
+      manager:create_instance({
+        root = fixture.root, hidden_columns = { "unknown" },
+      })
+    end)
+    wait_for(function()
+      return inherited:is_ready() and cleared:is_ready() and replaced:is_ready()
+    end)
+  end)
+
   it("sets a window cursor to a snapshot path after readiness", function()
     local pending
     fre._set_fs_adapter({
@@ -372,7 +399,7 @@ describe("fre async hidden instances", function()
     }, vim.b[instance.bufnr].fre)
     assert.is_nil(rawget(instance, "config"))
     assert.is_nil(rawget(instance.buffer, "config"))
-    assert.is_table(instance.buffer.columns)
+    assert.is_table(instance:get_columns())
     assert.is_nil(rawget(instance.buffer, "buffer_options"))
     assert.is_nil(rawget(instance.buffer, "buffer_variables"))
     assert.is_nil(rawget(instance.buffer, "mapping"))
@@ -429,7 +456,8 @@ describe("fre async hidden instances", function()
     assert.are.equal(mutation_adapter, instance.work.mutation_adapter)
     assert.are.equal(write_ui_adapter, instance.work.write_ui_adapter)
     assert.are.same({ "dir" }, rawget(instance.sync, "expanded"))
-    assert.are_not.equal(effective.columns, instance.buffer.columns)
+    local owned_columns = instance:get_columns()
+    assert.are_not.equal(effective.columns, owned_columns)
     assert.are_not.equal(effective.layout, instance.view.default_layout)
     assert.are_not.equal(effective.window.options, instance.view.window_options)
     assert.is_nil(rawget(instance.buffer, "buffer_options"))
@@ -443,7 +471,7 @@ describe("fre async hidden instances", function()
     effective.window.options.wrap = true
     caller_owned.nested.value = 2
     assert.are.same({ "dir" }, rawget(instance.sync, "expanded"))
-    assert.is_not_nil(instance.buffer.columns[1])
+    assert.is_not_nil(instance:get_columns()[1])
     assert.are_not.equal(99, instance.view.default_layout.size)
     assert.is_false(instance.view.window_options.wrap)
     assert.are.same({ value = 1 }, vim.b[instance.bufnr].retained_only_in_nvim)

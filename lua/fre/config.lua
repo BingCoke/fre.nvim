@@ -59,6 +59,7 @@ local function builtins()
       columns.size(),
       columns.mtime({ format = "%Y-%m-%d %H:%M" }),
     },
+    hidden_columns = {},
     layout = {
       position = "left",
       size = 40,
@@ -255,6 +256,21 @@ local function validate_columns(value, path)
   if not ok then fail(tostring(err):gsub("^fre%.columns:%s*", ""), 4) end
 end
 
+local function validate_hidden_columns(value, path, descriptors)
+  local length = sequence_length(value, path)
+  local configured = {}
+  for _, descriptor in ipairs(descriptors) do configured[descriptor.id] = true end
+  local seen = {}
+  for index = 1, length do
+    local item_path = path .. "[" .. index .. "]"
+    local id = value[index]
+    expect_type(id, "string", item_path)
+    if seen[id] then fail(path .. " contains duplicate column id " .. id) end
+    if not configured[id] then fail(path .. " contains unknown column id " .. id) end
+    seen[id] = true
+  end
+end
+
 local function validate_buffer(value, path)
   expect_table(value, path)
   check_known_keys(value, { options = true, variables = true }, path)
@@ -285,6 +301,7 @@ local setup_fields = {
   auto_expand_single_directory = true,
   sort = true,
   columns = true,
+  hidden_columns = true,
   layout = true,
   use_mapping_default = true,
   mapping = true,
@@ -300,6 +317,7 @@ local new_fields = {
   sort = true,
   expanded = true,
   columns = true,
+  hidden_columns = true,
   layout = true,
   use_mapping_default = true,
   mapping = true,
@@ -334,6 +352,7 @@ local function validate_common(config, setup)
   expect_type(config.auto_expand_single_directory, "boolean", "auto_expand_single_directory")
   expect_type(config.sort, "function", "sort")
   validate_columns(config.columns, "columns")
+  validate_hidden_columns(config.hidden_columns, "hidden_columns", config.columns)
   expect_type(config.use_mapping_default, "boolean", "use_mapping_default")
   validate_mapping(config.mapping, "mapping")
   validate_layout(config.layout, "layout", true)
@@ -382,6 +401,9 @@ function M.resolve_setup(opts, ignore_default_file_explorer)
   end
   if opts.columns ~= nil then
     result.columns = copy(opts.columns)
+  end
+  if opts.hidden_columns ~= nil then
+    result.hidden_columns = copy(opts.hidden_columns)
   end
   if opts.use_mapping_default ~= nil then
     result.use_mapping_default = copy(opts.use_mapping_default)
@@ -444,6 +466,7 @@ function M.resolve_instance(setup_defaults, opts, normalized_root)
     sort = setup_defaults.sort,
     expanded = expanded,
     columns = copy(setup_defaults.columns),
+    hidden_columns = copy(setup_defaults.hidden_columns),
     layout = copy(setup_defaults.layout),
     use_mapping_default = copy(setup_defaults.use_mapping_default),
     mapping = copy(setup_defaults.mapping),
@@ -464,6 +487,9 @@ function M.resolve_instance(setup_defaults, opts, normalized_root)
   end
   if opts.columns ~= nil then
     result.columns = copy(opts.columns)
+  end
+  if opts.hidden_columns ~= nil then
+    result.hidden_columns = copy(opts.hidden_columns)
   end
   if opts.use_mapping_default ~= nil then
     result.use_mapping_default = copy(opts.use_mapping_default)

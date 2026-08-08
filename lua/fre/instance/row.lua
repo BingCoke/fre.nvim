@@ -134,17 +134,6 @@ local function marker_source(buffer, instance_id, row_number)
   return source
 end
 
-local function navigation_context(ctx, navigation_kind)
-  ctx.synthetic = true
-  ctx.navigation_kind = navigation_kind
-  ctx.metadata = {
-    kind = "directory",
-    mode = nil,
-    size = nil,
-    mtime = nil,
-  }
-  return ctx
-end
 
 local function navigation_callback_entry(source, navigation_kind, tree)
   tree = tree or source.tree
@@ -230,7 +219,7 @@ end
 
 local function parse_columns(row_number, source, node, suffix, marker_end, opts)
   local tree = opts.tree or source.tree
-  local descriptors = source.columns or {}
+  local descriptors = source.visible_columns or {}
   local values, ranges, separators, fields = {}, {}, {}, {}
   local navigation_kind = opts.navigation_kind
   local callback_entry
@@ -248,9 +237,8 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
     local owned = resolved and resolved.fields[index]
     local parser_input = owned and owned.chunk .. PARSER_GUARD or suffix:sub(consumed + 1)
     local ctx = source:_column_context(
-      node, callback_entry, descriptor, index, index == #descriptors
+      node, callback_entry, descriptor, index, index == #descriptors, navigation_kind
     )
-    if navigation_kind then ctx = navigation_context(ctx, navigation_kind) end
     local ok, value, remaining = pcall(descriptor.parse, parser_input, ctx)
     if not ok then
       fail_row(row_number, "column " .. descriptor.id .. " parser failed: " .. tostring(value))
@@ -510,7 +498,7 @@ function M.decorations(buffer, row_number, line)
     add_unchanged_decoration(result, line, field.highlight)
   end
 
-  local descriptors = source.columns or {}
+  local descriptors = source.visible_columns or {}
   local suffix = line:sub(identity.marker_end + 1)
   local resolved = resolve_layout(descriptors, suffix, identity.marker_end, layout)
   if not resolved then
@@ -675,48 +663,25 @@ function M.matches_identity(buffer, line, instance_id, node_id)
   return ok and decoded.instance_id == instance_id and decoded.node_id == node_id
 end
 
-function M.prepare(buffer, projection, render_path, opts)
-  opts = opts or {}
+function M.project_items(buffer, projection, render_path, tree)
   render_path = render_path or function(node)
     return node.kind == "directory" and node.name .. "/" or node.name
   end
-  local tree = opts.tree or buffer.tree
+  tree = tree or buffer.tree
   local nodes = projection.nodes or projection
-  local descriptors = buffer.columns or {}
-  local rendered, widths = {}, {}
-  for index = 1, #descriptors do widths[index] = 0 end
+  local rendered = {}
 
-  local function add_rendered(node, rendered_path, navigation_kind)
+  local function add_item(node, rendered_path, navigation_kind)
     local callback_entry
     if navigation_kind then
       callback_entry = navigation_callback_entry(buffer, navigation_kind, tree)
     else
       callback_entry = tree:entry(node)
     end
-    local fields = {}
-    for index, descriptor in ipairs(descriptors) do
-      local ctx = buffer:_column_context(
-        node, callback_entry, descriptor, index, index == #descriptors
-      )
-      if navigation_kind then ctx = navigation_context(ctx, navigation_kind) end
-      local text, highlight, display_width = columns.render_text(descriptor, callback_entry, ctx)
-      fields[index] = {
-        text = text,
-        highlight = highlight,
-        display_width = display_width,
-      }
-      widths[index] = math.max(widths[index], display_width)
-    end
-    local node_id
-    if navigation_kind then
-      node_id = 0
-    else
-      node_id = node.id
-    end
     rendered[#rendered + 1] = {
       node = node,
-      node_id = node_id,
-      fields = fields,
+      node_id = navigation_kind and 0 or node.id,
+      callback_entry = callback_entry,
       path = rendered_path,
       path_highlight = path_highlight(
         callback_entry.relative_path, callback_entry.kind, navigation_kind
@@ -726,20 +691,18 @@ function M.prepare(buffer, projection, render_path, opts)
     }
   end
 
-  local navigation_kind
-  if path.parent(buffer.root) then
-    navigation_kind = "parent"
-  else
-    navigation_kind = "root"
-  end
-  local navigation_path
-  if navigation_kind == "parent" then
-    navigation_path = "../"
-  else
-    navigation_path = "/"
-  end
-  add_rendered(tree:root_node(), navigation_path, navigation_kind)
-  for _, node in ipairs(nodes) do add_rendered(node, render_path(node), nil) end
+  local navigation_kind = path.parent(buffer.root) and "parent" or "root"
+  add_item(
+    tree:root_node(), navigation_kind == "parent" and "../" or "/", navigation_kind
+  )
+  for _, node in ipairs(nodes) do add_item(node, render_path(node), nil) end
+  return rendered, nodes
+end
+
+function M.prepare(buffer, projection, rendered, descriptors, widths, opts)
+  opts = opts or {}
+  local tree = opts.tree or buffer.tree
+  local nodes = opts.nodes or projection.nodes or projection
 
   local marker_node_width = #tostring(tree:latest_node_id())
   local lines, baseline, highlights, row_templates = {}, {}, {}, {}
