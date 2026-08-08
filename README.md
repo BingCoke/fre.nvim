@@ -370,6 +370,10 @@ actions.collapse(ctx)
 actions.toggle_expand(ctx)
 actions.collapse_all(ctx)
 actions.toggle_hidden_file(ctx)
+actions.hide_columns(ctx, ids)
+actions.show_columns(ctx, ids)
+actions.toggle_columns(ctx, ids)
+actions.is_column_visible(ctx, id)
 actions.refresh(ctx)
 actions.jump_to_path(ctx) -- 当前 entry/navigation 行的 path 字段起点
 

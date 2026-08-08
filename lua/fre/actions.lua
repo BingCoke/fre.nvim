@@ -396,6 +396,22 @@ function M.toggle_hidden_file(ctx, opts)
   return instance_from(ctx):toggle_hidden_file()
 end
 
+function M.hide_columns(ctx, ids)
+  return instance_from(ctx):hide_columns(ids)
+end
+
+function M.show_columns(ctx, ids)
+  return instance_from(ctx):show_columns(ids)
+end
+
+function M.toggle_columns(ctx, ids)
+  return instance_from(ctx):toggle_columns(ids)
+end
+
+function M.is_column_visible(ctx, id)
+  return instance_from(ctx):is_column_visible(id)
+end
+
 function M.refresh(ctx, opts)
   no_options(opts, "refresh")
   local instance = instance_from(ctx)

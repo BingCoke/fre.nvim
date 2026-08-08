@@ -159,6 +159,7 @@ describe("fre ticket 17 actions and mappings", function()
     local names = {
       "context", "expand", "collapse", "collapse_all", "toggle_expand", "reveal", "jump_to_path",
       "open", "hidden", "toggle", "set_hidden_file", "toggle_hidden_file", "refresh",
+      "hide_columns", "show_columns", "toggle_columns", "is_column_visible",
       "select", "tab_select", "split_select", "confirm", "write", "destroy",
     }
     for _, name in ipairs(names) do assert.are.equal("function", type(actions[name]), name) end
@@ -342,6 +343,13 @@ describe("fre ticket 17 actions and mappings", function()
     fake.toggle = function(_, value) calls[#calls + 1] = { "toggle", value } end
     fake.set_hidden_file = function(_, value) calls[#calls + 1] = { "set_hidden_file", value } end
     fake.toggle_hidden_file = function() calls[#calls + 1] = { "toggle_hidden_file" } end
+    fake.hide_columns = function(_, ids) calls[#calls + 1] = { "hide_columns", ids } end
+    fake.show_columns = function(_, ids) calls[#calls + 1] = { "show_columns", ids } end
+    fake.toggle_columns = function(_, ids) calls[#calls + 1] = { "toggle_columns", ids } end
+    fake.is_column_visible = function(_, id)
+      calls[#calls + 1] = { "is_column_visible", id }
+      return id == "visible"
+    end
     fake.destroy = function() calls[#calls + 1] = { "destroy" } end
     fake.collapse_all = function() calls[#calls + 1] = { "collapse_all" } end
     local ctx = {
@@ -358,14 +366,71 @@ describe("fre ticket 17 actions and mappings", function()
     actions.toggle(ctx, { layout = { position = "left", size = 10 } })
     actions.set_hidden_file(ctx, { hidden_file = true })
     actions.toggle_hidden_file(ctx)
+    actions.hide_columns(ctx, { "first" })
+    actions.show_columns(ctx, { "second" })
+    actions.toggle_columns(ctx, { "first", "second" })
+    assert.is_true(actions.is_column_visible(ctx, "visible"))
     actions.destroy(ctx)
     assert.are.same({
       { "expand", "snapshot/path" }, { "collapse", "snapshot/path" },
       { "toggle_expand", "snapshot/path" }, { "collapse_all" }, { "reveal", "snapshot/path" },
       { "open", { position = "current" } }, { "hidden" },
       { "toggle", { position = "left", size = 10 } },
-      { "set_hidden_file", true }, { "toggle_hidden_file" }, { "destroy" },
+      { "set_hidden_file", true }, { "toggle_hidden_file" },
+      { "hide_columns", { "first" } }, { "show_columns", { "second" } },
+      { "toggle_columns", { "first", "second" } },
+      { "is_column_visible", "visible" }, { "destroy" },
     }, calls)
+  end)
+
+  it("runs visibility actions directly and through a group mapping closure", function()
+    local function descriptor(id)
+      return columns.custom({
+        id = id,
+        render = function() return id:upper() end,
+        parse = function(suffix)
+          local value, rest = suffix:match("^(%S+)%s+(.*)$")
+          return value, rest
+        end,
+        equals = function() return true end,
+      })
+    end
+    local instance = ready({ ["a.txt"] = "x" }, {
+      columns = { descriptor("first"), descriptor("second") },
+      hidden_columns = { "second" },
+      mapping = {
+        n = {
+          gC = function(ctx)
+            return actions.toggle_columns(ctx, { "first", "second" })
+          end,
+        },
+      },
+    })
+    local ctx = context_for(instance, "a.txt")
+
+    assert.is_true(actions.is_column_visible(ctx, "first"))
+    assert.is_false(actions.is_column_visible(ctx, "second"))
+    assert.is_nil(actions.hide_columns(ctx, { "first", "unknown" }))
+    assert.are.same({ "first", "second" }, instance:get_hidden_columns())
+    assert.is_nil(actions.show_columns(ctx, { "first" }))
+    assert.are.same({ "second" }, instance:get_hidden_columns())
+    assert.is_nil(actions.toggle_columns(ctx, { "first", "second" }))
+    assert.are.same({ "first", "second" }, instance:get_hidden_columns())
+    assert.is_nil(actions.toggle_columns(ctx, { "first", "second" }))
+    assert.are.same({}, instance:get_hidden_columns())
+
+    assert.is_truthy(error_text(function()
+      actions.hide_columns(ctx, "first")
+    end):find("proper string array", 1, true))
+    vim.bo[instance.bufnr].modified = true
+    local admission = error_text(function() actions.hide_columns(ctx, { "first" }) end)
+    vim.bo[instance.bufnr].modified = false
+    assert.is_truthy(admission:find("buffer is modified", 1, true))
+
+    invoke(instance.bufnr, "n", "gC")
+    assert.are.same({ "first", "second" }, instance:get_hidden_columns())
+    invoke(instance.bufnr, "n", "gC")
+    assert.are.same({}, instance:get_hidden_columns())
   end)
 
   it("collapses every cached directory once through zM and preserves valid window cursors", function()

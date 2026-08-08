@@ -130,6 +130,28 @@ instance:toggle_columns({ "permissions", "size" })
 
 同一 Tree snapshot 中，隐藏 column 不调用其 `render`，并保留可复用结果；再次显示已有结果的 column 不重新渲染。构建期 hidden、之前从未渲染的 column 会在首次显示时同步生成缺失结果。render、投影准备、extmark、highlight 或 Buffer 提交失败时，旧文本、highlights、row identity、hidden state 和可复用结果保持不变；失败 callback 在抛错前产生的外部副作用无法由 Fre 撤销。
 
+## Actions 与 mapping closure
+
+```lua
+local actions = require("fre.actions")
+local detailed = { "permissions", "size", "mtime" }
+
+require("fre").setup({
+  mapping = {
+    n = {
+      ["gC"] = function(ctx)
+        return actions.toggle_columns(ctx, detailed)
+      end,
+    },
+  },
+})
+```
+
+Actions 提供 `hide_columns(ctx, ids)`、`show_columns(ctx, ids)`、`toggle_columns(ctx, ids)` 和 `is_column_visible(ctx, id)`。它们只从当次 ActionContext 解析当前 Instance 并调用同名公开方法，因此返回值、validation、admission、cache、transaction 与 rollback 行为和直接 Instance 调用完全相同。
+
+固定 column group 使用普通 `function(ctx)` closure 绑定；Fre 不接受 string action names 或 partial-application 配置，也不安装默认 visibility mapping。上例的 group toggle 在任一目标 visible 时进入 compact 状态，在全部目标 hidden 时恢复 detailed 状态。
+
+
 ## Cursor 恢复
 
 Column visibility 提交前，Fre 会为显示该 Instance 的每个 View 记录当前 filesystem entry 与语义字段位置。提交后仍存在且 navigable 的字段保留字段内 display-cell offset；字段内容缩短时，位置会钳制到最后一个有效 UTF-8 character boundary。path 内的 cursor 同样保留 path display offset。
