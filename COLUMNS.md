@@ -130,6 +130,12 @@ instance:toggle_columns({ "permissions", "size" })
 
 同一 Tree snapshot 中，隐藏 column 不调用其 `render`，并保留可复用结果；再次显示已有结果的 column 不重新渲染。构建期 hidden、之前从未渲染的 column 会在首次显示时同步生成缺失结果。render、投影准备、extmark、highlight 或 Buffer 提交失败时，旧文本、highlights、row identity、hidden state 和可复用结果保持不变；失败 callback 在抛错前产生的外部副作用无法由 Fre 撤销。
 
+## Public full refresh
+
+`instance:refresh()` 获取新的 filesystem truth 时，会为候选 Tree snapshot 重新调用全部 visible descriptor 的 `render`；普通 visibility change 的 cache reuse 不适用于 full refresh。hidden 和 disabled descriptors 仍不渲染。
+
+成功 refresh 后，当前 visible columns 具有新 snapshot 的结果；随后显示一个 refresh 时 hidden 的 column，只同步渲染该 column 缺失的 entry 结果，不重渲染其他 visible columns。scan、sort、render、prepare 或 commit 失败时，旧 Tree、文本、column results、hidden state、cursors、highlights 和 watcher state 保持不变。
+
 ## Actions 与 mapping closure
 
 ```lua

@@ -118,6 +118,17 @@ local function snapshot(instance)
       order = order,
     }
   end
+  local visible_columns = {}
+  for _, descriptor in ipairs(instance.buffer.visible_columns) do
+    visible_columns[#visible_columns + 1] = descriptor.id
+  end
+  local windows = {}
+  for _, winid in ipairs(vim.fn.win_findbuf(instance.bufnr)) do
+    windows[winid] = {
+      cursor = vim.api.nvim_win_get_cursor(winid),
+      view = vim.api.nvim_win_call(winid, vim.fn.winsaveview),
+    }
+  end
   return {
     tree = instance.tree,
     root_node = instance.tree.root,
@@ -129,9 +140,21 @@ local function snapshot(instance)
     projection_generation = instance.buffer.view.projection_generation,
     projection_ranges = vim.deepcopy(instance.buffer.projection_ranges),
     row_extmarks = vim.deepcopy(instance.buffer.row_extmarks),
+    render_cache = vim.deepcopy(instance.buffer.render_cache),
+    hidden_columns = instance:get_hidden_columns(),
+    visible_columns = visible_columns,
     text = lines(instance),
     modified = vim.bo[instance.bufnr].modified,
-    extmarks = vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}),
+    modifiable = vim.bo[instance.bufnr].modifiable,
+    extmarks = vim.api.nvim_buf_get_extmarks(instance.bufnr, -1, 0, -1, { details = true }),
+    real_root = instance.sync:real_root_value(),
+    result = vim.deepcopy(instance.sync:result_value()),
+    tree_generation = instance.sync.tree_generation,
+    watcher_paths = instance.sync:watcher_paths(),
+    pending_initial_cursor = vim.deepcopy(instance.buffer.pending_initial_cursor),
+    windows = windows,
+    focused_tab = vim.api.nvim_get_current_tabpage(),
+    focused_window = vim.api.nvim_get_current_win(),
     nodes = nodes,
   }
 end
@@ -147,10 +170,32 @@ local function assert_snapshot(instance, expected)
   assert.are.equal(expected.projection_generation, instance.buffer.view.projection_generation)
   assert.are.same(expected.projection_ranges, instance.buffer.projection_ranges)
   assert.are.same(expected.row_extmarks, instance.buffer.row_extmarks)
+  assert.are.same(expected.render_cache, instance.buffer.render_cache)
+  assert.are.same(expected.hidden_columns, instance:get_hidden_columns())
+  local visible_columns = {}
+  for _, descriptor in ipairs(instance.buffer.visible_columns) do
+    visible_columns[#visible_columns + 1] = descriptor.id
+  end
+  assert.are.same(expected.visible_columns, visible_columns)
   assert.are.same(expected.text, lines(instance))
   assert.are.equal(expected.modified, vim.bo[instance.bufnr].modified)
+  assert.are.equal(expected.modifiable, vim.bo[instance.bufnr].modifiable)
   assert.are.same(expected.extmarks,
-    vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}))
+    vim.api.nvim_buf_get_extmarks(instance.bufnr, -1, 0, -1, { details = true }))
+  assert.are.equal(expected.real_root, instance.sync:real_root_value())
+  assert.are.same(expected.result, instance.sync:result_value())
+  assert.are.equal(expected.tree_generation, instance.sync.tree_generation)
+  assert.are.same(expected.watcher_paths, instance.sync:watcher_paths())
+  assert.are.same(expected.pending_initial_cursor, instance.buffer.pending_initial_cursor)
+  assert.are.equal(expected.focused_tab, vim.api.nvim_get_current_tabpage())
+  assert.are.equal(expected.focused_window, vim.api.nvim_get_current_win())
+  assert.are.equal(vim.tbl_count(expected.windows), #vim.fn.win_findbuf(instance.bufnr))
+  for winid, saved in pairs(expected.windows) do
+    assert.is_true(vim.api.nvim_win_is_valid(winid))
+    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(winid))
+    assert.are.same(saved.cursor, vim.api.nvim_win_get_cursor(winid))
+    assert.are.same(saved.view, vim.api.nvim_win_call(winid, vim.fn.winsaveview))
+  end
   for id, value in pairs(expected.nodes) do
     local node = instance.tree.nodes_by_id[id]
     assert.are.equal(value.ref, node)
@@ -361,12 +406,96 @@ describe("fre ticket 08 atomic refresh", function()
     assert.is_true(instance.tree.nodes_by_path[fixture:path("inactive", "deep")].children_cached)
   end)
 
+  it("rerenders visible columns on full refresh and preserves cache on failure", function()
+    local calls = {}
+    local explode_visible = false
+    local function descriptor(id, enable)
+      return columns.custom({
+        id = id,
+        enable = enable,
+        render = function()
+          calls[id] = (calls[id] or 0) + 1
+          if id == "visible" and explode_visible then
+            error("injected full refresh render failure")
+          end
+          return id:upper() .. ":" .. calls[id]
+        end,
+        parse = function(suffix)
+          local value, rest = suffix:match("^(%S+)%s+(.*)$")
+          return value, rest
+        end,
+        equals = function() return true end,
+      })
+    end
+    local instance = ready({ ["a.txt"] = "a" }, {
+      columns = {
+        descriptor("visible", true),
+        descriptor("hidden", true),
+        descriptor("disabled", false),
+      },
+      hidden_columns = { "hidden", "disabled" },
+    })
+    local function projected_text() return table.concat(lines(instance), "\n") end
+    assert.are.equal(2, calls.visible)
+    assert.is_nil(calls.hidden)
+    assert.is_nil(calls.disabled)
+    assert.is_truthy(projected_text():find("VISIBLE:1", 1, true))
+    assert.is_truthy(projected_text():find("VISIBLE:2", 1, true))
+
+    instance:show_columns({ "hidden" })
+    assert.are.equal(2, calls.hidden)
+    assert.is_truthy(projected_text():find("HIDDEN:1", 1, true))
+    assert.is_truthy(projected_text():find("HIDDEN:2", 1, true))
+    instance:hide_columns({ "hidden" })
+    instance:hide_columns({ "visible" })
+    instance:show_columns({ "visible" })
+    assert.are.equal(2, calls.visible)
+    assert.are.equal(2, calls.hidden)
+
+    assert.is_nil(complete_refresh(instance))
+    assert.are.equal(4, calls.visible)
+    assert.are.equal(2, calls.hidden)
+    assert.is_nil(calls.disabled)
+    assert.is_nil(projected_text():find("VISIBLE:1", 1, true))
+    assert.is_nil(projected_text():find("VISIBLE:2", 1, true))
+    assert.is_truthy(projected_text():find("VISIBLE:3", 1, true))
+    assert.is_truthy(projected_text():find("VISIBLE:4", 1, true))
+    assert.is_nil(projected_text():find("HIDDEN:", 1, true))
+
+    instance:show_columns({ "hidden" })
+    assert.are.equal(4, calls.visible)
+    assert.are.equal(4, calls.hidden)
+    assert.is_nil(projected_text():find("HIDDEN:1", 1, true))
+    assert.is_nil(projected_text():find("HIDDEN:2", 1, true))
+    assert.is_truthy(projected_text():find("HIDDEN:3", 1, true))
+    assert.is_truthy(projected_text():find("HIDDEN:4", 1, true))
+    local before_failure = snapshot(instance)
+    explode_visible = true
+    local err = complete_refresh(instance)
+    explode_visible = false
+    assert.is_truthy(tostring(err):find(
+      "injected full refresh render failure", 1, true
+    ), tostring(err))
+    assert_snapshot(instance, before_failure)
+    assert.is_true(instance.sync:is_dirty())
+    assert.are.equal(5, calls.visible)
+    assert.are.equal(4, calls.hidden)
+
+    instance:hide_columns({ "visible", "hidden" })
+    instance:show_columns({ "visible", "hidden" })
+    assert.are.equal(5, calls.visible)
+    assert.are.equal(4, calls.hidden)
+    assert.are.same(before_failure.text, lines(instance))
+    assert.is_nil(calls.disabled)
+  end)
+
   it("leaves complete authoritative snapshots unchanged on scan sort column parser and commit failures", function()
     local explode_render = false
     local explode_parse = false
+    local render_epoch = 0
     local descriptor = value_column(function(entry)
       if explode_render then error("column exploded") end
-      return entry.name
+      return entry.name .. ":" .. render_epoch
     end, function(suffix)
       if explode_parse then error("parser exploded") end
       local value, rest = suffix:match("^(%S+) +(.*)$")
@@ -375,11 +504,29 @@ describe("fre ticket 08 atomic refresh", function()
     local active_load = real_fs.load
     local fs_adapter = { load = function(...) return active_load(...) end }
     fre._set_fs_adapter(fs_adapter)
-    local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b" }, {
-      columns = { descriptor },
+    local icon = columns.icon({
+      provider = function() return "X", "FreRefreshFailureIcon" end,
     })
+    local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b" }, {
+      columns = { icon, descriptor },
+    })
+    instance:open()
+    local first = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_cursor(first, instance:get_pos("a.txt"))
+    vim.api.nvim_win_call(first, function() vim.cmd("normal! zt") end)
+    vim.cmd("tabnew")
+    instance:open()
+    local second = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_cursor(second, instance:get_pos("b.txt"))
+    vim.api.nvim_win_call(second, function() vim.cmd("normal! zb") end)
+    instance.sync:suspend_watchers()
+    for index = 1, 30 do
+      fixture:write(string.format("00-item-%02d.txt", index), tostring(index))
+    end
+    instance.sync:sync_watchers()
 
     local function failed_refresh(expected, setup, cleanup)
+      render_epoch = render_epoch + 1
       if setup then setup() end
       local before = snapshot(instance)
       local err = complete_refresh(instance)
@@ -421,6 +568,30 @@ describe("fre ticket 08 atomic refresh", function()
       end
     end, function() vim.api.nvim_buf_set_extmark = original_set_extmark end)
     assert.is_true(injected)
+
+    local highlight_injected = false
+    failed_refresh("highlight commit exploded", function()
+      vim.api.nvim_buf_set_extmark = function(bufnr, namespace, row, col, opts)
+        if not highlight_injected and opts and opts.hl_group == "FreRefreshFailureIcon" then
+          highlight_injected = true
+          error("highlight commit exploded")
+        end
+        return original_set_extmark(bufnr, namespace, row, col, opts)
+      end
+    end, function() vim.api.nvim_buf_set_extmark = original_set_extmark end)
+    assert.is_true(highlight_injected)
+
+    instance.buffer.pending_initial_cursor[second] = true
+    local original_place_initial_cursor = buffer.place_initial_cursor
+    local late_commit_injected = false
+    failed_refresh("late commit exploded", function()
+      buffer.place_initial_cursor = function()
+        late_commit_injected = true
+        error("late commit exploded")
+      end
+    end, function() buffer.place_initial_cursor = original_place_initial_cursor end)
+    assert.is_true(late_commit_injected)
+    instance.buffer.pending_initial_cursor[second] = nil
   end)
 
   it("never reuses IDs allocated by a discarded refresh candidate", function()
