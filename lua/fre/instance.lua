@@ -442,6 +442,10 @@ function Instance:adopt_view(winid, presentation)
   return view.adopt(self.view, winid, presentation)
 end
 
+function Instance:takeover_view(winid)
+  return view.takeover(self.view, winid)
+end
+
 function Instance:place_initial_cursor(winid)
   view.place_initial_cursor(self.view, winid)
   return self

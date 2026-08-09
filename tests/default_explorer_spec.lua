@@ -204,6 +204,31 @@ describe("fre ticket 20 default directory explorer", function()
     assert.are.equal(before, instance_count(manager))
   end)
 
+  it("conceals identity during a direct :edit directory takeover", function()
+    reset_editor()
+    fre.setup({ default_file_explorer = true, columns = {} })
+    vim.cmd("edit " .. vim.fn.fnameescape(fixture.root))
+    local child = assert(fre.get_instance())
+    wait_for(function()
+      return child:status() == "ready" or child:status() == "load-failed"
+    end)
+    assert.are.equal("ready", child:status(), tostring(child:failure()))
+    assert.are.equal(3, vim.wo.conceallevel)
+    assert.are.equal("nvic", vim.wo.concealcursor)
+    local decoded = assert(child.buffer:decode(1))
+    for column = 1, #decoded.marker do
+      assert.are.equal(1, vim.fn.synconcealed(1, column)[1], "marker byte " .. column)
+    end
+    vim.api.nvim__redraw({ flush = true })
+    local screen = {}
+    for column = 1, vim.api.nvim_win_get_width(0) do
+      screen[#screen + 1] = vim.fn.screenstring(1, column)
+    end
+    local visible = table.concat(screen)
+    assert.is_nil(visible:find(child.id, 1, true), visible)
+    assert.is_nil(visible:find("fre:", 1, true), visible)
+  end)
+
   it("resolves the exact takeover View when native jump-back returns to it", function()
     reset_editor()
     local source, winid = source_buffer(fixture.root)

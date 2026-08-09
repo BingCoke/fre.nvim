@@ -1,5 +1,4 @@
 local path = require("fre.path")
-local window = require("fre.window")
 
 local M = {
   augroup_name = "FreDefaultExplorer",
@@ -13,20 +12,7 @@ local function create_instance(root)
 end
 
 local function replace_window(instance, winid)
-  local previous_bufnr = vim.api.nvim_win_get_buf(winid)
-  local finish_capture = instance:capture_view_errors()
-  local ok, previous = pcall(window.install, instance, winid)
-  local enter_err = finish_capture()
-  if not ok then error(previous, 0) end
-  instance:adopt_view(winid, {
-    layout = { position = "current" },
-    origin_winid = winid,
-    mode = "restore",
-    previous_bufnr = previous_bufnr,
-  })
-  instance:place_initial_cursor(winid)
-  if enter_err then error(enter_err, 0) end
-  return winid
+  return instance:takeover_view(winid)
 end
 
 local function valid_views(bufnr)
