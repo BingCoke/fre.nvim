@@ -138,11 +138,15 @@ instance:toggle_columns({ "permissions", "size" })
 
 ## Watched directory updates
 
-每个 active watched directory 独立 debounce。完成 debounce 后，Fre 不信任 event filename，只重扫该 directory 的直属子项一次；未变化的 event 不调用 descriptor `render`、不准备或提交投影，也不改变文本、cursor、highlight 或 watcher。same-name/same-kind entry 保留 identity；rename 按 delete 加 create 处理。
+每个 active watched directory 具有独立的 trailing debounce；一个目录的新事件不会重置其他目录的计时。完成 debounce 后，Fre 不信任 event filename。当前全部 ready directories 会去重并按 shallow-to-deep 顺序，在同一个 detached Tree candidate 上各重扫直属子项一次，最后最多提交一次投影。batch 运行期间新成熟的目录留给后续 batch，不扩张当前 transaction。
 
-新 entry 只渲染全部 visible descriptors。删除 entry 会丢弃其旧结果。现有 entry 的 normalized `kind`、`mode`、`size` 或 `mtime` 变化时，只重渲染 `metadata`（或 legacy `requires`）包含变化字段的 descriptor；省略 declaration 的 custom descriptor 保守重渲染，显式空 declaration 保留结果。hidden descriptor 的 stale 结果会失效但不立即渲染，之后 show 时才补生成。
+Parent 扫描后，child 只有在原 node identity、path 和 active-expanded 状态仍成立时才继续扫描。未变化的整批 event 不调用 descriptor `render`、不准备或提交投影，也不改变文本、cursor、highlight 或 watcher。same-name/same-kind entry 保留 identity；rename 按 delete 加 create 处理。
 
-插入、删除、rename、排序变化或投影宽度变化可以重建最终行布局，但不会扩大 descriptor callback 范围到未变化的 entry-column pairs。scan、comparator、render、prepare 或 commit 失败时，旧 filesystem view、column results、文本、cursor、extmarks、highlights 和 watcher 状态保持不变。
+新 entry 只渲染全部 visible descriptors。删除 entry 会丢弃其旧结果。现有 entry 的 normalized `kind`、`mode`、`size` 或 `mtime` 变化时，只重渲染 `metadata`（或 legacy `requires`）包含变化字段的 descriptor；省略 declaration 的 custom descriptor 保守重渲染，显式空 declaration 保留结果。hidden descriptor 的 stale 结果会失效但不立即渲染，之后 show 时才补生成。插入、删除、rename、排序变化或投影宽度变化可以重建最终行布局，但不会扩大 callback 范围到未变化的 entry-column pairs。
+
+Buffer 修改、实例没有 active View、write、direct execution、public refresh 或另一个 watch batch 暂时占用 presentation 时，Fre 保留准确的 pending directories，不退化为无范围 full refresh。成功的 public full refresh 与 write reconciliation 会消费其启动前已 pending 的 active directories；启动后成熟的目录保留给后续 targeted batch。Direct execution 本身不扫描 filesystem，也不消费 pending work；terminal 后再运行 targeted batch。
+
+Watcher handle 失败时会立即关闭并只报告一次。其已知目录先执行一次有界 rescan；成功后只在该目录仍 active 时重建 handle。scan、comparator、render、prepare 或 commit 失败会丢弃整个 candidate，保留该 batch 的全部 pending directories，并保持旧 filesystem view、column results、文本、cursor、extmarks、highlights 和 watcher lifecycle；后续重试仍使用这些准确目录。
 
 
 ## Actions 与 mapping closure

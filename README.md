@@ -599,11 +599,12 @@ execution:cancel()
 
 ## Watcher 与 GC
 
-- Fre 为 root 和当前活动的展开目录建立非递归 `vim.uv` watcher。
-- 事件按目录 debounce，并只刷新相关直接子项边界。
-- buffer 已修改、实例隐藏或写入锁定时，事件只记录待刷新状态，不会覆盖当前内容。
-- 隐藏实例再次显示时，会在安全条件下执行一次完整刷新。
-- watcher 行为和可靠性仍受操作系统及 libuv 限制。
+- Fre 为 root 和当前活动的展开目录建立非递归 `vim.uv` watcher；每个目录独立 trailing debounce。
+- 同时 ready 的目录按浅到深顺序在一个 detached transaction 中刷新相关直接子项边界，并最多提交一次最终投影；event filename 不作为扫描目标。
+- batch 运行期间新成熟的目录进入后续 targeted batch。buffer 已修改、实例隐藏、write、direct execution 或其他 refresh 占用 presentation 时，准确的 pending directories 会保留，不退化为无范围 full refresh。
+- 成功的 public refresh 和 write reconciliation 消费其启动前 pending directories；direct execution 不扫描或消费 pending work，结束后才运行 targeted batch。
+- watcher handle 失败会关闭并报告一次；完成一次有界 rescan 后，仅在目录仍 active 时重建。batch 失败保留旧投影与全部 pending directories。
+- watcher 行为和可靠性仍受操作系统及 libuv 限制。详细 callback/cache 语义见 [COLUMNS.md](COLUMNS.md#watched-directory-updates)。
 
 GC 是默认 Manager 可选使用的进程级 owner。它按 Instance identity 保存 group membership、容量、每实例 `ttl_ms`/`include_modified` policy snapshot、hidden interval、timer/generation 和 eligibility；GC 可保留 managed Instance 并只调用其 public `destroy()`。核心 Instance 不持有 Manager/GC/group/policy/runtime 状态。`fre.new({ gc = ... })` 的 managed policy 由 GC 解析；standalone constructor 不解释或应用 GC policy。
 

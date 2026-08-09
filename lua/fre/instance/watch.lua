@@ -116,7 +116,11 @@ function Controller:sync(specs, opts)
     end
   end
 
-  if opts.recreate_failed then self.failed = {} end
+  if opts.recreate_failed == true then
+    self.failed = {}
+  elseif type(opts.recreate_failed) == "table" then
+    for watch_path in pairs(opts.recreate_failed) do self.failed[watch_path] = nil end
+  end
   for _, spec in ipairs(specs or {}) do
     if self.entries[spec.path] == nil and self.failed[spec.path] == nil then self:_start(spec) end
   end

@@ -277,6 +277,7 @@ describe("fre ticket 15 directory watchers", function()
     fre._set_fs_adapter(fs_adapter)
     watcher = fake_watcher()
     fre._set_watch_adapter(watcher)
+    fre._reset_mutation_adapter()
   end)
 
   after_each(function()
@@ -286,6 +287,7 @@ describe("fre ticket 15 directory watchers", function()
     end
     fre._reset_fs_adapter()
     fre._reset_watch_adapter()
+    fre._reset_mutation_adapter()
     pcall(vim.cmd, "silent! tabonly")
     pcall(vim.cmd, "silent! only")
     fixture:cleanup()
@@ -430,6 +432,130 @@ describe("fre ticket 15 directory watchers", function()
     assert.is_false(instance.sync:is_busy())
   end)
 
+  it("batches sibling ready paths into one targeted projection", function()
+    local instance = ready({ ["a/old.txt"] = "a", ["b/old.txt"] = "b" })
+    instance:expand("a")
+    instance:expand("b")
+    wait_idle(instance)
+    instance:open()
+    local a = fixture:path("a")
+    local b = fixture:path("b")
+    local counts = loader_counts()
+    local projection_generation = instance.buffer.view.projection_generation
+
+    fixture:write("a/new.txt", "a")
+    fixture:write("b/new.txt", "b")
+    watcher:emit(a, nil, "untrusted-a")
+    watcher:emit(b, nil, "untrusted-b")
+    watcher:fire(a)
+    watcher:fire(b)
+    wait_for(function()
+      return instance:get_pos("a/new.txt") ~= nil
+        and instance:get_pos("b/new.txt") ~= nil
+        and not instance.sync:is_busy() and not instance.sync:is_dirty()
+    end)
+
+    assert.is_nil(counts[instance.root])
+    assert.are.equal(1, counts[a])
+    assert.are.equal(1, counts[b])
+    assert.are.equal(projection_generation + 1,
+      instance.buffer.view.projection_generation)
+  end)
+
+
+  it("retains every batched path when a later directory scan fails", function()
+    local notices = {}
+    vim.notify = function(message) notices[#notices + 1] = tostring(message) end
+    local instance = ready({ ["a/old.txt"] = "a", ["b/old.txt"] = "b" })
+    instance:expand("a")
+    instance:expand("b")
+    wait_idle(instance)
+    instance:open()
+    local a = fixture:path("a")
+    local b = fixture:path("b")
+    local counts = {}
+    local fail_b = true
+    active_load = function(scan_path, done)
+      counts[scan_path] = (counts[scan_path] or 0) + 1
+      if scan_path == b and fail_b then
+        done("batched second scan exploded")
+      else
+        real_fs.load(scan_path, done)
+      end
+    end
+    fixture:write("a/new.txt", "a")
+    fixture:write("b/new.txt", "b")
+    local before = snapshot(instance)
+    watcher:emit(a, nil, "ignored-a")
+    watcher:emit(b, nil, "ignored-b")
+    watcher:fire(a)
+    watcher:fire(b)
+    wait_for(function()
+      return #notices == 1 and not instance.sync:is_busy()
+        and instance.sync:is_dirty()
+    end)
+    assert.is_truthy(notices[1]:find("batched second scan exploded", 1, true))
+    assert.are.equal(1, counts[a])
+    assert.are.equal(1, counts[b])
+    assert_snapshot(instance, before)
+
+    fail_b = false
+    watcher:emit(a, nil, "retry-a")
+    watcher:fire(a)
+    wait_for(function()
+      return instance:get_pos("a/new.txt") ~= nil
+        and instance:get_pos("b/new.txt") ~= nil
+        and not instance.sync:is_busy() and not instance.sync:is_dirty()
+    end)
+    assert.is_nil(counts[instance.root])
+    assert.are.equal(2, counts[a])
+    assert.are.equal(2, counts[b])
+    assert.are.equal(before.projection_generation + 1,
+      instance.buffer.view.projection_generation)
+  end)
+
+
+  it("revalidates child targets after shallow parent reconciliation", function()
+    local instance = ready({ ["a/b/old.txt"] = "old" })
+    instance:expand("a/b")
+    wait_idle(instance)
+    instance:open()
+    local parent = fixture:path("a")
+    local child = fixture:path("a", "b")
+    local order = {}
+    active_load = function(scan_path, done)
+      order[#order + 1] = scan_path
+      real_fs.load(scan_path, done)
+    end
+
+    fixture:write("a/b/new.txt", "new")
+    watcher:emit(parent, nil, "ignored-parent")
+    watcher:emit(child, nil, "ignored-child")
+    watcher:fire(parent)
+    watcher:fire(child)
+    wait_for(function()
+      return instance:get_pos("a/b/new.txt") ~= nil
+        and not instance.sync:is_busy() and not instance.sync:is_dirty()
+    end)
+    assert.are.same({ parent, child }, order)
+
+    order = {}
+    local old_child_handle = watcher:latest(child)
+    fs.remove_tree(child)
+    watcher:emit(parent, nil, "ignored-parent")
+    watcher:emit(child, nil, "ignored-child")
+    watcher:fire(parent)
+    watcher:fire(child)
+    wait_for(function()
+      return instance.tree.nodes_by_path[child] == nil
+        and not instance.sync:is_busy() and not instance.sync:is_dirty()
+    end)
+    assert.are.same({ parent }, order)
+    assert.is_true(old_child_handle.closed)
+    assert.is_nil(watcher:latest(child))
+  end)
+
+
   it("debounces each directory independently and ignores event filenames", function()
     local instance = ready({ ["a/old.txt"] = "a", ["b/old.txt"] = "b" })
     instance:expand("a")
@@ -477,7 +603,7 @@ describe("fre ticket 15 directory watchers", function()
     pending_a = nil
     real_fs.load(a, complete_a)
     wait_for(function()
-      return counts[instance.root] == 1 and counts[a] == 2 and counts[b] == 1
+      return counts[a] == 1 and counts[b] == 1
         and instance:get_pos("a/new.txt") ~= nil
         and instance:get_pos("b/new.txt") ~= nil
         and not instance.sync:is_dirty()
@@ -486,8 +612,8 @@ describe("fre ticket 15 directory watchers", function()
 
     vim.wait(40, function() return false end, 10)
     assert.is_false(instance.sync:is_followup_scheduled())
-    assert.are.equal(1, counts[instance.root])
-    assert.are.equal(2, counts[a])
+    assert.is_nil(counts[instance.root])
+    assert.are.equal(1, counts[a])
     assert.are.equal(1, counts[b])
     assert.are.equal(a_handle, watcher:latest(a))
     assert.are.equal(b_handle, watcher:latest(b))
@@ -901,7 +1027,7 @@ describe("fre ticket 15 directory watchers", function()
       function(instance) instance.work:_release_write(request) end)
   end)
 
-  it("performs one pending full refresh on presentation without Manager registration", function()
+  it("runs the pending targeted refresh on presentation without Manager registration", function()
     local counts = loader_counts()
     local instance = ready({ ["dir/old.txt"] = "old" })
     instance:expand("dir")
@@ -922,13 +1048,110 @@ describe("fre ticket 15 directory watchers", function()
     manager.instances_by_buf[instance.bufnr] = instance
     wait_for(function()
       return not instance.sync:is_dirty() and instance:get_pos("root-new.txt") ~= nil
-        and instance:get_pos("dir/new.txt") ~= nil
+        and not instance.sync:is_busy()
     end)
 
     assert.are.equal("ready", instance:status())
     assert.are.equal(1, counts[instance.root])
-    assert.are.equal(1, counts[fixture:path("dir")])
+    assert.is_nil(counts[fixture:path("dir")])
+    assert.is_nil(instance:get_pos("dir/new.txt"))
   end)
+
+  it("keeps watcher paths pending without scanning during direct execution", function()
+    local mutation_done
+    fre._set_mutation_adapter({
+      create_file = function(_, done) mutation_done = done end,
+      create_directory = function(_, done) mutation_done = done end,
+      copy = function(_, _, _, done) mutation_done = done end,
+      move = function(_, _, done) mutation_done = done end,
+      delete = function(_, _, done) mutation_done = done end,
+    })
+    local instance = ready({ ["dir/old.txt"] = "old" })
+    instance:expand("dir")
+    wait_idle(instance)
+    instance:open()
+    local directory = fixture:path("dir")
+    local counts = loader_counts()
+    local execution = instance:execute({ operations = {
+      { type = "create_file", path = fixture:path("execution-placeholder") },
+    } })
+    assert.are.equal("running", execution:get_status().state)
+    wait_for(function() return mutation_done ~= nil end)
+
+    fixture:write("dir/during-execution.txt", "new")
+    watcher:emit(directory, nil, "ignored")
+    watcher:fire(directory)
+    wait_for(function() return instance.sync:is_dirty() end)
+    vim.wait(40, function() return false end, 10)
+    assert.is_nil(counts[instance.root])
+    assert.is_nil(counts[directory])
+    assert.is_nil(instance:get_pos("dir/during-execution.txt"))
+    assert.are.equal("running", execution:get_status().state)
+
+    mutation_done(nil)
+    wait_for(function()
+      return execution:get_status().state == "succeeded"
+        and instance:get_pos("dir/during-execution.txt") ~= nil
+        and not instance.sync:is_busy() and not instance.sync:is_dirty()
+    end)
+    assert.is_nil(counts[instance.root])
+    assert.are.equal(1, counts[directory])
+  end)
+
+  it("lets full refresh and write consume only their starting pending paths", function()
+    local function exercise(mode)
+      local directory_name = mode .. "-dir"
+      local instance = ready({ [directory_name .. "/old.txt"] = "old" })
+      instance:expand(directory_name)
+      wait_idle(instance)
+      instance:open()
+      vim.cmd("enew")
+      local directory = fixture:path(directory_name)
+      local counts = loader_counts()
+      fixture:write(directory_name .. "/pending.txt", "pending")
+      watcher:emit(instance.root, nil, "ignored-root")
+      watcher:emit(directory, nil, "ignored-directory")
+      watcher:fire(instance.root)
+      watcher:fire(directory)
+      wait_for(function() return instance.sync:is_dirty() end)
+
+      if mode == "public" then
+        assert.is_nil(complete_refresh(instance))
+      else
+        local request = instance.work:_acquire_write()
+        local completed, reconciliation_error = false, nil
+        instance.sync:write_reconcile(function(_, finish)
+          finish(nil, true)
+        end, function(_, err)
+          reconciliation_error = err
+          assert.is_true(instance.work:_release_write(request))
+          completed = true
+        end)
+        wait_for(function() return completed end)
+        assert.is_nil(reconciliation_error)
+      end
+      assert.are.equal(1, counts[instance.root])
+      assert.are.equal(1, counts[directory])
+      assert.is_false(instance.sync:is_dirty())
+
+      instance:open()
+      local later = mode .. "-later.txt"
+      fixture:write(later, "later")
+      watcher:emit(instance.root, nil, "ignored-later")
+      watcher:fire(instance.root)
+      wait_for(function()
+        return instance:get_pos(later) ~= nil
+          and not instance.sync:is_busy() and not instance.sync:is_dirty()
+      end)
+      assert.are.equal(2, counts[instance.root])
+      assert.are.equal(1, counts[directory])
+      instance:destroy()
+    end
+
+    exercise("public")
+    exercise("write")
+  end)
+
 
   it("follows a public refresh when an event arrives after its boundary scan", function()
     local instance = ready({ ["dir/old.txt"] = "old" })
@@ -963,7 +1186,7 @@ describe("fre ticket 15 directory watchers", function()
     assert.is_false(first_saw_late)
     assert.are.equal(1, callbacks)
     assert.are.equal(2, counts[instance.root])
-    assert.are.equal(2, counts[directory])
+    assert.are.equal(1, counts[directory])
   end)
 
   it("follows write reconciliation after a post-scan event and unlocks once", function()
@@ -1003,9 +1226,45 @@ describe("fre ticket 15 directory watchers", function()
     assert.is_false(first_saw_late)
     assert.are.equal(1, callbacks)
     assert.are.equal(2, counts[instance.root])
-    assert.are.equal(2, counts[directory])
+    assert.are.equal(1, counts[directory])
     assert.is_false(instance.work:is_write_active())
   end)
+
+  it("rescans failed watcher paths once and recreates only active handles", function()
+    local notices = {}
+    vim.notify = function(message) notices[#notices + 1] = tostring(message) end
+    local instance = ready({ ["a/b/old.txt"] = "old" })
+    instance:expand("a/b")
+    wait_idle(instance)
+    instance:open()
+    local counts = loader_counts()
+
+    local failed_root = watcher:latest(instance.root)
+    failed_root.callback("root watch exploded", "ignored", {})
+    wait_for(function()
+      return #notices == 1 and not instance.sync:is_busy()
+        and not instance.sync:is_dirty()
+    end)
+    local replacement = watcher:latest(instance.root)
+    assert.is_true(failed_root.closed)
+    assert.are.equal(1, counts[instance.root])
+    assert.is_not_nil(replacement)
+    assert.are_not.equal(failed_root, replacement)
+
+    counts = loader_counts()
+    local child = fixture:path("a", "b")
+    local failed_child = watcher:latest(child)
+    failed_child.callback("child watch exploded", "ignored", {})
+    instance:collapse("a")
+    wait_for(function()
+      return #notices == 2 and not instance.sync:is_busy()
+        and not instance.sync:is_dirty()
+    end)
+    assert.is_true(failed_child.closed)
+    assert.is_nil(counts[child])
+    assert.is_nil(watcher:latest(child))
+  end)
+
 
   it("reports each failed handle once, stops it, and recreates after refresh", function()
     local notices = {}

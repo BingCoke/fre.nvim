@@ -22,6 +22,29 @@ local function split_relative(relative)
   return result
 end
 
+local function empty_watch_change()
+  return { changed = false, order_changed = false, created = {}, deleted = {}, metadata = {} }
+end
+
+local function merge_watch_change(target, change)
+  target = target or empty_watch_change()
+  target.changed = target.changed or change.changed == true
+  target.order_changed = target.order_changed or change.order_changed == true
+  for node_id in pairs(change.created or {}) do target.created[node_id] = true end
+  for node_id in pairs(change.deleted or {}) do target.deleted[node_id] = true end
+  for node_id, fields in pairs(change.metadata or {}) do
+    local merged = target.metadata[node_id] or {}
+    target.metadata[node_id] = merged
+    for field in pairs(fields) do merged[field] = true end
+  end
+  return target
+end
+
+local function watch_target_depth(root, target_path)
+  local relative = path.relative(root, target_path) or target_path
+  return #split_relative(relative)
+end
+
 function Sync.new(options)
   if type(options) ~= "table" then fail("sync options are required", 2) end
   local self = setmetatable({
@@ -47,7 +70,7 @@ function Sync.new(options)
     initial_refresh_request = nil,
     watch_refresh_generation = 0,
     watch_refresh_request = nil,
-    watch_pending_generation = 0,
+    watch_pending = {},
     watch_event_generation = 0,
     watch_followup_scheduled = false,
   }, Sync)
@@ -465,7 +488,7 @@ end
 
 function Sync:sync_watchers(recreate_failed)
   if self.lifecycle:is_dead() then return end
-  self.watch:sync(self:watch_specs(), { recreate_failed = recreate_failed == true })
+  self.watch:sync(self:watch_specs(), { recreate_failed = recreate_failed })
 end
 
 function Sync:suspend_watchers()
@@ -529,15 +552,12 @@ function Sync:_current_request(request)
     and self.refresh_generation == request.generation
 end
 
-function Sync:_watch_commit_safe(event, request)
+function Sync:_watch_commit_safe(_, request)
   if self.lifecycle:is_dead() or not View.has_active(self.view)
       or vim.bo[self.bufnr].modified or self.work:is_write_active()
       or self.work:is_execution_active() then return false end
   if self.refresh_request and self.refresh_request ~= request then return false end
-  if not request and (self.watch_refresh_request or self.dirty) then return false end
-  local node = self.tree:node_by_id(event.node_id)
-  if not node or node.path ~= event.path or node.kind ~= "directory"
-      or not node.loaded or not self.tree:is_active_directory(node) then return false end
+  if not request and self.watch_refresh_request then return false end
   if request and self.watch_refresh_request ~= request then return false end
   for _, current in self.tree:iter_nodes() do
     if current.kind == "directory"
@@ -548,18 +568,62 @@ function Sync:_watch_commit_safe(event, request)
   return true
 end
 
-function Sync:_finish_watch_refresh(request, err)
-  if request.completed then return end
-  if err ~= nil then self.dirty = true end
-  self:_finish_request(request, err)
+function Sync:_ack_watch_targets(request)
+  for _, target in ipairs(request.targets or {}) do
+    local pending = self.watch_pending[target.path]
+    if pending and pending.generation <= target.generation then
+      self.watch_pending[target.path] = nil
+    end
+  end
 end
+
+function Sync:_watch_target_paths(request)
+  local paths = {}
+  for _, target in ipairs(request.targets or {}) do paths[target.path] = true end
+  return paths
+end
+
+function Sync:_pending_watch_targets()
+  local targets = {}
+  for _, target in pairs(self.watch_pending) do
+    targets[#targets + 1] = vim.deepcopy(target)
+  end
+  table.sort(targets, function(left, right)
+    local left_depth = watch_target_depth(self.root, left.path)
+    local right_depth = watch_target_depth(self.root, right.path)
+    if left_depth ~= right_depth then return left_depth < right_depth end
+    return left.path < right.path
+  end)
+  return targets
+end
+
+function Sync:_start_watch_batch()
+  if next(self.watch_pending) == nil or not self:_watch_commit_safe(nil) then return false end
+  local targets = self:_pending_watch_targets()
+  if #targets == 0 then return false end
+  self.watch_refresh_generation = self.watch_refresh_generation + 1
+  local request = {
+    kind = "watch",
+    generation = self.watch_refresh_generation,
+    targets = targets,
+    changedtick = vim.api.nvim_buf_get_changedtick(self.bufnr),
+    modified = vim.bo[self.bufnr].modified,
+    on_complete = nil,
+    completed = false,
+  }
+  self.watch_refresh_request = request
+  self.dirty = true
+  self:_start_refresh(request, targets)
+  return true
+end
+
 
 function Sync:_commit_candidate(request, candidate, prepared)
   if not self:_current_request(request) then
     self:_finish_request(request, "refresh was superseded")
     return
   end
-  if request.kind == "watch" and not self:_watch_commit_safe(request.event, request) then
+  if request.kind == "watch" and not self:_watch_commit_safe(nil, request) then
     self.dirty = true
     self:_finish_request(request, nil)
     self:_schedule_followup()
@@ -581,10 +645,10 @@ function Sync:_commit_candidate(request, candidate, prepared)
   self.real_root = candidate.real_root
   self.result = self:_refresh_result(candidate)
   self.tree_generation = self.tree_generation + 1
-  local followup = self.watch_event_generation > request.watch_event_generation
-  if request.kind == "watch" then followup = request.had_dirty or followup end
+  self:_ack_watch_targets(request)
+  local followup = next(self.watch_pending) ~= nil
   self.dirty = followup
-  self:sync_watchers(true)
+  self:sync_watchers(request.kind == "watch" and self:_watch_target_paths(request) or true)
   self:_finish_request(request, nil)
   if self.dirty then self:_schedule_followup() end
 end
@@ -594,15 +658,16 @@ function Sync:_scan_candidate(request, candidate, paths, index)
     self:_finish_request(request, "refresh was superseded")
     return
   end
-  local scan_path = paths[index]
+  local target = paths[index]
+  local scan_path = type(target) == "table" and target.path or target
   if not scan_path then
     local prepared_ok, prepared
     if request.kind == "watch" then
       local change = candidate.watch_change
       if not change or not change.changed then
-        local followup = request.had_dirty
-          or self.watch_event_generation > request.watch_event_generation
-        self.dirty = followup
+        self:_ack_watch_targets(request)
+        self:sync_watchers(self:_watch_target_paths(request))
+        self.dirty = next(self.watch_pending) ~= nil
         self:_finish_request(request, nil)
         if self.dirty then self:_schedule_followup() end
         return
@@ -621,7 +686,13 @@ function Sync:_scan_candidate(request, candidate, paths, index)
     self:_commit_candidate(request, candidate, prepared)
     return
   end
-  local node = candidate.tree:node_by_path(scan_path)
+  local node
+  if request.kind == "watch" then
+    node = candidate.tree:node_by_id(target.node_id)
+    if node and node.path ~= target.path then node = nil end
+  else
+    node = candidate.tree:node_by_path(scan_path)
+  end
   if not node then self:_scan_candidate(request, candidate, paths, index + 1); return end
   if node.kind ~= "directory" or not candidate.tree:is_active_directory(node) then
     self:_scan_candidate(request, candidate, paths, index + 1)
@@ -647,11 +718,11 @@ function Sync:_scan_candidate(request, candidate, paths, index)
         local _, change = candidate.tree:reconcile(node, children or {})
         if real_path then node.real_path = real_path end
         if request.kind == "watch" then
-          candidate.watch_change = change
           if real_path ~= nil and node == candidate.tree:root_node() then
             candidate.real_root = real_path
           end
           if real_path ~= nil and real_path ~= previous_real_path then change.changed = true end
+          candidate.watch_change = merge_watch_change(candidate.watch_change, change)
         elseif index == 1 then
           candidate.real_root = real_path
         end
@@ -682,8 +753,7 @@ function Sync:refresh(force, on_complete, write_reconciliation)
     changedtick = vim.api.nvim_buf_get_changedtick(self.bufnr),
     modified = vim.bo[self.bufnr].modified,
     active_paths = self.tree:active_expanded_paths(),
-    had_dirty = self.dirty,
-    watch_event_generation = self.watch_event_generation,
+    targets = self:_pending_watch_targets(),
     completed = false,
   }
   self.refresh_request = request
@@ -710,6 +780,7 @@ function Sync:presentation_refresh_if_safe()
       return false
     end
   end
+  if next(self.watch_pending) ~= nil then return self:_start_watch_batch() end
   local ok, err = pcall(self.refresh, self, false, function(refresh_err)
     if not self.lifecycle:is_dead() and refresh_err ~= nil then
       self.report_error(refresh_err)
@@ -734,41 +805,26 @@ function Sync:_next_watch_event_generation()
   return self.watch_event_generation
 end
 
-function Sync:_mark_watch_pending(generation)
+function Sync:_mark_watch_pending(event, generation)
   generation = generation or self:_next_watch_event_generation()
-  self.watch_pending_generation = math.max(self.watch_pending_generation, generation)
+  self.watch_pending[event.path] = {
+    path = event.path, node_id = event.node_id, generation = generation,
+  }
   self.dirty = true
 end
 
 function Sync:_on_watch_error(event, err)
   if self.lifecycle:is_dead() then return end
-  self:_mark_watch_pending()
+  self:_mark_watch_pending(event)
+  self:_schedule_followup()
   self.report_error("watch failed for " .. event.path .. ": " .. tostring(err))
 end
 
 function Sync:_on_watch_event(event)
   if self.lifecycle:is_dead() then return end
   local generation = self:_next_watch_event_generation()
-  if not self:_watch_commit_safe(event) then
-    self:_mark_watch_pending(generation)
-    return
-  end
-  self.watch_refresh_generation = self.watch_refresh_generation + 1
-  local request = {
-    kind = "watch",
-    generation = self.watch_refresh_generation,
-    event = event,
-    path = event.path,
-    changedtick = vim.api.nvim_buf_get_changedtick(self.bufnr),
-    modified = vim.bo[self.bufnr].modified,
-    had_dirty = self.dirty,
-    watch_event_generation = generation,
-    on_complete = nil,
-    completed = false,
-  }
-  self.watch_refresh_request = request
-  self.dirty = true
-  self:_start_refresh(request, { event.path })
+  self:_mark_watch_pending(event, generation)
+  self:_schedule_followup()
 end
 
 function Sync:cancel_active_watch_refresh()
@@ -777,7 +833,7 @@ function Sync:cancel_active_watch_refresh()
   request.completed = true
   self.watch_refresh_request = nil
   self.watch_refresh_generation = self.watch_refresh_generation + 1
-  self:_mark_watch_pending()
+  self.dirty = next(self.watch_pending) ~= nil
   self:_schedule_followup()
   return true
 end
