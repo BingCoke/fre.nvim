@@ -596,11 +596,27 @@ function Sync:_scan_candidate(request, candidate, paths, index)
   end
   local scan_path = paths[index]
   if not scan_path then
-    local sort_ok, sort_err = pcall(candidate.tree.sort_cached, candidate.tree)
-    if not sort_ok then self:_finish_request(request, sort_err); return end
-    local prepared_ok, prepared = pcall(
-      self.buffer.prepare_projection, self.buffer, true, candidate.tree
-    )
+    local prepared_ok, prepared
+    if request.kind == "watch" then
+      local change = candidate.watch_change
+      if not change or not change.changed then
+        local followup = request.had_dirty
+          or self.watch_event_generation > request.watch_event_generation
+        self.dirty = followup
+        self:_finish_request(request, nil)
+        if self.dirty then self:_schedule_followup() end
+        return
+      end
+      prepared_ok, prepared = pcall(
+        self.buffer.prepare_watch_projection, self.buffer, candidate.tree, change
+      )
+    else
+      local sort_ok, sort_err = pcall(candidate.tree.sort_cached, candidate.tree)
+      if not sort_ok then self:_finish_request(request, sort_err); return end
+      prepared_ok, prepared = pcall(
+        self.buffer.prepare_projection, self.buffer, true, candidate.tree
+      )
+    end
     if not prepared_ok then self:_finish_request(request, prepared); return end
     self:_commit_candidate(request, candidate, prepared)
     return
@@ -624,9 +640,21 @@ function Sync:_scan_candidate(request, candidate, paths, index)
       end
       if err ~= nil then self:_finish_request(request, err); return end
       local reconcile_ok, reconcile_err = pcall(function()
-        candidate.tree:reconcile(node, children or {})
+        local previous_real_path = node.real_path
+        if previous_real_path == nil and node == candidate.tree:root_node() then
+          previous_real_path = candidate.real_root
+        end
+        local _, change = candidate.tree:reconcile(node, children or {})
         if real_path then node.real_path = real_path end
-        if index == 1 and request.kind == "full" then candidate.real_root = real_path end
+        if request.kind == "watch" then
+          candidate.watch_change = change
+          if real_path ~= nil and node == candidate.tree:root_node() then
+            candidate.real_root = real_path
+          end
+          if real_path ~= nil and real_path ~= previous_real_path then change.changed = true end
+        elseif index == 1 then
+          candidate.real_root = real_path
+        end
       end)
       if not reconcile_ok then self:_finish_request(request, reconcile_err); return end
       self:_scan_candidate(request, candidate, paths, index + 1)

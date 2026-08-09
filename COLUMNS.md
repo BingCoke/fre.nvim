@@ -66,7 +66,7 @@ Descriptor 字段：
 - `align` 是 `left`、`center` 或 `right`；custom 默认 `left`。
 - `navigable` 是 boolean；custom 默认 `true`。
 - `enable` 是 boolean 或零参数 predicate，默认 `true`。
-- `metadata` 是无重复的 `kind`、`mode`、`size`、`mtime` 数组；`requires` 是会被规范化为 `metadata` 的 legacy alias。
+- `metadata` 是无重复的 `kind`、`mode`、`size`、`mtime` 数组；`requires` 是会被规范化为 `metadata` 的 legacy alias。省略两者表示 metadata 变化时保守重渲染；显式 `metadata = {}` 或 `requires = {}` 表示该 descriptor 不依赖这些字段。
 - `render(entry, ctx)` 返回无控制字符的有效 UTF-8 文本和可选 highlight group。
 - `parse(suffix, ctx)` 返回当前字段值和未消费 suffix。
 - `equals(entry, value, ctx)` 验证解析值是否仍匹配 metadata。
@@ -135,6 +135,15 @@ instance:toggle_columns({ "permissions", "size" })
 `instance:refresh()` 获取新的 filesystem truth 时，会为候选 Tree snapshot 重新调用全部 visible descriptor 的 `render`；普通 visibility change 的 cache reuse 不适用于 full refresh。hidden 和 disabled descriptors 仍不渲染。
 
 成功 refresh 后，当前 visible columns 具有新 snapshot 的结果；随后显示一个 refresh 时 hidden 的 column，只同步渲染该 column 缺失的 entry 结果，不重渲染其他 visible columns。scan、sort、render、prepare 或 commit 失败时，旧 Tree、文本、column results、hidden state、cursors、highlights 和 watcher state 保持不变。
+
+## Watched directory updates
+
+每个 active watched directory 独立 debounce。完成 debounce 后，Fre 不信任 event filename，只重扫该 directory 的直属子项一次；未变化的 event 不调用 descriptor `render`、不准备或提交投影，也不改变文本、cursor、highlight 或 watcher。same-name/same-kind entry 保留 identity；rename 按 delete 加 create 处理。
+
+新 entry 只渲染全部 visible descriptors。删除 entry 会丢弃其旧结果。现有 entry 的 normalized `kind`、`mode`、`size` 或 `mtime` 变化时，只重渲染 `metadata`（或 legacy `requires`）包含变化字段的 descriptor；省略 declaration 的 custom descriptor 保守重渲染，显式空 declaration 保留结果。hidden descriptor 的 stale 结果会失效但不立即渲染，之后 show 时才补生成。
+
+插入、删除、rename、排序变化或投影宽度变化可以重建最终行布局，但不会扩大 descriptor callback 范围到未变化的 entry-column pairs。scan、comparator、render、prepare 或 commit 失败时，旧 filesystem view、column results、文本、cursor、extmarks、highlights 和 watcher 状态保持不变。
+
 
 ## Actions 与 mapping closure
 

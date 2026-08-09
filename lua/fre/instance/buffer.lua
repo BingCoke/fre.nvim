@@ -352,7 +352,7 @@ local function set_node_extmark(buffer, node, row)
   })
 end
 
-function M.constrain_cursor(buffer, winid)
+function M.constrain_cursor(buffer, winid, tree)
   winid = winid or vim.api.nvim_get_current_win()
   if not vim.api.nvim_win_is_valid(winid)
       or vim.api.nvim_win_get_buf(winid) ~= buffer.bufnr then return end
@@ -361,6 +361,7 @@ function M.constrain_cursor(buffer, winid)
   local ok, decoded = pcall(M.decode, buffer, row_number, {
     allow_empty_path = true,
     validate_metadata = false,
+    tree = tree,
   })
   if not ok or not decoded or not decoded.marked then return end
   local lower = decoded.navigable_range.start_byte
@@ -444,7 +445,33 @@ function M.prepare(buffer, projection, render_path, opts)
     validate = opts.validate, tree = tree, nodes = nodes,
   })
   prepared.render_cache = candidate_cache
+  prepared.tree = tree
   return prepared
+end
+
+local function descriptor_depends_on(descriptor, changed)
+  if not descriptor._metadata_declared then return next(changed) ~= nil end
+  for _, field in ipairs(descriptor.metadata or {}) do
+    if changed[field] then return true end
+  end
+  return false
+end
+
+function M.prepare_watch_projection(buffer, tree, change)
+  local candidate_cache = copy_render_cache(buffer.render_cache)
+  for node_id in pairs(change.created or {}) do candidate_cache[node_id] = nil end
+  for node_id in pairs(change.deleted or {}) do candidate_cache[node_id] = nil end
+  for node_id, changed in pairs(change.metadata or {}) do
+    local cached = candidate_cache[node_id]
+    if cached then
+      for _, descriptor in ipairs(buffer.enabled_columns) do
+        if descriptor_depends_on(descriptor, changed) then
+          cached[descriptor.id] = nil
+        end
+      end
+    end
+  end
+  return buffer:prepare_projection(false, tree, { render_cache = candidate_cache })
 end
 
 function M.row_matches_identity(buffer, row_number, instance_id, node_id)
@@ -604,7 +631,7 @@ local function restore_view_cursors(buffer, snapshots, prepared)
   local first_entry_row
   if visible_nodes[1] then
     local candidate = row_offset + 1
-    local decoded_ok, decoded = pcall(M.decode, buffer, candidate)
+    local decoded_ok, decoded = pcall(M.decode, buffer, candidate, { tree = prepared.tree })
     if decoded_ok and decoded and decoded.row_kind == "entry"
         and decoded.instance_id == buffer.id then
       first_entry_row = candidate
@@ -612,7 +639,7 @@ local function restore_view_cursors(buffer, snapshots, prepared)
   end
   local navigation_row
   if row_offset > 0 then
-    local decoded_ok, decoded = pcall(M.decode, buffer, 1)
+    local decoded_ok, decoded = pcall(M.decode, buffer, 1, { tree = prepared.tree })
     if decoded_ok and decoded and decoded.row_kind == "navigation"
         and decoded.instance_id == buffer.id then
       navigation_row = 1
@@ -644,6 +671,7 @@ local function restore_view_cursors(buffer, snapshots, prepared)
         local decoded_ok, decoded = pcall(row.decode, buffer, row_number, line, {
           allow_empty_path = true,
           validate_metadata = false,
+          tree = prepared.tree,
         })
         if decoded_ok and decoded and decoded.marked then
           local mapped_col = row.cursor_column(
@@ -670,7 +698,7 @@ local function restore_view_cursors(buffer, snapshots, prepared)
           restored.curswant = vim.fn.winsaveview().curswant
         end
         vim.fn.winrestview(restored)
-        M.constrain_cursor(buffer, saved.winid)
+        M.constrain_cursor(buffer, saved.winid, prepared.tree)
       end)
     end)
     if not ok and natural_view then

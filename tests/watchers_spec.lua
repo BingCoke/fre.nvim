@@ -1,4 +1,5 @@
 local buffer = require("fre.instance.buffer")
+local columns = require("fre.columns")
 local fre = require("fre")
 local path = require("fre.path")
 local real_fs = require("fre.fs").default
@@ -175,6 +176,22 @@ local function delayed_first_scans()
 end
 
 local function snapshot(instance)
+  local windows = {}
+  for _, winid in ipairs(vim.fn.win_findbuf(instance.bufnr)) do
+    windows[winid] = {
+      cursor = vim.api.nvim_win_get_cursor(winid),
+      view = vim.api.nvim_win_call(winid, vim.fn.winsaveview),
+    }
+  end
+  local watcher_paths = instance.sync:watcher_paths()
+  local watcher_handles = {}
+  for _, watch_path in ipairs(watcher_paths) do
+    watcher_handles[watch_path] = watcher:latest(watch_path)
+  end
+  local visible_columns = {}
+  for _, descriptor in ipairs(instance.buffer.visible_columns) do
+    visible_columns[#visible_columns + 1] = descriptor.id
+  end
   return {
     tree = instance.tree,
     root_node = instance.tree.root,
@@ -183,11 +200,25 @@ local function snapshot(instance)
     view = instance.buffer.view,
     text = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false),
     baseline = vim.deepcopy(instance.buffer.view.baseline),
+    column_widths = vim.deepcopy(instance.buffer.view.column_widths),
+    projection_generation = instance.buffer.view.projection_generation,
     projection_ranges = vim.deepcopy(instance.buffer.projection_ranges),
     row_extmarks = vim.deepcopy(instance.buffer.row_extmarks),
-    extmarks = vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}),
+    render_cache = vim.deepcopy(instance.buffer.render_cache),
+    hidden_columns = instance:get_hidden_columns(),
+    visible_columns = visible_columns,
+    pending_initial_cursor = vim.deepcopy(instance.buffer.pending_initial_cursor),
+    extmarks = vim.api.nvim_buf_get_extmarks(instance.bufnr, -1, 0, -1, { details = true }),
     modified = vim.bo[instance.bufnr].modified,
     modifiable = vim.bo[instance.bufnr].modifiable,
+    result = vim.deepcopy(instance.sync:result_value()),
+    tree_generation = instance.sync.tree_generation,
+    real_root = instance.sync:real_root_value(),
+    watcher_paths = watcher_paths,
+    watcher_handles = watcher_handles,
+    windows = windows,
+    focused_tab = vim.api.nvim_get_current_tabpage(),
+    focused_window = vim.api.nvim_get_current_win(),
   }
 end
 
@@ -199,12 +230,39 @@ local function assert_snapshot(instance, expected)
   assert.are.equal(expected.view, instance.buffer.view)
   assert.are.same(expected.text, vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false))
   assert.are.same(expected.baseline, instance.buffer.view.baseline)
+  assert.are.same(expected.column_widths, instance.buffer.view.column_widths)
+  assert.are.equal(expected.projection_generation, instance.buffer.view.projection_generation)
   assert.are.same(expected.projection_ranges, instance.buffer.projection_ranges)
   assert.are.same(expected.row_extmarks, instance.buffer.row_extmarks)
+  assert.are.same(expected.render_cache, instance.buffer.render_cache)
+  assert.are.same(expected.hidden_columns, instance:get_hidden_columns())
+  local visible_columns = {}
+  for _, descriptor in ipairs(instance.buffer.visible_columns) do
+    visible_columns[#visible_columns + 1] = descriptor.id
+  end
+  assert.are.same(expected.visible_columns, visible_columns)
+  assert.are.same(expected.pending_initial_cursor, instance.buffer.pending_initial_cursor)
   assert.are.same(expected.extmarks,
-    vim.api.nvim_buf_get_extmarks(instance.bufnr, buffer.namespace, 0, -1, {}))
+    vim.api.nvim_buf_get_extmarks(instance.bufnr, -1, 0, -1, { details = true }))
   assert.are.equal(expected.modified, vim.bo[instance.bufnr].modified)
   assert.are.equal(expected.modifiable, vim.bo[instance.bufnr].modifiable)
+  assert.are.same(expected.result, instance.sync:result_value())
+  assert.are.equal(expected.tree_generation, instance.sync.tree_generation)
+  assert.are.equal(expected.real_root, instance.sync:real_root_value())
+  assert.are.same(expected.watcher_paths, instance.sync:watcher_paths())
+  for watch_path, handle in pairs(expected.watcher_handles) do
+    assert.are.equal(handle, watcher:latest(watch_path))
+    assert.is_false(handle.closed)
+  end
+  assert.are.equal(expected.focused_tab, vim.api.nvim_get_current_tabpage())
+  assert.are.equal(expected.focused_window, vim.api.nvim_get_current_win())
+  assert.are.equal(vim.tbl_count(expected.windows), #vim.fn.win_findbuf(instance.bufnr))
+  for winid, saved in pairs(expected.windows) do
+    assert.is_true(vim.api.nvim_win_is_valid(winid))
+    assert.are.equal(instance.bufnr, vim.api.nvim_win_get_buf(winid))
+    assert.are.same(saved.cursor, vim.api.nvim_win_get_cursor(winid))
+    assert.are.same(saved.view, vim.api.nvim_win_call(winid, vim.fn.winsaveview))
+  end
 end
 
 describe("fre ticket 15 directory watchers", function()
@@ -437,6 +495,357 @@ describe("fre ticket 15 directory watchers", function()
     assert.is_false(b_handle.closed)
   end)
 
+  it("skips projection and cache mutation for an exact no-change event", function()
+    local calls = 0
+    local descriptor = columns.custom({
+      id = "stable", metadata = {},
+      render = function(entry) calls = calls + 1; return entry.name end,
+      parse = function(suffix)
+        local value, rest = suffix:match("^(%S+)%s+(.*)$")
+        return value, rest
+      end,
+      equals = function() return true end,
+    })
+    local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b" }, {
+      columns = { descriptor },
+    })
+    instance:open()
+    calls = 0
+    local counts = loader_counts()
+    local root_node = instance.tree.root
+    local nodes_by_id = instance.tree.nodes_by_id
+    local nodes_by_path = instance.tree.nodes_by_path
+    local a_node = instance.tree.nodes_by_path[fixture:path("a.txt")]
+    local view = instance.buffer.view
+    local render_cache = instance.buffer.render_cache
+    local projection_generation = view.projection_generation
+    local tree_generation = instance.sync.tree_generation
+    local root_handle = watcher:latest(instance.root)
+
+    watcher:emit(instance.root, nil, "untrusted-name.txt")
+    watcher:fire(instance.root)
+    wait_for(function()
+      return counts[instance.root] == 1 and not instance.sync:is_busy()
+        and not instance.sync:is_dirty()
+    end)
+
+    assert.are.equal(0, calls)
+    assert.are.equal(root_node, instance.tree.root)
+    assert.are.equal(nodes_by_id, instance.tree.nodes_by_id)
+    assert.are.equal(nodes_by_path, instance.tree.nodes_by_path)
+    assert.are.equal(a_node, instance.tree.nodes_by_path[fixture:path("a.txt")])
+    assert.are.equal(view, instance.buffer.view)
+    assert.are.equal(render_cache, instance.buffer.render_cache)
+    assert.are.equal(projection_generation, instance.buffer.view.projection_generation)
+    assert.are.equal(tree_generation, instance.sync.tree_generation)
+    assert.are.equal(root_handle, watcher:latest(instance.root))
+    assert.is_false(root_handle.closed)
+  end)
+
+
+  it("publishes a changed watched-root canonical path", function()
+    local instance = ready({ ["a.txt"] = "a" })
+    instance:open()
+    local replacement = instance.sync:real_root_value() .. "-retargeted"
+    active_load = function(scan_path, done)
+      real_fs.load(scan_path, function(err, children)
+        done(err, children, replacement)
+      end)
+    end
+    local tree_generation = instance.sync.tree_generation
+    watcher:emit(instance.root, nil, "ignored")
+    watcher:fire(instance.root)
+    wait_for(function()
+      return instance.sync.tree_generation == tree_generation + 1
+        and not instance.sync:is_busy() and not instance.sync:is_dirty()
+    end)
+    assert.are.equal(replacement, instance.sync:real_root_value())
+    assert.are.equal(replacement, instance.tree.root.real_path)
+  end)
+
+  it("restores a renamed-entry cursor through the detached candidate Tree", function()
+    local descriptor = columns.custom({
+      id = "wide", metadata = {},
+      render = function(entry)
+        return entry.name == "selected.txt" and string.rep("W", 40) or "x"
+      end,
+      parse = function(suffix)
+        local value, rest = suffix:match("^(%S+)%s+(.*)$")
+        return value, rest
+      end,
+      equals = function() return true end,
+    })
+    local instance = ready({ ["selected.txt"] = "selected" }, {
+      columns = { descriptor },
+    })
+    instance:open()
+    local winid = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_cursor(winid, instance:get_pos("selected.txt"))
+    local renamed = "renamed.txt"
+    local ok, rename_err = vim.uv.fs_rename(
+      fixture:path("selected.txt"), fixture:path(renamed)
+    )
+    assert.is_truthy(ok, tostring(rename_err))
+    watcher:emit(instance.root, nil, "ignored")
+    watcher:fire(instance.root)
+    wait_for(function()
+      return instance:get_pos(renamed) ~= nil
+        and not instance.sync:is_busy() and not instance.sync:is_dirty()
+    end)
+    assert.are.same(instance:get_pos(renamed), vim.api.nvim_win_get_cursor(winid))
+  end)
+
+
+  it("invalidates only new or metadata-dependent entry-column pairs", function()
+    local calls = {}
+    local function descriptor(id, declaration, field)
+      local opts = {
+        id = id,
+        render = function(entry, ctx)
+          calls[id] = calls[id] or {}
+          calls[id][entry.name] = (calls[id][entry.name] or 0) + 1
+          local metadata = ctx.metadata or {}
+          local mtime = metadata.mtime or {}
+          local value = metadata[field] or mtime.sec or "none"
+          return id .. ":" .. tostring(value) .. ":" .. entry.name
+        end,
+        parse = function(suffix)
+          local value, rest = suffix:match("^(%S+)%s+(.*)$")
+          return value, rest
+        end,
+        equals = function() return true end,
+      }
+      if declaration then opts[declaration] = field and { field } or {} end
+      return columns.custom(opts)
+    end
+    local descriptors = {
+      descriptor("kind", "metadata", "kind"),
+      descriptor("mode", "metadata", "mode"),
+      descriptor("size", "metadata", "size"),
+      descriptor("mtime", "metadata", "mtime"),
+      descriptor("empty", "metadata", nil),
+      descriptor("legacy", "requires", "size"),
+      descriptor("undeclared", nil, nil),
+      descriptor("hidden", "metadata", "size"),
+    }
+    local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b" }, {
+      columns = descriptors, hidden_columns = { "hidden" },
+    })
+    instance:open()
+    instance:show_columns({ "hidden" })
+    instance:hide_columns({ "hidden" })
+    calls = {}
+
+    local overrides = {}
+    active_load = function(scan_path, done)
+      real_fs.load(scan_path, function(err, children, real_path)
+        for _, entry in ipairs(children or {}) do
+          local override = overrides[entry.name]
+          if override then
+            entry.stat = vim.deepcopy(entry.stat or {})
+            if override.mode ~= nil then entry.stat.mode = override.mode end
+            if override.size ~= nil then entry.stat.size = override.size end
+            if override.mtime ~= nil then entry.stat.mtime = vim.deepcopy(override.mtime) end
+          end
+        end
+        done(err, children, real_path)
+      end)
+    end
+    local function trigger()
+      local generation = instance.sync.tree_generation
+      watcher:emit(instance.root, nil, "ignored")
+      watcher:fire(instance.root)
+      wait_for(function()
+        return instance.sync.tree_generation == generation + 1
+          and not instance.sync:is_busy() and not instance.sync:is_dirty()
+      end)
+    end
+
+    local a = instance.tree.nodes_by_path[fixture:path("a.txt")]
+    overrides["a.txt"] = { size = (a.stat.size or 0) + 100 }
+    trigger()
+    assert.are.same({
+      size = { ["a.txt"] = 1 },
+      legacy = { ["a.txt"] = 1 },
+      undeclared = { ["a.txt"] = 1 },
+    }, calls)
+
+    calls = {}
+    instance:show_columns({ "hidden" })
+    assert.are.same({ hidden = { ["a.txt"] = 1 } }, calls)
+    instance:hide_columns({ "hidden" })
+    calls = {}
+
+    local b = instance.tree.nodes_by_path[fixture:path("b.txt")]
+    overrides["b.txt"] = { mode = (b.mode or 0) + 1 }
+    trigger()
+    assert.are.same({
+      mode = { ["b.txt"] = 1 },
+      undeclared = { ["b.txt"] = 1 },
+    }, calls)
+
+    calls = {}
+    a = instance.tree.nodes_by_path[fixture:path("a.txt")]
+    overrides["a.txt"].mtime = {
+      sec = (a.mtime.sec or 0) + 1, nsec = (a.mtime.nsec or 0) + 1,
+    }
+    trigger()
+    assert.are.same({
+      mtime = { ["a.txt"] = 1 },
+      undeclared = { ["a.txt"] = 1 },
+    }, calls)
+
+    calls = {}
+    local long_name = "00-a-new-entry-with-a-wide-column.txt"
+    fixture:write(long_name, "new")
+    local a_id = instance.tree.nodes_by_path[fixture:path("a.txt")].id
+    local b_id = instance.tree.nodes_by_path[fixture:path("b.txt")].id
+    trigger()
+    local new_calls = {}
+    for _, id in ipairs({ "kind", "mode", "size", "mtime", "empty", "legacy", "undeclared" }) do
+      new_calls[id] = { [long_name] = 1 }
+    end
+    assert.are.same(new_calls, calls)
+    assert.are.equal(a_id, instance.tree.nodes_by_path[fixture:path("a.txt")].id)
+    assert.are.equal(b_id, instance.tree.nodes_by_path[fixture:path("b.txt")].id)
+
+    calls = {}
+    fs.remove_tree(fixture:path("b.txt"))
+    trigger()
+    assert.are.same({}, calls)
+    assert.is_nil(instance.buffer.render_cache[b_id])
+
+    calls = {}
+    local renamed = "zz-renamed.txt"
+    local ok, rename_err = vim.uv.fs_rename(fixture:path("a.txt"), fixture:path(renamed))
+    assert.is_truthy(ok, tostring(rename_err))
+    overrides[renamed] = overrides["a.txt"]
+    overrides["a.txt"] = nil
+    trigger()
+    local renamed_calls = {}
+    for _, id in ipairs({ "kind", "mode", "size", "mtime", "empty", "legacy", "undeclared" }) do
+      renamed_calls[id] = { [renamed] = 1 }
+    end
+    assert.are.same(renamed_calls, calls)
+    assert.is_nil(instance.tree.nodes_by_path[fixture:path("a.txt")])
+    assert.is_nil(instance.buffer.render_cache[a_id])
+    assert.are_not.equal(a_id, instance.tree.nodes_by_path[fixture:path(renamed)].id)
+  end)
+
+
+  it("rolls back targeted watch failures without replacing published state", function()
+    local render_epoch = 0
+    local explode_render = false
+    local value = columns.custom({
+      id = "value", metadata = {},
+      render = function(entry)
+        if explode_render then error("watch render exploded") end
+        return entry.name .. ":" .. render_epoch
+      end,
+      parse = function(suffix)
+        local parsed, rest = suffix:match("^(%S+)%s+(.*)$")
+        return parsed, rest
+      end,
+      equals = function() return true end,
+    })
+    local icon = columns.icon({
+      provider = function() return "X", "FreWatchFailureIcon" end,
+    })
+    local instance = ready({ ["a.txt"] = "a", ["b.txt"] = "b" }, {
+      columns = { icon, value },
+    })
+    instance:open()
+    local first = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_cursor(first, instance:get_pos("a.txt"))
+    vim.api.nvim_win_call(first, function() vim.cmd("normal! zt") end)
+    vim.cmd("tabnew")
+    instance:open()
+    local second = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_set_cursor(second, instance:get_pos("b.txt"))
+    vim.api.nvim_win_call(second, function() vim.cmd("normal! zb") end)
+
+    instance.sync:suspend_watchers()
+    for index = 1, 30 do
+      fixture:write(string.format("00-watch-%02d.txt", index), tostring(index))
+    end
+    instance.sync:sync_watchers()
+    local messages = {}
+    vim.notify = function(message) messages[#messages + 1] = tostring(message) end
+
+    local function failed_watch(expected, setup, cleanup)
+      render_epoch = render_epoch + 1
+      if setup then setup() end
+      local before = snapshot(instance)
+      local message_count = #messages
+      watcher:emit(instance.root, nil, "ignored")
+      watcher:fire(instance.root)
+      wait_for(function()
+        return not instance.sync:is_busy() and instance.sync:is_dirty()
+          and #messages > message_count
+      end)
+      if cleanup then cleanup() end
+      assert.is_truthy(messages[#messages]:find(expected, 1, true), messages[#messages])
+      assert_snapshot(instance, before)
+      instance.sync.dirty = false
+    end
+
+    local original_load = active_load
+    failed_watch("watch scan exploded", function()
+      active_load = function(_, done) done("watch scan exploded") end
+    end, function() active_load = original_load end)
+
+    local original_sort = instance.tree:get_comparator()
+    failed_watch("watch sort exploded", function()
+      instance.tree:set_comparator(function() error("watch sort exploded") end)
+    end, function() instance.tree:set_comparator(original_sort) end)
+
+    failed_watch("watch render exploded", function() explode_render = true end,
+      function() explode_render = false end)
+
+    local original_prepare = buffer.prepare_watch_projection
+    failed_watch("watch prepare exploded", function()
+      buffer.prepare_watch_projection = function() error("watch prepare exploded") end
+    end, function() buffer.prepare_watch_projection = original_prepare end)
+
+    local original_set_extmark = vim.api.nvim_buf_set_extmark
+    local row_extmark_injected = false
+    failed_watch("watch row extmark exploded", function()
+      vim.api.nvim_buf_set_extmark = function(bufnr, namespace, row, col, opts)
+        if not row_extmark_injected and namespace == buffer.namespace then
+          row_extmark_injected = true
+          error("watch row extmark exploded")
+        end
+        return original_set_extmark(bufnr, namespace, row, col, opts)
+      end
+    end, function() vim.api.nvim_buf_set_extmark = original_set_extmark end)
+    assert.is_true(row_extmark_injected)
+
+    local highlight_injected = false
+    failed_watch("watch highlight exploded", function()
+      vim.api.nvim_buf_set_extmark = function(bufnr, namespace, row, col, opts)
+        if not highlight_injected and opts and opts.hl_group == "FreWatchFailureIcon" then
+          highlight_injected = true
+          error("watch highlight exploded")
+        end
+        return original_set_extmark(bufnr, namespace, row, col, opts)
+      end
+    end, function() vim.api.nvim_buf_set_extmark = original_set_extmark end)
+    assert.is_true(highlight_injected)
+
+    instance.buffer.pending_initial_cursor[second] = true
+    local original_place_initial_cursor = buffer.place_initial_cursor
+    local late_commit_injected = false
+    failed_watch("watch late commit exploded", function()
+      buffer.place_initial_cursor = function()
+        late_commit_injected = true
+        error("watch late commit exploded")
+      end
+    end, function() buffer.place_initial_cursor = original_place_initial_cursor end)
+    assert.is_true(late_commit_injected)
+    instance.buffer.pending_initial_cursor[second] = nil
+  end)
+
+
   it("refreshes exactly the affected direct-child boundary atomically", function()
     local counts = loader_counts()
     local instance = ready({ ["a/old.txt"] = "a", ["b/old.txt"] = "b" })
@@ -467,6 +876,7 @@ describe("fre ticket 15 directory watchers", function()
       local instance = ready({ ["old.txt"] = "old" })
       instance:open()
       make_unsafe(instance)
+      vim.wait(20, function() return false end, 5)
       counts = loader_counts()
       local before = snapshot(instance)
       watcher:emit(instance.root, nil, "new.txt")

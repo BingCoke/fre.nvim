@@ -27,6 +27,35 @@ local function metadata(entry)
   }
 end
 
+local function normalized_mtime(value)
+  if type(value) == "table" then
+    return { sec = tonumber(value.sec) or 0, nsec = tonumber(value.nsec) or 0 }
+  end
+  return { sec = tonumber(value) or 0, nsec = 0 }
+end
+
+local function normalized_metadata(kind, info)
+  return {
+    kind = kind,
+    mode = tonumber(info.mode) or 0,
+    size = info.stat and tonumber(info.stat.size) or nil,
+    mtime = normalized_mtime(info.mtime),
+  }
+end
+
+local function metadata_changes(node, info)
+  local before = normalized_metadata(node.kind, node)
+  local after = normalized_metadata(node.kind, info)
+  local changed = {}
+  for _, field in ipairs({ "kind", "mode", "size" }) do
+    if before[field] ~= after[field] then changed[field] = true end
+  end
+  if before.mtime.sec ~= after.mtime.sec or before.mtime.nsec ~= after.mtime.nsec then
+    changed.mtime = true
+  end
+  return changed
+end
+
 local function detached_copy(value, seen)
   if type(value) ~= "table" then return value end
   seen = seen or {}
@@ -280,12 +309,13 @@ function Tree:_new_node(parent, entry)
   return node
 end
 
-function Tree:_detach(node)
+function Tree:_detach(node, deleted)
   if node.kind == "directory" then
     for _, child in ipairs(node.children_order or {}) do
-      self:_detach(child)
+      self:_detach(child, deleted)
     end
   end
+  if deleted then deleted[node.id] = true end
   self.nodes_by_id[node.id] = nil
   if self.nodes_by_path[node.path] == node then
     self.nodes_by_path[node.path] = nil
@@ -353,10 +383,14 @@ end
 function Tree:reconcile(parent, entries)
   directory_state(parent)
   local previous = parent.children_by_name
+  local previous_order = parent.children_order
   local ordered = {}
   local by_name = {}
   local updates = {}
   local reused = {}
+  local change = {
+    changed = false, order_changed = false, created = {}, deleted = {}, metadata = {},
+  }
 
   for _, entry in ipairs(entries or {}) do
     if type(entry) ~= "table" or type(entry.name) ~= "string" or entry.name == "" then
@@ -376,9 +410,17 @@ function Tree:reconcile(parent, entries)
     if old and old.kind == entry.kind then
       node = old
       reused[node] = true
-      updates[node] = metadata(entry)
+      local info = metadata(entry)
+      updates[node] = info
+      local fields = metadata_changes(node, info)
+      if next(fields) ~= nil then
+        change.metadata[node.id] = fields
+        change.changed = true
+      end
     else
       node = self:_new_node(parent, entry)
+      change.created[node.id] = true
+      change.changed = true
     end
     by_name[entry.name] = node
     ordered[#ordered + 1] = node
@@ -388,8 +430,23 @@ function Tree:reconcile(parent, entries)
     return self.comparator(self:entry(parent), self:entry(a), self:entry(b))
   end)
 
+  if #previous_order ~= #ordered then
+    change.order_changed = true
+  else
+    for index, node in ipairs(ordered) do
+      if previous_order[index].id ~= node.id then
+        change.order_changed = true
+        break
+      end
+    end
+  end
+  if change.order_changed then change.changed = true end
+
   for _, old in pairs(previous) do
-    if not reused[old] then self:_detach(old) end
+    if not reused[old] then
+      self:_detach(old, change.deleted)
+      change.changed = true
+    end
   end
   for node, info in pairs(updates) do
     node.stat = info.stat
@@ -407,7 +464,7 @@ function Tree:reconcile(parent, entries)
   parent.load_state = "loaded"
   parent.loaded = true
   parent.children_cached = true
-  return ordered
+  return ordered, change
 end
 
 function Tree:sort_cached()

@@ -84,7 +84,14 @@ local function validate_descriptor(descriptor, name)
   if type(descriptor.equals) ~= "function" then
     fail(name .. ".equals must be a function", 4)
   end
-  descriptor.metadata = validate_metadata(descriptor.metadata or descriptor.requires, name .. ".metadata")
+  local declared = descriptor._metadata_declared
+  if type(declared) ~= "boolean" then
+    declared = descriptor.metadata ~= nil or descriptor.requires ~= nil
+  end
+  local dependencies = descriptor.metadata
+  if dependencies == nil then dependencies = descriptor.requires end
+  descriptor.metadata = validate_metadata(dependencies, name .. ".metadata")
+  descriptor._metadata_declared = declared
   descriptor.requires = nil
   return descriptor
 end

@@ -73,4 +73,48 @@ describe("fre Tree interface", function()
     assert.are.equal(added, tree:node_by_path("/root/added.txt"))
     assert.is_true(added.id > before_discard)
   end)
+  it("summarizes detached topology order and normalized metadata changes", function()
+    local function entry(name, kind, mode, size, sec, nsec)
+      return {
+        name = name, kind = kind,
+        stat = { mode = mode, size = size, mtime = { sec = sec, nsec = nsec } },
+      }
+    end
+    local tree = Tree.new("/root", "tree-summary", comparator)
+    local root = tree:root_node()
+    tree:reconcile(root, {
+      entry("dir", "directory", 493, 0, 1, 0),
+      entry("kept.txt", "file", 420, 1, 2, 0),
+    })
+    local directory = tree:node_by_path("/root/dir")
+    tree:reconcile(directory, {
+      entry("nested.txt", "file", 420, 2, 3, 0),
+    })
+    local kept = tree:node_by_path("/root/kept.txt")
+    local nested = tree:node_by_path("/root/dir/nested.txt")
+
+    local _, change = tree:reconcile(root, {
+      entry("added.txt", "file", 420, 5, 4, 0),
+      entry("kept.txt", "file", 420, 9, 2, 7),
+    })
+    local added = tree:node_by_path("/root/added.txt")
+    assert.are.equal(kept, tree:node_by_path("/root/kept.txt"))
+    assert.is_nil(tree:node_by_path("/root/dir"))
+    assert.is_true(change.changed)
+    assert.is_true(change.order_changed)
+    assert.are.same({ [added.id] = true }, change.created)
+    assert.are.same({ [directory.id] = true, [nested.id] = true }, change.deleted)
+    assert.are.same({ [kept.id] = { size = true, mtime = true } }, change.metadata)
+
+    local _, unchanged = tree:reconcile(root, {
+      entry("added.txt", "file", 420, 5, 4, 0),
+      entry("kept.txt", "file", 420, 9, 2, 7),
+    })
+    assert.is_false(unchanged.changed)
+    assert.is_false(unchanged.order_changed)
+    assert.are.same({}, unchanged.created)
+    assert.are.same({}, unchanged.deleted)
+    assert.are.same({}, unchanged.metadata)
+  end)
+
 end)

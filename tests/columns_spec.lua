@@ -192,6 +192,30 @@ describe("fre columns", function()
     end)
   end)
 
+  it("preserves metadata declaration presence while normalizing requires", function()
+    local function custom(opts)
+      opts = vim.tbl_extend("force", {
+        id = "dependency",
+        render = function() return "x" end,
+        parse = function(suffix) return "x", suffix end,
+        equals = function() return true end,
+      }, opts or {})
+      return columns.custom(opts)
+    end
+    local omitted = custom()
+    local empty = custom({ metadata = {} })
+    local legacy = custom({ requires = { "size" } })
+    local preferred = custom({ metadata = { "mode" }, requires = { "size" } })
+    assert.are.same({}, omitted.metadata)
+    assert.are.equal(false, omitted._metadata_declared)
+    assert.are.same({}, empty.metadata)
+    assert.are.equal(true, empty._metadata_declared)
+    assert.are.same({ "size" }, legacy.metadata)
+    assert.are.equal(true, legacy._metadata_declared)
+    assert.is_nil(legacy.requires)
+    assert.are.same({ "mode" }, preferred.metadata)
+  end)
+
   it("normalizes descriptor enable without evaluating predicates", function()
     local calls = 0
     local predicate = function() calls = calls + 1; return true end
