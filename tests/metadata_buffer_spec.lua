@@ -875,6 +875,22 @@ describe("fre metadata buffer rows", function()
     assert.is_truthy(visible:find("a.txt", 1, true), visible)
   end)
 
+  it("keeps physical identity concealed when search lands on an internal ID", function()
+    local instance = ready({ ["a.txt"] = "x" })
+    instance:open({ position = "current" })
+    local row = row_for(instance, "a.txt")
+    local decoded = instance.buffer:decode(row)
+    local pattern = vim.fn.escape(instance.id, [[\]])
+    vim.api.nvim__redraw({ flush = true })
+    local screen = {}
+    for column = 1, vim.api.nvim_win_get_width(0) do
+      screen[#screen + 1] = vim.fn.screenstring(row, column)
+    end
+    assert.is_nil(table.concat(screen):find(instance.id, 1, true))
+    assert.is_nil(table.concat(screen):find("fre:", 1, true))
+    assert.are.equal(decoded.visible_range.start_byte, vim.api.nvim_win_get_cursor(0)[2])
+  end)
+
   it("accepts layout whitespace but rejects semantic metadata and kind suffix changes", function()
     local instance = ready({ ["file.txt"] = "x" })
     local row = row_for(instance, "file.txt")

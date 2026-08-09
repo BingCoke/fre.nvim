@@ -86,6 +86,39 @@ describe("filesystem adapter", function()
     assert.are.same(expected_paths, actual_paths)
   end)
 
+  it("ignores entries that disappear between scanning and stat", function()
+    create_files(fixture, 6)
+    local deferred = defer_lstats()
+    local result
+    local missing_path
+
+    fs.default.load(fixture.root, function(err, children)
+      result = { err = err, children = children }
+    end)
+
+    assert.is_true(vim.wait(1000, function()
+      return #deferred.pending > 0
+    end, 1))
+    missing_path = deferred.started_paths[3]
+
+    while #deferred.pending > 0 do
+      local request = table.remove(deferred.pending)
+      deferred.active = deferred.active - 1
+      if request.path == missing_path then
+        assert.is_true(uv.fs_unlink(request.path))
+      end
+      local stat, err = original_lstat(request.path)
+      request.callback(err, stat)
+    end
+
+    assert.is_not_nil(result)
+    assert.is_nil(result.err)
+    assert.are.equal(5, #result.children)
+    for _, child in ipairs(result.children) do
+      assert.is_not.equal(missing_path, child.real_path)
+    end
+  end)
+
   it("reports the earliest scan-order stat error after in-flight requests settle", function()
     create_files(fixture, 6)
     local deferred = defer_lstats()

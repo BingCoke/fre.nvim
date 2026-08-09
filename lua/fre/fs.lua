@@ -7,6 +7,10 @@ local function error_message(action, path, err)
   return string.format("%s %s: %s", action, path, err or "unknown error")
 end
 
+local function is_missing_error(err)
+  return type(err) == "string" and (err == "ENOENT" or err:match("^ENOENT:") ~= nil)
+end
+
 local function default_load(root, done)
   uv.fs_realpath(root, function(real_err, real_root)
     if real_err or not real_root then
@@ -67,7 +71,13 @@ local function default_load(root, done)
               return
             end
           end
-          done(nil, children, real_root)
+          local ordered_children = {}
+          for index = 1, total do
+            if children[index] then
+              ordered_children[#ordered_children + 1] = children[index]
+            end
+          end
+          done(nil, ordered_children, real_root)
         end
 
         local load_entry
@@ -76,7 +86,9 @@ local function default_load(root, done)
           local child_path = vim.fs.joinpath(real_root, entry.name)
           uv.fs_lstat(child_path, function(child_err, child_stat)
             if child_err or not child_stat then
-              errors[index] = error_message("cannot stat entry", child_path, child_err)
+              if not is_missing_error(child_err) then
+                errors[index] = error_message("cannot stat entry", child_path, child_err)
+              end
             else
               local child_kind = child_stat.type
               if child_kind == "directory" then
