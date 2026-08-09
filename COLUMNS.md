@@ -168,7 +168,9 @@ require("fre").setup({
 
 Actions 提供 `hide_columns(ctx, ids)`、`show_columns(ctx, ids)`、`toggle_columns(ctx, ids)` 和 `is_column_visible(ctx, id)`。它们只从当次 ActionContext 解析当前 Instance 并调用同名公开方法，因此返回值、validation、admission、cache、transaction 与 rollback 行为和直接 Instance 调用完全相同。
 
-固定 column group 使用普通 `function(ctx)` closure 绑定；Fre 不接受 string action names 或 partial-application 配置，也不安装默认 visibility mapping。上例的 group toggle 在任一目标 visible 时进入 compact 状态，在全部目标 hidden 时恢复 detailed 状态。
+默认 normal mapping 提供 `gC`：每次按键都会从当前 Instance 的 configured columns 动态收集 ID，排除 `icon` 后调用公开 `actions.toggle_columns(ctx, ids)`。因此 custom columns 会自动参与，固定末尾的 filesystem path 不受影响；任一目标 visible 时进入 compact 状态，在全部目标 hidden 时恢复 detailed 状态。`use_mapping_default = false` 时不安装 `gC`，用户也可以在 `mapping.n.gC` 中覆盖默认行为。
+
+固定或自定义 column group 也可以使用普通 `function(ctx)` closure 绑定；Fre 不接受 string action names 或 partial-application 配置。上例的 group toggle 与默认 `gC` 具有相同的最终状态和事务语义。
 
 
 ## 目录选择中的 appearance

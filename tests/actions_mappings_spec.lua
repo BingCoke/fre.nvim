@@ -278,12 +278,38 @@ describe("fre ticket 17 actions and mappings", function()
     local actual = {}
     for lhs in pairs(normal) do actual[#actual + 1] = lhs end
     table.sort(actual)
-    assert.are.same({ "<CR>", "R", "g.", "q", "zM", "za", "zc", "zv" }, actual)
+    assert.are.same({ "<CR>", "R", "g.", "gC", "q", "zM", "za", "zc", "zv" }, actual)
     assert.is_nil(normal.h)
     assert.is_nil(normal.l)
     assert.are.same({}, keymaps(instance.bufnr, "i"))
     assert.are.same({}, keymaps(instance.bufnr, "v"))
     assert.is_nil(rawget(instance.buffer, "mapping"))
+  end)
+
+  it("toggles every configured non-icon column through the default gC mapping", function()
+    local custom = columns.custom({
+      id = "kind_name",
+      render = function(entry) return entry.kind:sub(1, 1) end,
+      parse = function(suffix)
+        local value, rest = suffix:match("^(%S+)%s+(.*)$")
+        return value, rest
+      end,
+      equals = function() return true end,
+    })
+    local instance = ready({ ["a.txt"] = "a" }, {
+      columns = { columns.icon(), columns.size(), custom },
+    })
+    open_current(instance)
+    local normal = keymaps(instance.bufnr, "n")
+    assert.is_not_nil(normal.gC)
+    assert.are.same({}, instance:get_hidden_columns())
+
+    invoke(instance.bufnr, "n", "gC")
+    assert.are.same({ "size", "kind_name" }, instance:get_hidden_columns())
+    assert.is_true(instance:is_column_visible("icon"))
+
+    invoke(instance.bufnr, "n", "gC")
+    assert.are.same({}, instance:get_hidden_columns())
   end)
 
   it("overlays setup and new maps once, supports defaults-off, and isolates caller tables", function()
@@ -329,6 +355,7 @@ describe("fre ticket 17 actions and mappings", function()
     assert.is_not_nil(only_maps.x)
     assert.is_not_nil(only_maps.y)
     assert.are.equal(3, vim.tbl_count(only_maps))
+    assert.is_nil(only_maps.gC)
     assert.is_nil(keymaps(only.bufnr, "n")["<CR>"])
   end)
 
