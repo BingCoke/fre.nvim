@@ -67,6 +67,13 @@ end
 
 local function mapping_base()
   local actions = require("fre.actions")
+  local function toggle_detail_columns(ctx)
+    local ids = {}
+    for _, column in ipairs(ctx.instance:get_columns()) do
+      if column.id ~= "icon" then ids[#ids + 1] = column.id end
+    end
+    return actions.toggle_columns(ctx, ids)
+  end
   return {
     n = {
       ["<CR>"] = actions.select,
@@ -76,6 +83,7 @@ local function mapping_base()
       ["zM"] = actions.collapse_all,
       ["q"] = actions.hidden,
       ["g."] = actions.toggle_hidden_file,
+      ["gC"] = toggle_detail_columns,
       ["R"] = actions.refresh,
     },
     i = {},
