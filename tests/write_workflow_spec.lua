@@ -252,7 +252,6 @@ describe("fre ticket 11 write workflow", function()
     vim.notify = function() end
     active_ui = write_ui
     ui_adapter = {
-      input = function(...) return active_ui.input(...) end,
       confirm = function(...) return active_ui.confirm(...) end,
       progress = function(...) return active_ui.progress(...) end,
       report = function(...)

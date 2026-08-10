@@ -112,14 +112,14 @@ standalone Instance 不需要 `require("fre").setup()`，仍支持加载、窗�
 
 ## 编辑文件系统
 
-Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末尾的可编辑路径。首次显示、进入父目录、`reveal()` 和快速创建草稿会把光标放在路径起点；之后普通、可视和插入模式可以进入 permissions、size、mtime 及可导航的自定义元数据，但不能进入隐藏身份或行首 icon。新增未标记行仍可从第 0 列编辑。快速创建草稿则直接带有当前 visible columns、按目标名称和类型生成的 icon，以及 metadata 占位值；它仍只是未写入的 buffer 文本。元数据可以选择、yank 和暂时修改，但语义只读。
+Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末尾的可编辑路径。首次显示、进入父目录和 `reveal()` 会把光标放在路径起点；之后普通、可视和插入模式可以进入 permissions、size、mtime 及可导航的自定义元数据，但不能进入隐藏身份或行首 icon。新增未标记行仍可从第 0 列编辑。快速创建会立即插入带有当前 visible columns、目标 icon 和 metadata 占位值的草稿，把光标放到预填目录前缀末尾并进入 insert mode，等待直接补全文件名；它仍只是未写入的 buffer 文本。元数据可以选择、yank 和暂时修改，但语义只读。
 
 | 目标 | Buffer 操作 |
 | --- | --- |
 | 新建空文件 | 新增未标记行，例如 `notes.txt`；`src/a.cpp` 会同时计划缺失的 `src/` |
 | 新建目录 | 新增以 `/` 结尾的未标记行，例如 `docs/`；缺失的祖先目录会加入同一计划 |
-| 快速在光标语义目录创建 | 按 `]n`，只输入 basename 或子路径；目录行以该目录为基准，文件和 symlink 行以 parent 为基准 |
-| 快速在 Instance root 创建 | 按 `]N`，输入 root-relative basename 或子路径；草稿插入当前行下一行 |
+| 快速在光标语义目录创建 | 按 `]n`，立即插入预填语义目录前缀的草稿；目录行以该目录为基准，文件和 symlink 行以 parent 为基准 |
+| 快速在 Instance root 创建 | 按 `]N`，立即插入空 root-relative path 草稿；草稿位于当前行下一行 |
 | 重命名 | 修改已有行的路径，例如 `old.lua` 改为 `new.lua` |
 | 移动 | 修改为根目录内的另一相对路径，例如 `a.lua` 改为 `archive/a.lua` |
 | 复制 | `yy`/`p` 复制已有行，再修改复制行的目标路径 |
@@ -351,7 +351,7 @@ instance:open({
 }
 ```
 
-ActionContext 是 mapping 当次同步调用的 source snapshot。`ctx.view` 是 exact `ctx.winid` 的只读 View snapshot，mapping 可直接读取 `layout` 和 `origin_winid`；不会携带 visibility、generation/token 或 reconciliation 状态。调用方缓存 context 并延迟执行不受支持。`create_child` / `create_root` 内部会在打开输入前同步提取所需值，并在输入 callback 中重新验证精确 Instance、buffer、window 和 anchor 行；这不延长传入 context 的生命周期。非 mapping 场景可同步调用 `fre.view.inspect()`。更多完整示例见 [TIPS.md](TIPS.md)。
+ActionContext 是 mapping 当次同步调用的 source snapshot。`ctx.view` 是 exact `ctx.winid` 的只读 View snapshot，mapping 可直接读取 `layout` 和 `origin_winid`；不会携带 visibility、generation/token 或 reconciliation 状态。调用方缓存 context 并延迟执行不受支持。`create_child` / `create_root` 同步验证 source 并插入草稿，不保留传入 context。非 mapping 场景可同步调用 `fre.view.inspect()`。更多完整示例见 [TIPS.md](TIPS.md)。
 
 可视范围形状为：
 
@@ -381,8 +381,8 @@ actions.toggle_columns(ctx, ids)
 actions.is_column_visible(ctx, id)
 actions.refresh(ctx)
 actions.jump_to_path(ctx) -- 当前 entry/navigation 行的 path 字段起点
-actions.create_child(ctx) -- 相对光标语义目录输入 basename/子路径
-actions.create_root(ctx)  -- 相对 Instance root 输入 basename/子路径
+actions.create_child(ctx) -- 插入预填光标语义目录前缀的草稿并进入 insert mode
+actions.create_root(ctx)  -- 插入空 root-relative path 草稿并进入 insert mode
 
 actions.select(ctx, {
   target_winid = ctx.winid,

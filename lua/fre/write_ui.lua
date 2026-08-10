@@ -114,9 +114,6 @@ local function initialize_handle(handle, callback)
   return handle
 end
 
-function M.input(opts, on_submit)
-  return vim.ui.input(opts, on_submit)
-end
 
 
 function M.confirm(ctx, display, on_decision)

@@ -461,9 +461,7 @@ function M:insert_draft(opts)
   if type(after_row) ~= "number" or after_row % 1 ~= 0 then
     fail("draft insertion row must be a 1-based integer", 3)
   end
-  if type(proposed_path) ~= "string" or proposed_path == "" then
-    fail("draft path must be a non-empty string", 3)
-  end
+  if type(proposed_path) ~= "string" then fail("draft path must be a string", 3) end
   if proposed_path:find("[\r\n]") then fail("draft path must be a single line", 3) end
   if not vim.api.nvim_buf_is_valid(self.bufnr) then fail("instance buffer is not valid", 3) end
   local line_count = vim.api.nvim_buf_line_count(self.bufnr)
@@ -521,8 +519,8 @@ function M:insert_draft(opts)
     )
   end
   local decoded = self:decode(inserted_row)
-  vim.api.nvim_win_set_cursor(winid, { inserted_row, decoded.path_range.start_byte })
-  return { row = inserted_row, col = decoded.path_range.start_byte }
+  vim.api.nvim_win_set_cursor(winid, { inserted_row, decoded.path_range.end_byte })
+  return { row = inserted_row, col = decoded.path_range.end_byte }
 end
 
 local function descriptor_depends_on(descriptor, changed)

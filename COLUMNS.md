@@ -174,7 +174,7 @@ Actions 提供 `hide_columns(ctx, ids)`、`show_columns(ctx, ids)`、`toggle_col
 
 默认 normal mapping 提供 `gC`：每次按键都会从当前 Instance 的 configured columns 动态收集 ID，排除 `icon` 后调用公开 `actions.toggle_columns(ctx, ids)`。因此 custom columns 会自动参与，固定末尾的 filesystem path 不受影响；任一目标 visible 时进入 compact 状态，在全部目标 hidden 时恢复 detailed 状态。`use_mapping_default = false` 时不安装 `gC`，用户也可以在 `mapping.n.gC` 中覆盖默认行为。
 
-默认 normal mapping 还提供 `]n` 与 `]N`，分别调用 `actions.create_child(ctx)` 和 `actions.create_root(ctx)`。两者生成的草稿都使用当前 visible columns 和投影宽度，插入当前 cursor 下一行并把 cursor 放到 filesystem path 起点；它们只修改 buffer，仍由后续 `:write` 统一 prepare、confirm、execute 和 reconcile。
+默认 normal mapping 还提供 `]n` 与 `]N`，分别调用 `actions.create_child(ctx)` 和 `actions.create_root(ctx)`。两者都会立即使用当前 visible columns 和投影宽度在 cursor 下一行插入草稿：`]n` 预填光标语义目录前缀，`]N` 使用空 root-relative path；随后 cursor 位于前缀末尾并进入 insert mode，等待直接补全文件名。它们只修改 buffer，仍由后续 `:write` 统一 prepare、confirm、execute 和 reconcile。
 
 固定或自定义 column group 也可以使用普通 `function(ctx)` closure 绑定；Fre 不接受 string action names 或 partial-application 配置。上例的 group toggle 与默认 `gC` 具有相同的最终状态和事务语义。
 
