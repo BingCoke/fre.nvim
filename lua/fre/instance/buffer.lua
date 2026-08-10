@@ -14,7 +14,7 @@ Buffer.__index = M
 setmetatable(M, { __index = Buffer })
 
 local function marker_column_context(
-    source, node, entry, descriptor, index, is_last, navigation_kind
+    source, node, entry, descriptor, index, is_last, navigation_kind, draft
 )
   local mtime = node.mtime
   if type(mtime) == "table" then
@@ -38,7 +38,11 @@ local function marker_column_context(
       size = node.stat and tonumber(node.stat.size) or nil, mtime = mtime,
     },
   }
-  if navigation_kind then
+  if draft then
+    context.synthetic = true
+    context.draft = true
+    context.metadata = { kind = node.kind, mode = nil, size = nil, mtime = nil }
+  elseif navigation_kind then
     context.synthetic = true
     context.navigation_kind = navigation_kind
     context.metadata = { kind = "directory", mode = nil, size = nil, mtime = nil }
@@ -266,9 +270,9 @@ function M:position(node)
   return { row_number, decoded.path_range.start_byte }
 end
 
-function M:_column_context(node, entry, descriptor, index, is_last, navigation_kind)
+function M:_column_context(node, entry, descriptor, index, is_last, navigation_kind, draft)
   return marker_column_context(
-    self, node, entry, descriptor, index, is_last, navigation_kind
+    self, node, entry, descriptor, index, is_last, navigation_kind, draft
   )
 end
 
@@ -447,6 +451,78 @@ function M.prepare(buffer, projection, render_path, opts)
   prepared.render_cache = candidate_cache
   prepared.tree = tree
   return prepared
+end
+
+function M:insert_draft(opts)
+  if type(opts) ~= "table" then fail("draft options are required", 3) end
+  local after_row = opts.after_row
+  local proposed_path = opts.proposed_path
+  local winid = opts.winid
+  if type(after_row) ~= "number" or after_row % 1 ~= 0 then
+    fail("draft insertion row must be a 1-based integer", 3)
+  end
+  if type(proposed_path) ~= "string" or proposed_path == "" then
+    fail("draft path must be a non-empty string", 3)
+  end
+  if proposed_path:find("[\r\n]") then fail("draft path must be a single line", 3) end
+  if not vim.api.nvim_buf_is_valid(self.bufnr) then fail("instance buffer is not valid", 3) end
+  local line_count = vim.api.nvim_buf_line_count(self.bufnr)
+  if after_row < 1 or after_row > line_count then fail("draft insertion row is out of range", 3) end
+  if type(winid) ~= "number" or not vim.api.nvim_win_is_valid(winid)
+      or vim.api.nvim_win_get_buf(winid) ~= self.bufnr then
+    fail("draft target window is not valid", 3)
+  end
+
+  local item = row.draft_item(self, proposed_path)
+  local descriptors = self.visible_columns
+  local widths = self.view.column_widths or {}
+  if #widths ~= #descriptors then fail("draft columns require a committed layout", 3) end
+  local fields = {}
+  for index, descriptor in ipairs(descriptors) do
+    local ctx = self:_column_context(
+      item.node, item.callback_entry, descriptor, index, index == #descriptors, nil, true
+    )
+    local text, highlight, display_width = columns.render_text(
+      descriptor, item.callback_entry, ctx
+    )
+    if display_width > widths[index] then
+      fail("draft column " .. descriptor.id .. " exceeds the committed width", 3)
+    end
+    fields[index] = {
+      text = text, highlight = highlight, display_width = display_width,
+    }
+  end
+  item.fields = fields
+  local prepared = row.prepare(
+    self, { nodes = {} }, { item }, descriptors, widths, {
+      validate = true, tree = self.tree, nodes = {},
+    }
+  )
+  local inserted_row = after_row + 1
+  local was_modifiable = vim.bo[self.bufnr].modifiable
+  local ok, err = pcall(function()
+    vim.bo[self.bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(self.bufnr, after_row, after_row, false, prepared.lines)
+  end)
+  local restore_ok, restore_err = pcall(function()
+    vim.bo[self.bufnr].modifiable = was_modifiable
+  end)
+  if not ok then error(err, 0) end
+  if not restore_ok then error(restore_err, 0) end
+
+  for _, highlight in ipairs(prepared.highlights or {}) do
+    vim.api.nvim_buf_set_extmark(
+      self.bufnr, highlight_namespace, after_row + highlight.row, highlight.start_col, {
+        end_col = highlight.end_col,
+        hl_group = highlight.hl_group,
+        priority = 100,
+        undo_restore = false,
+      }
+    )
+  end
+  local decoded = self:decode(inserted_row)
+  vim.api.nvim_win_set_cursor(winid, { inserted_row, decoded.path_range.start_byte })
+  return { row = inserted_row, col = decoded.path_range.start_byte }
 end
 
 local function descriptor_depends_on(descriptor, changed)

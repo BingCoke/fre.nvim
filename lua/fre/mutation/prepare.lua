@@ -154,8 +154,14 @@ function M.prepare(instance)
 
   for row = 1, line_count do
     local decoded = instance.buffer:decode(row)
-    if decoded.synthetic then
-      -- Synthetic decoded rows never participate in filesystem plans.
+    if decoded.draft or (not decoded.marked and decoded.line ~= "") then
+      local absolute, relative = target_for_row(instance, row, decoded)
+      local kind = decoded.proposed_path:sub(-1) == "/" and "directory" or "file"
+      rows[#rows + 1] = {
+        row = row, kind = kind, target = absolute, target_relative = relative, new = true,
+      }
+    elseif decoded.synthetic then
+      -- Navigation rows never participate in filesystem plans.
     elseif decoded.marked then
       local absolute, relative = target_for_row(instance, row, decoded)
       local occurrence = {
@@ -178,12 +184,6 @@ function M.prepare(instance)
         occurrences[decoded.node_id][#occurrences[decoded.node_id] + 1] = occurrence
       end
       rows[#rows + 1] = occurrence
-    elseif decoded.line ~= "" then
-      local absolute, relative = target_for_row(instance, row, decoded)
-      local kind = decoded.proposed_path:sub(-1) == "/" and "directory" or "file"
-      rows[#rows + 1] = {
-        row = row, kind = kind, target = absolute, target_relative = relative, new = true,
-      }
     end
   end
 

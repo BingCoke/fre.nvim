@@ -252,6 +252,7 @@ describe("fre ticket 11 write workflow", function()
     vim.notify = function() end
     active_ui = write_ui
     ui_adapter = {
+      input = function(...) return active_ui.input(...) end,
       confirm = function(...) return active_ui.confirm(...) end,
       progress = function(...) return active_ui.progress(...) end,
       report = function(...)
@@ -330,6 +331,30 @@ describe("fre ticket 11 write workflow", function()
     local result = instance.work:last_write_result()
     assert.are.equal("succeeded", result.execution.state)
     assert.is_nil(result.reconciliation_error)
+  end)
+
+  it("reconciles a quick-create draft into a real projected node after write", function()
+    local instance = ready({ ["a.txt"] = "a" })
+    instance:open({ position = "current" })
+    local winid = vim.api.nvim_get_current_win()
+    local anchor_row = row_for(instance, "a.txt")
+    local inserted = instance:insert_draft({
+      after_row = anchor_row, proposed_path = "created.txt", winid = winid,
+    })
+    assert.is_true(assert(instance.buffer:decode(inserted.row)).draft)
+    local ui = scripted_ui()
+
+    local ok, err = write_command(instance)
+    assert.is_true(ok, tostring(err))
+    assert.are.same({ "CREATE FILE  created.txt" }, ui.confirmations[1])
+    ui.decide(true)
+    wait_unlocked(instance)
+
+    assert.is_not_nil(vim.uv.fs_lstat(fixture:path("created.txt")))
+    local reconciled = assert(instance.buffer:decode(row_for(instance, "created.txt")))
+    assert.is_false(reconciled.draft == true)
+    assert.is_number(reconciled.node_id)
+    assert.is_false(vim.bo[instance.bufnr].modified)
   end)
 
   it("skips confirmation at the exact Oil-style simple-edit limits", function()

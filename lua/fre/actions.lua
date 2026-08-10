@@ -84,6 +84,77 @@ local function capture_source(instance, ctx)
   instance:inspect_view({ winid = ctx.winid })
 end
 
+local function create_child_base(ctx, instance)
+  if ctx.row_kind == "navigation" then
+    if ctx.source_instance_id == instance.id and ctx.navigation_kind == "root" then return "" end
+    return nil
+  end
+  if ctx.row_kind ~= "entry" then return nil end
+  local entry = entry_from(ctx)
+  if entry.kind == "directory" then return entry.relative_path end
+  local parent = path.parent(entry.absolute_path)
+  return parent and path.relative(instance.root, parent) or nil
+end
+
+local function capture_create_source(instance, ctx, base)
+  validate_source(ctx, instance)
+  capture_source(instance, ctx)
+  if not instance:is_ready() then fail("instance is not ready", 4) end
+  local line = vim.api.nvim_buf_get_lines(instance.bufnr, ctx.row - 1, ctx.row, false)[1]
+  if line == nil then fail("draft insertion row is no longer valid", 4) end
+  return {
+    instance = instance,
+    instance_id = instance.id,
+    bufnr = instance.bufnr,
+    winid = ctx.winid,
+    tabpage = ctx.tabpage,
+    row = ctx.row,
+    line = line,
+    base = base,
+  }
+end
+
+local function recheck_create_source(captured)
+  local instance = captured.instance
+  if instance.id ~= captured.instance_id or instance.bufnr ~= captured.bufnr
+      or not instance:is_ready() or instance:is_destroying() or instance:is_destroyed()
+      or not vim.api.nvim_buf_is_valid(captured.bufnr)
+      or not vim.api.nvim_tabpage_is_valid(captured.tabpage)
+      or not vim.api.nvim_win_is_valid(captured.winid)
+      or vim.api.nvim_win_get_tabpage(captured.winid) ~= captured.tabpage
+      or vim.api.nvim_win_get_buf(captured.winid) ~= captured.bufnr then
+    fail("quick-create source is no longer valid", 4)
+  end
+  instance:inspect_view({ winid = captured.winid })
+  local line = vim.api.nvim_buf_get_lines(
+    captured.bufnr, captured.row - 1, captured.row, false
+  )[1]
+  if line ~= captured.line then fail("quick-create anchor row changed during input", 4) end
+end
+
+local function request_draft(ctx, base, prompt)
+  local instance = instance_from(ctx)
+  local captured = capture_create_source(instance, ctx, base)
+  return ui_adapter.input({ prompt = prompt }, function(value)
+    if value == nil then return end
+    local ok, err = pcall(function()
+      value = vim.trim(value)
+      if value == "" then return end
+      recheck_create_source(captured)
+      local proposed = captured.base == "" and value or captured.base .. "/" .. value
+      local directory = proposed:sub(-1) == "/"
+      local _, relative = path.edit_target(instance.root, proposed)
+      if directory then relative = relative .. "/" end
+      instance:insert_draft({
+        after_row = captured.row,
+        proposed_path = relative,
+        winid = captured.winid,
+      })
+    end)
+    if not ok then vim.notify(tostring(err), vim.log.levels.ERROR) end
+  end)
+end
+
 local function capture_target(instance, winid)
   validate_target(winid)
   local bufnr = vim.api.nvim_win_get_buf(winid)
@@ -317,6 +388,22 @@ end
 function M.context()
   return mapping.context()
 end
+
+function M.create_child(ctx, opts)
+  no_options(opts, "create_child")
+  local instance = instance_from(ctx)
+  local base = create_child_base(ctx, instance)
+  if base == nil then return nil end
+  local label = base == "" and "/" or base .. "/"
+  return request_draft(ctx, base, "Create in " .. label .. ": ")
+end
+
+function M.create_root(ctx, opts)
+  no_options(opts, "create_root")
+  instance_from(ctx)
+  return request_draft(ctx, "", "Create at root: ")
+end
+
 
 function M.jump_to_path(ctx, opts)
   no_options(opts, "jump_to_path")
@@ -577,7 +664,11 @@ function M._set_ui_adapter(adapter)
       or type(adapter.progress) ~= "function" then
     fail("write UI adapter must provide confirm() and progress()", 2)
   end
-  ui_adapter = adapter
+  if type(adapter.input) == "function" then
+    ui_adapter = adapter
+  else
+    ui_adapter = setmetatable({ input = default_ui.input }, { __index = adapter })
+  end
   require("fre.manager").default:set_write_ui_adapter(adapter)
 end
 

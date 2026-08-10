@@ -112,12 +112,14 @@ standalone Instance 不需要 `require("fre").setup()`，仍支持加载、窗�
 
 ## 编辑文件系统
 
-Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末尾的可编辑路径。首次显示、进入父目录和 `reveal()` 会把光标放在路径起点；之后普通、可视和插入模式可以进入 permissions、size、mtime 及可导航的自定义元数据，但不能进入隐藏身份或行首 icon。新增未标记行仍可从第 0 列编辑。元数据可以选择、yank 和暂时修改，但语义只读。
+Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末尾的可编辑路径。首次显示、进入父目录、`reveal()` 和快速创建草稿会把光标放在路径起点；之后普通、可视和插入模式可以进入 permissions、size、mtime 及可导航的自定义元数据，但不能进入隐藏身份或行首 icon。新增未标记行仍可从第 0 列编辑。快速创建草稿则直接带有当前 visible columns、按目标名称和类型生成的 icon，以及 metadata 占位值；它仍只是未写入的 buffer 文本。元数据可以选择、yank 和暂时修改，但语义只读。
 
 | 目标 | Buffer 操作 |
 | --- | --- |
 | 新建空文件 | 新增未标记行，例如 `notes.txt`；`src/a.cpp` 会同时计划缺失的 `src/` |
 | 新建目录 | 新增以 `/` 结尾的未标记行，例如 `docs/`；缺失的祖先目录会加入同一计划 |
+| 快速在光标语义目录创建 | 按 `]n`，只输入 basename 或子路径；目录行以该目录为基准，文件和 symlink 行以 parent 为基准 |
+| 快速在 Instance root 创建 | 按 `]N`，输入 root-relative basename 或子路径；草稿插入当前行下一行 |
 | 重命名 | 修改已有行的路径，例如 `old.lua` 改为 `new.lua` |
 | 移动 | 修改为根目录内的另一相对路径，例如 `a.lua` 改为 `archive/a.lua` |
 | 复制 | `yy`/`p` 复制已有行，再修改复制行的目标路径 |
@@ -151,6 +153,8 @@ Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末�
 | 按键 | 行为 |
 | --- | --- |
 | `<CR>` | 打开文件或 symlink；进入目录或选择 `../` 时以 source 的完整 effective appearance 创建独立 peer Instance；在根 `/` 上无操作 |
+| `]n` | 在光标语义目录下创建草稿；输入 basename 或子路径，文件/symlink 使用其 parent，根 `/` 使用 Instance root，`../` 无操作 |
+| `]N` | 在 Instance root 下创建草稿，并插入当前行下一行 |
 | `zv` | 展开光标所在目录；非目录行无操作 |
 | `zc` | 折叠光标所在目录；非目录行无操作 |
 | `za` | 切换目录展开状态；非目录行无操作 |
@@ -347,7 +351,7 @@ instance:open({
 }
 ```
 
-ActionContext 是 mapping 当次同步调用的 source snapshot。`ctx.view` 是 exact `ctx.winid` 的只读 View snapshot，mapping 可直接读取 `layout` 和 `origin_winid`；不会携带 visibility、generation/token 或 reconciliation 状态。缓存 context 并延迟执行不受支持。非 mapping 场景可同步调用 `fre.view.inspect()`。更多完整示例见 [TIPS.md](TIPS.md)。
+ActionContext 是 mapping 当次同步调用的 source snapshot。`ctx.view` 是 exact `ctx.winid` 的只读 View snapshot，mapping 可直接读取 `layout` 和 `origin_winid`；不会携带 visibility、generation/token 或 reconciliation 状态。调用方缓存 context 并延迟执行不受支持。`create_child` / `create_root` 内部会在打开输入前同步提取所需值，并在输入 callback 中重新验证精确 Instance、buffer、window 和 anchor 行；这不延长传入 context 的生命周期。非 mapping 场景可同步调用 `fre.view.inspect()`。更多完整示例见 [TIPS.md](TIPS.md)。
 
 可视范围形状为：
 
@@ -377,6 +381,8 @@ actions.toggle_columns(ctx, ids)
 actions.is_column_visible(ctx, id)
 actions.refresh(ctx)
 actions.jump_to_path(ctx) -- 当前 entry/navigation 行的 path 字段起点
+actions.create_child(ctx) -- 相对光标语义目录输入 basename/子路径
+actions.create_root(ctx)  -- 相对 Instance root 输入 basename/子路径
 
 actions.select(ctx, {
   target_winid = ctx.winid,
@@ -617,9 +623,9 @@ GC 的可见性以全部实际 View 为准，原生 duplicate 与 Fre 创建的�
 
 ## 稳定 marker 与特殊文件排查
 
-每个已有条目和导航行在物理 buffer 行首都带有 `\x1ffre:<id-byte-length>:<instance-id>:<node-id>\x1f` 稳定身份 marker。`instance-id` 是 opaque string，长度按 Lua byte 计数，因此 ID 内可以包含 `:`；长度和 node ID 使用无符号、无前导零的 canonical decimal。真实 node ID 为正数，node ID `0` 是唯一导航哨兵：它根据源 Instance root 表示 `../` 或 `/`，不属于 Tree、baseline 或 filesystem mutation。旧的定宽数字 marker 不再识别。
+每个已有条目和导航行在物理 buffer 行首都带有稳定身份 marker。`instance-id` 是按 Lua byte 长度定界的 opaque string，因此 ID 内可以包含 `:`；真实 node ID 为正数，node ID `0` 是唯一导航哨兵：它根据源 Instance root 表示 `../` 或 `/`，不属于 Tree、baseline 或 filesystem mutation。快速创建草稿使用独立且与当前投影 marker 等宽的内部草稿身份，保留 Instance 归属但不占用 Tree node ID；写入并 reconcile 后才由真实 filesystem scan 分配 node ID。
 
-Marker 是隐藏的内部结构文本，不是可配置列。它没有全局宽度、宽度 generation 或宽度变化事件；每行都由长度字段自行定界。Buffer 草稿中的 marker 字节会随普通编辑和 yank 保留，成功写入或显式成功刷新后才按当前身份重新投影。
+Marker 是隐藏的内部结构文本，不是可配置列。它没有全局宽度、宽度 generation 或宽度变化事件；每行都由长度字段自行定界。已有行、复制行和快速创建草稿中的 marker 字节都会随普通编辑、undo 和 yank 作为真实 buffer 文本保留；成功写入或显式成功刷新后才按 filesystem truth 重新投影。
 
 正式的 `syntax/fre.vim` 在首个带 marker 的投影前提供 conceal；目标窗口也会在显示 Fre 前应用 conceal 等局部选项，并在离开 Fre 时恢复之前的值。Raw buffer API、`:print` 和普通 yank 仍会保留这些真实字节，这是复制身份协议的一部分。
 
@@ -665,7 +671,7 @@ $p = '\\?\C:\absolute\path\to\nul'
 - 启用默认目录接管后，当前 Neovim 进程中没有恢复 netrw 的公共 API。
 - `refresh({ force = true })` 和默认 `R` action 会直接丢弃未保存的 Fre buffer 草稿。
 - 原生 jumplist、buffer navigation 和普通 split duplicate 都按实际窗口支持；外部创建的 float 没有可可靠推断的 ordinary origin，需要相关 action 显式提供 `anchor_winid`。
-- ActionContext 只支持 mapping/action 的同步调用；缓存后延迟执行不受支持。
+- ActionContext 只支持 mapping/action 的同步调用；调用方缓存后延迟执行不受支持。内置 quick-create action 会在自身输入 callback 前后执行窄值捕获和 source 重验。
 
 ## 开发与测试
 

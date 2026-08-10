@@ -35,6 +35,8 @@ columns.mtime({ format = "%Y-%m-%d", align = "right" })
 
 `size` 使用 `lstat.size` 和十进制单位；`mtime` 使用 descriptor 的 `format`。permissions、size、mtime 和可导航 custom column 在 buffer 中可以选择和临时编辑，但写入准备阶段会重新解析并验证其语义只读值。
 
+快速创建草稿沿用当前 visible descriptor 顺序、已提交投影宽度、padding 和 alignment。`icon` 根据目标 basename 与 file/directory kind 渲染；permissions、size 和 mtime 在没有 filesystem truth 时显示 `-`，不会复制 anchor 行的 metadata。若 custom descriptor 的草稿文本超过当前已提交宽度，创建会明确失败，不会截断字段或在 modified buffer 上重投影。
+
 ## Custom Descriptors
 
 ```lua
@@ -74,6 +76,8 @@ Descriptor 字段：
 Callback context 的 `column_index` 与 `is_last` 相对 Instance 构建时固定的 enabled 顺序计算，不随 runtime hidden state 改变。这样同一个 entry-column 结果可以在 hide/show 之间复用；物理行中的 visible 顺序仍始终是 enabled 减去 hidden。
 
 导航行使用相同的 visible column 顺序和投影宽度。其 callback context 包含 `synthetic = true` 和 `navigation_kind = "parent" | "root"`，并提供 callback-only directory Entry；`instance:get_entry(1)` 仍返回 `nil`。
+
+快速创建草稿调用同一组 `render(entry, ctx)` 和 `parse(suffix, ctx)`，但不会用 `equals` 把展示列当作已存在的 filesystem metadata 约束。其 context 包含 `synthetic = true`、`draft = true`，不含 `navigation_kind`；`ctx.metadata` 只保留目标 `kind`，`mode`、`size`、`mtime` 为 `nil`。callback Entry 包含当前 Instance identity、目标 absolute/root-relative path、basename 和推断的 file/directory kind，但 `node_id = nil`。descriptor 不应把 synthetic draft 当作已存在的 filesystem snapshot；用户之后修改 path 时，创建目标以 path 为准，成功写入/reconcile 后全部 columns 才按真实 filesystem truth 重投影。
 
 ## 构建期配置
 
@@ -169,6 +173,8 @@ require("fre").setup({
 Actions 提供 `hide_columns(ctx, ids)`、`show_columns(ctx, ids)`、`toggle_columns(ctx, ids)` 和 `is_column_visible(ctx, id)`。它们只从当次 ActionContext 解析当前 Instance 并调用同名公开方法，因此返回值、validation、admission、cache、transaction 与 rollback 行为和直接 Instance 调用完全相同。
 
 默认 normal mapping 提供 `gC`：每次按键都会从当前 Instance 的 configured columns 动态收集 ID，排除 `icon` 后调用公开 `actions.toggle_columns(ctx, ids)`。因此 custom columns 会自动参与，固定末尾的 filesystem path 不受影响；任一目标 visible 时进入 compact 状态，在全部目标 hidden 时恢复 detailed 状态。`use_mapping_default = false` 时不安装 `gC`，用户也可以在 `mapping.n.gC` 中覆盖默认行为。
+
+默认 normal mapping 还提供 `]n` 与 `]N`，分别调用 `actions.create_child(ctx)` 和 `actions.create_root(ctx)`。两者生成的草稿都使用当前 visible columns 和投影宽度，插入当前 cursor 下一行并把 cursor 放到 filesystem path 起点；它们只修改 buffer，仍由后续 `:write` 统一 prepare、confirm、execute 和 reconcile。
 
 固定或自定义 column group 也可以使用普通 `function(ctx)` closure 绑定；Fre 不接受 string action names 或 partial-application 配置。上例的 group toggle 与默认 `gC` 具有相同的最终状态和事务语义。
 

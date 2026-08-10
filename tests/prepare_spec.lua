@@ -263,6 +263,33 @@ describe("fre ticket 10 prepare basic mutations", function()
     }, plan.display)
   end)
 
+  it("plans marked drafts as ordinary file and directory creates", function()
+    local instance = ready({ ["keep.txt"] = "k" })
+    instance:open({ position = "current" })
+    local winid = vim.api.nvim_get_current_win()
+    local anchor_row = row_for(instance, "keep.txt")
+    local file = instance:insert_draft({
+      after_row = anchor_row, proposed_path = "new.txt", winid = winid,
+    })
+    instance:insert_draft({
+      after_row = file.row, proposed_path = "folder/", winid = winid,
+    })
+    local decoded = assert(instance.buffer:decode(file.row))
+    local physical = lines(instance)[file.row]
+    local renamed = physical:sub(1, decoded.path_range.start_byte) .. "renamed/"
+      .. physical:sub(decoded.path_range.end_byte + 1)
+    local modifiable = vim.bo[instance.bufnr].modifiable
+    vim.bo[instance.bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(instance.bufnr, file.row - 1, file.row, false, { renamed })
+    vim.bo[instance.bufnr].modifiable = modifiable
+
+    assert.are.same({
+      { type = "create_directory", path = fixture:path("renamed") },
+      { type = "create_directory", path = fixture:path("folder") },
+    }, instance:prepare().operations)
+  end)
+
+
   it("ignores structural blank rows and returns no operation for retained canonical rows", function()
     local instance = ready({ ["keep.txt"] = "k" })
     set_lines(instance, { "", physical_line(instance, "keep.txt"), "" })

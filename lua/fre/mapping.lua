@@ -85,6 +85,8 @@ local function mapping_base()
       ["g."] = actions.toggle_hidden_file,
       ["gC"] = toggle_detail_columns,
       ["R"] = actions.refresh,
+      ["]n"] = actions.create_child,
+      ["]N"] = actions.create_root,
     },
     i = {},
     v = {},

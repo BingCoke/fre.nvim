@@ -6,6 +6,7 @@ local M = {}
 
 local US = string.char(31)
 local PREFIX = US .. "fre:"
+local DRAFT_IDENTITY_BYTE = "D"
 local PARSER_GUARD = US .. "fre-parser-guard" .. US
 local MAX_EXACT_INTEGER = 9007199254740991
 
@@ -53,15 +54,28 @@ local function format_aligned_node_id(node_id, width)
   return string.rep("0", width - #text) .. text
 end
 
-function M.marker(_, instance_id, node_id, node_width)
+local function validate_marker_instance(instance_id)
   if not identity.valid(instance_id) then
-    fail("instance marker ID must be a non-empty string without control characters", 3)
+    fail("instance marker ID must be a non-empty string without control characters", 4)
   end
+end
+
+function M.marker(_, instance_id, node_id, node_width)
+  validate_marker_instance(instance_id)
   if not valid_integer(node_id, true) then
     fail("node marker ID must be a non-negative integer", 3)
   end
   return PREFIX .. tostring(#instance_id) .. ":" .. instance_id .. ":"
     .. format_aligned_node_id(node_id, node_width) .. US
+end
+
+function M.draft_marker(_, instance_id, node_width)
+  validate_marker_instance(instance_id)
+  if type(node_width) ~= "number" or node_width % 1 ~= 0 or node_width < 1 then
+    fail("draft marker width must be a positive integer", 3)
+  end
+  return PREFIX .. tostring(#instance_id) .. ":" .. instance_id .. ":"
+    .. string.rep(DRAFT_IDENTITY_BYTE, node_width) .. US
 end
 
 function M.decode_marker(_, row_number, line)
@@ -87,15 +101,22 @@ function M.decode_marker(_, row_number, line)
   local marker_end = line:find(US, node_start, true)
   if not marker_end then fail_row(row_number, "malformed reserved row marker") end
   local node_text = line:sub(node_start, marker_end - 1)
-  local node_id = decode_aligned_node_id(node_text, row_number)
+  local draft = node_text ~= ""
+    and node_text == string.rep(DRAFT_IDENTITY_BYTE, #node_text)
+  local node_id
+  if not draft then node_id = decode_aligned_node_id(node_text, row_number) end
   local marker_text = line:sub(1, marker_end)
-  if marker_text ~= M.marker(nil, instance_id, node_id, #node_text) then
+  local canonical = draft
+    and M.draft_marker(nil, instance_id, #node_text)
+    or M.marker(nil, instance_id, node_id, #node_text)
+  if marker_text ~= canonical then
     fail_row(row_number, "non-canonical row marker")
   end
   return {
     marker_end = marker_end,
     instance_id = instance_id,
     node_id = node_id,
+    draft = draft,
     marker = marker_text,
     raw_marker_text = marker_text,
   }
@@ -166,6 +187,28 @@ local function path_highlight(relative_path, kind, navigation_kind)
   return nil
 end
 
+function M.draft_item(buffer, proposed_path)
+  local kind = proposed_path:sub(-1) == "/" and "directory" or "file"
+  local relative = kind == "directory" and proposed_path:sub(1, -2) or proposed_path
+  local entry = {
+    instance_id = buffer.id,
+    node_id = nil,
+    absolute_path = path.resolve(buffer.root, relative),
+    relative_path = relative,
+    name = relative:match("([^/]+)$") or relative,
+    kind = kind,
+  }
+  return {
+    node = { kind = kind },
+    node_id = nil,
+    callback_entry = entry,
+    path = proposed_path,
+    path_highlight = path_highlight(proposed_path, kind, nil),
+    synthetic = true,
+    draft = true,
+  }
+end
+
 local function active_layout(source, override)
   if override and override.source_instance_id == source.id then return override end
   return source.view
@@ -222,11 +265,13 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
   local descriptors = source.visible_columns or {}
   local values, ranges, separators, fields = {}, {}, {}, {}
   local navigation_kind = opts.navigation_kind
-  local callback_entry
-  if navigation_kind then
-    callback_entry = navigation_callback_entry(source, navigation_kind, tree)
-  else
-    callback_entry = tree:entry(node)
+  local callback_entry = opts.callback_entry
+  if not callback_entry then
+    if navigation_kind then
+      callback_entry = navigation_callback_entry(source, navigation_kind, tree)
+    else
+      callback_entry = tree:entry(node)
+    end
   end
   local layout = active_layout(source, opts.layout_override)
   local resolved = resolve_layout(descriptors, suffix, marker_end, layout)
@@ -237,7 +282,8 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
     local owned = resolved and resolved.fields[index]
     local parser_input = owned and owned.chunk .. PARSER_GUARD or suffix:sub(consumed + 1)
     local ctx = source:_column_context(
-      node, callback_entry, descriptor, index, index == #descriptors, navigation_kind
+      node, callback_entry, descriptor, index, index == #descriptors, navigation_kind,
+      opts.draft == true
     )
     local ok, value, remaining = pcall(descriptor.parse, parser_input, ctx)
     if not ok then
@@ -335,6 +381,61 @@ local function parse_columns(row_number, source, node, suffix, marker_end, opts)
   }
 end
 
+local function decode_draft(buffer, row_number, line, decoded_marker, opts)
+  if decoded_marker.instance_id ~= buffer.id then
+    fail_row(row_number, "draft marker belongs to another instance")
+  end
+  local suffix = line:sub(decoded_marker.marker_end + 1)
+  local layout = active_layout(buffer, opts.layout_override)
+  local resolved = resolve_layout(
+    buffer.visible_columns or {}, suffix, decoded_marker.marker_end, layout
+  )
+  if not resolved then fail_row(row_number, "draft row does not match the active column layout") end
+  local proposed_path, path_range = trim_range(
+    suffix:sub(resolved.consumed + 1), decoded_marker.marker_end + resolved.consumed
+  )
+  local item_ok, item = pcall(M.draft_item, buffer, proposed_path)
+  if not item_ok then fail_row(row_number, "invalid draft path: " .. tostring(item)) end
+  local parsed = parse_columns(
+    row_number, buffer, item.node, suffix, decoded_marker.marker_end, {
+      callback_entry = item.callback_entry,
+      draft = true,
+      node_id = nil,
+      validate_metadata = false,
+      layout_override = opts.layout_override,
+    }
+  )
+  return {
+    kind = "new",
+    row_kind = "new",
+    marked = true,
+    draft = true,
+    synthetic = true,
+    line = line,
+    marker = decoded_marker.marker,
+    instance_id = buffer.id,
+    source_instance_id = buffer.id,
+    node_id = nil,
+    source_node = nil,
+    foreign = false,
+    entry = item.callback_entry,
+    proposed_path = proposed_path,
+    path = proposed_path,
+    marker_range = { start_byte = 0, end_byte = decoded_marker.marker_end },
+    column_values = parsed.values,
+    column_ranges = parsed.ranges,
+    separator_ranges = parsed.separators,
+    fields = parsed.fields,
+    path_range = path_range,
+    visible_range = { start_byte = decoded_marker.marker_end, end_byte = path_range.end_byte },
+    navigable_range = {
+      start_byte = parsed.first_navigable or path_range.start_byte,
+      end_byte = path_range.end_byte,
+    },
+  }
+end
+
+
 function M.decode(buffer, row_number, line, opts)
   opts = opts or {}
   if line == nil then return nil end
@@ -351,6 +452,9 @@ function M.decode(buffer, row_number, line, opts)
   local tree = opts.tree or buffer.tree
 
   local decoded_marker = M.decode_marker(buffer, row_number, line)
+  if decoded_marker.draft then
+    return decode_draft(buffer, row_number, line, decoded_marker, opts)
+  end
   local source = marker_source(buffer, decoded_marker.instance_id, row_number)
   local node, entry, navigation_kind
   if decoded_marker.node_id == 0 then
@@ -458,6 +562,49 @@ local function add_unchanged_decoration(result, line, decoration)
   end
 end
 
+local function draft_decorations(buffer, row_number, line)
+  local ok, decoded = pcall(M.decode, buffer, row_number, line, {
+    validate_metadata = false,
+  })
+  if not ok or not decoded or not decoded.draft then return {} end
+  local item = M.draft_item(buffer, decoded.proposed_path)
+  local descriptors = buffer.visible_columns or {}
+  local widths = buffer.view and buffer.view.column_widths or {}
+  local result = {}
+  for index, descriptor in ipairs(descriptors) do
+    local field = decoded.fields[index]
+    local width = widths[index]
+    if field and type(width) == "number" then
+      local ctx = buffer:_column_context(
+        item.node, item.callback_entry, descriptor, index, index == #descriptors, nil, true
+      )
+      local rendered, text, highlight, display_width = pcall(
+        columns.render_text, descriptor, item.callback_entry, ctx
+      )
+      if rendered and highlight and display_width <= width then
+        local _, leading_padding = columns.align(text, width, display_width, descriptor.align)
+        add_unchanged_decoration(result, line, {
+          start_col = field.physical_range.start_byte + leading_padding,
+          end_col = field.physical_range.start_byte + leading_padding + #text,
+          text = text,
+          hl_group = highlight,
+        })
+      end
+    end
+  end
+  local group = path_highlight(decoded.proposed_path, item.node.kind, nil)
+  if group and decoded.path_range.end_byte > decoded.path_range.start_byte then
+    add_unchanged_decoration(result, line, {
+      start_col = decoded.path_range.start_byte,
+      end_col = decoded.path_range.end_byte,
+      text = decoded.proposed_path,
+      hl_group = group,
+    })
+  end
+  return result
+end
+
+
 function M.decorations(buffer, row_number, line)
   if type(line) ~= "string" then return {} end
   if line:sub(1, 1) ~= US then
@@ -474,6 +621,7 @@ function M.decorations(buffer, row_number, line)
   end
 
   local identity = M.decode_marker(buffer, row_number, line)
+  if identity.draft then return draft_decorations(buffer, row_number, line) end
   local source = marker_source(buffer, identity.instance_id, row_number)
   local layout = source.view
   local template = template_for(layout, identity.node_id)
@@ -732,7 +880,9 @@ function M.prepare(buffer, projection, rendered, descriptors, widths, opts)
   local marker_node_width = #tostring(tree:latest_node_id())
   local lines, baseline, highlights, row_templates = {}, {}, {}, {}
   for row_number, item in ipairs(rendered) do
-    local marker_text = M.marker(buffer, buffer.id, item.node_id, marker_node_width)
+    local marker_text = item.draft
+      and M.draft_marker(buffer, buffer.id, marker_node_width)
+      or M.marker(buffer, buffer.id, item.node_id, marker_node_width)
     local physical = {}
     local template = {
       instance_id = buffer.id,
@@ -806,7 +956,7 @@ function M.prepare(buffer, projection, rendered, descriptors, widths, opts)
       }
     end
     template.line = lines[row_number]
-    row_templates[item.node_id] = template
+    if not item.draft then row_templates[item.node_id] = template end
     if not item.synthetic then baseline[item.node.id] = item.node.path end
   end
 
@@ -821,7 +971,12 @@ function M.prepare(buffer, projection, rendered, descriptors, widths, opts)
         layout_override = validation_layout,
         tree = tree,
       })
-      if item.synthetic then
+      if item.draft then
+        if not decoded.draft or decoded.node_id ~= nil
+            or decoded.proposed_path ~= item.path then
+          fail_row(row_number, "rendered draft row failed semantic validation")
+        end
+      elseif item.synthetic then
         if not decoded.synthetic or decoded.navigation_kind ~= item.navigation_kind
             or decoded.proposed_path ~= item.path then
           fail_row(row_number, "rendered navigation row failed semantic validation")

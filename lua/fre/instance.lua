@@ -480,6 +480,12 @@ function Instance:toggle(layout)
   return type(result) == "number" and self or result
 end
 
+function Instance:insert_draft(opts)
+  require_ready(self)
+  return self.buffer:insert_draft(opts)
+end
+
+
 function Instance:write(ctx)
   if self.lifecycle:is_dead() then fail("instance is destroyed", 2) end
   if ctx == nil then ctx = {} end

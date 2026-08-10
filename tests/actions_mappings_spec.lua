@@ -106,9 +106,13 @@ local function screenpos(winid)
 end
 
 local function confirmation_adapter()
-  local adapter = { decisions = {} }
+  local adapter = { decisions = {}, inputs = {} }
   function adapter.confirm(_, _, decide)
     adapter.decisions[#adapter.decisions + 1] = decide
+    return {}
+  end
+  function adapter.input(opts, submit)
+    adapter.inputs[#adapter.inputs + 1] = { opts = vim.deepcopy(opts), submit = submit }
     return {}
   end
   function adapter.progress() return {} end
@@ -158,6 +162,7 @@ describe("fre ticket 17 actions and mappings", function()
   it("exports only the ordinary action interface", function()
     local names = {
       "context", "expand", "collapse", "collapse_all", "toggle_expand", "reveal", "jump_to_path",
+      "create_child", "create_root",
       "open", "hidden", "toggle", "set_hidden_file", "toggle_hidden_file", "refresh",
       "hide_columns", "show_columns", "toggle_columns", "is_column_visible",
       "select", "tab_select", "split_select", "confirm", "write", "destroy",
@@ -278,12 +283,66 @@ describe("fre ticket 17 actions and mappings", function()
     local actual = {}
     for lhs in pairs(normal) do actual[#actual + 1] = lhs end
     table.sort(actual)
-    assert.are.same({ "<CR>", "R", "g.", "gC", "q", "zM", "za", "zc", "zv" }, actual)
+    assert.are.same(
+      { "<CR>", "R", "]N", "]n", "g.", "gC", "q", "zM", "za", "zc", "zv" }, actual
+    )
     assert.is_nil(normal.h)
     assert.is_nil(normal.l)
     assert.are.same({}, keymaps(instance.bufnr, "i"))
     assert.are.same({}, keymaps(instance.bufnr, "v"))
     assert.is_nil(rawget(instance.buffer, "mapping"))
+  end)
+
+  it("creates child-relative and root-relative drafts through the default mappings", function()
+    local adapter = confirmation_adapter()
+    actions._set_ui_adapter(adapter)
+    local instance = ready({ ["src"] = true, ["keep.txt"] = "k" })
+    local winid = open_current(instance)
+
+    local directory_row = row_for(instance, "src")
+    vim.api.nvim_win_set_cursor(winid, { directory_row, 0 })
+    invoke(instance.bufnr, "n", "]n")
+    assert.are.equal(1, #adapter.inputs)
+    adapter.inputs[1].submit("nested/a.ts")
+    local child = assert(instance.buffer:decode(directory_row + 1))
+    assert.is_true(child.draft)
+    assert.are.equal("src/nested/a.ts", child.proposed_path)
+
+    local root_anchor = row_for(instance, "keep.txt")
+    vim.api.nvim_win_set_cursor(winid, { root_anchor, 0 })
+    invoke(instance.bufnr, "n", "]N")
+    assert.are.equal(2, #adapter.inputs)
+    adapter.inputs[2].submit("root.txt")
+    local root_draft = assert(instance.buffer:decode(root_anchor + 1))
+    assert.is_true(root_draft.draft)
+    assert.are.equal("root.txt", root_draft.proposed_path)
+
+    local before = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false)
+    invoke(instance.bufnr, "n", "]N")
+    adapter.inputs[3].submit(nil)
+    assert.are.same(before, vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false))
+  end)
+
+  it("rejects quick-create callbacks after the anchor changes or the instance is destroyed", function()
+    local adapter = confirmation_adapter()
+    actions._set_ui_adapter(adapter)
+    local instance = ready({ ["a.txt"] = "a" })
+    local winid = open_current(instance)
+    local anchor_row = row_for(instance, "a.txt")
+    vim.api.nvim_win_set_cursor(winid, { anchor_row, 0 })
+    invoke(instance.bufnr, "n", "]N")
+
+    set_line(instance, anchor_row, "changed.txt")
+    local changed = vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false)
+    local ok, err = pcall(adapter.inputs[1].submit, "rejected.txt")
+    assert.is_true(ok, tostring(err))
+    assert.are.same(changed, vim.api.nvim_buf_get_lines(instance.bufnr, 0, -1, false))
+
+    invoke(instance.bufnr, "n", "]N")
+    instance:destroy()
+    ok, err = pcall(adapter.inputs[2].submit, "also-rejected.txt")
+    assert.is_true(ok, tostring(err))
+    assert.are.equal("destroyed", instance:status())
   end)
 
   it("toggles every configured non-icon column through the default gC mapping", function()

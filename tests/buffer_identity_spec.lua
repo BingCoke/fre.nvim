@@ -1,4 +1,5 @@
 local fre = require("fre")
+local columns = require("fre.columns")
 local buffer = require("fre.instance.buffer")
 local path = require("fre.path")
 local row = require("fre.instance.row")
@@ -17,11 +18,12 @@ local function wait_for(predicate)
   assert.is_true(vim.wait(1500, predicate, 10))
 end
 
-local function ready(entries, root)
+local function ready(entries, root, opts)
   if entries then
     fixture:tree(entries)
   end
-  local instance = keep(fre.new({ root = root or fixture.root }))
+  opts = vim.tbl_extend("force", { root = root or fixture.root }, opts or {})
+  local instance = keep(fre.new(opts))
   wait_for(function()
     return instance:status() == "ready"
   end)
@@ -122,6 +124,132 @@ describe("fre stable row identity", function()
     assert.are_not.equal(first, second)
     assert.are.equal("a.txt", second.name)
   end)
+
+  it("uses an equal-width non-node marker for drafts", function()
+    local entries = {}
+    for index = 1, 10 do entries[string.format("file-%02d.txt", index)] = "x" end
+    local instance = ready(entries)
+    local existing = assert(instance.buffer:decode(row_for(instance, "file-01.txt")))
+    local draft_marker = row.draft_marker(
+      nil, instance.id, #tostring(instance.tree:latest_node_id())
+    )
+    local decoded = row.decode_marker(nil, 1, draft_marker .. "src/a.ts")
+
+    assert.are.equal(#existing.marker, #draft_marker)
+    assert.are.equal(instance.id, decoded.instance_id)
+    assert.is_true(decoded.draft)
+    assert.is_nil(decoded.node_id)
+    assert.are.equal(draft_marker, decoded.marker)
+  end)
+
+
+  it("inserts an aligned draft after the requested row and moves the cursor to its path", function()
+    local entries = {}
+    for index = 1, 10 do entries[string.format("file-%02d.txt", index)] = "x" end
+    local instance = ready(entries)
+    instance:open({ position = "current" })
+    local winid = vim.api.nvim_get_current_win()
+    local anchor_row = row_for(instance, "file-01.txt")
+    local existing = assert(instance.buffer:decode(anchor_row))
+
+    local inserted = instance:insert_draft({
+      after_row = anchor_row, proposed_path = "src/a.ts", winid = winid,
+    })
+    local decoded = assert(instance.buffer:decode(anchor_row + 1))
+
+    assert.are.equal(anchor_row + 1, inserted.row)
+    assert.is_true(decoded.marked)
+    assert.is_true(decoded.draft)
+    assert.are.equal("new", decoded.row_kind)
+    assert.is_nil(decoded.node_id)
+    assert.are.equal("src/a.ts", decoded.proposed_path)
+    assert.are.equal(existing.path_range.start_byte, decoded.path_range.start_byte)
+    assert.is_true(vim.bo[instance.bufnr].modified)
+    assert.are.same(
+      { anchor_row + 1, decoded.path_range.start_byte }, vim.api.nvim_win_get_cursor(winid)
+    )
+    vim.api.nvim__redraw({ flush = true })
+    for column = 1, #decoded.marker do
+      assert.are.equal(
+        1, vim.fn.synconcealed(inserted.row, column)[1], "draft marker byte " .. column
+      )
+    end
+  end)
+
+
+  it("renders draft columns from target metadata and restores their highlights", function()
+    local seen
+    local custom = columns.custom({
+      id = "draft_state",
+      render = function(entry, ctx)
+        if ctx.draft then
+          seen = {
+            synthetic = ctx.synthetic,
+            draft = ctx.draft,
+            navigation_kind = ctx.navigation_kind,
+            entry_name = entry.name,
+            entry_kind = entry.kind,
+            metadata = vim.deepcopy(ctx.metadata),
+          }
+        end
+        return ctx.draft and "draft" or "entry"
+      end,
+      parse = function(suffix)
+        local value, rest = suffix:match("^(%S+) +(.*)$")
+        return value, rest
+      end,
+      equals = function(_, value, ctx)
+        return value == (ctx.draft and "draft" or "entry")
+      end,
+    })
+    local icon = columns.icon({
+      provider = function(entry)
+        if entry.kind == "directory" then return "DIR", "FreDirectoryIcon" end
+        return entry.name, "FreFileIcon"
+      end,
+    })
+    local instance = ready({ ["source-name.txt"] = "x" }, nil, {
+      columns = { icon, columns.permissions(), columns.size(), columns.mtime(), custom },
+    })
+    instance:open({ position = "current" })
+    local winid = vim.api.nvim_get_current_win()
+    local anchor_row = row_for(instance, "source-name.txt")
+    local file = instance:insert_draft({
+      after_row = anchor_row, proposed_path = "a.ts", winid = winid,
+    })
+    local decoded = assert(instance.buffer:decode(file.row))
+
+    assert.are.equal("a.ts", decoded.column_values.icon)
+    assert.are.equal("-", decoded.column_values.permissions)
+    assert.are.equal("-", decoded.column_values.size)
+    assert.are.equal("-", decoded.column_values.mtime)
+    assert.are.equal("draft", decoded.column_values.draft_state)
+    assert.are.same({
+      synthetic = true,
+      draft = true,
+      entry_name = "a.ts",
+      entry_kind = "file",
+      metadata = { kind = "file", mode = nil, size = nil, mtime = nil },
+    }, seen)
+    local file_decorations = row.decorations(
+      instance.buffer, file.row, lines(instance)[file.row]
+    )
+    assert.is_true(vim.tbl_contains(vim.tbl_map(function(item)
+      return item.hl_group
+    end, file_decorations), "FreFileIcon"))
+
+    local directory = instance:insert_draft({
+      after_row = file.row, proposed_path = "folder/", winid = winid,
+    })
+    local directory_decoded = assert(instance.buffer:decode(directory.row))
+    assert.are.equal("DIR", directory_decoded.column_values.icon)
+    local groups = vim.tbl_map(function(item) return item.hl_group end, row.decorations(
+      instance.buffer, directory.row, lines(instance)[directory.row]
+    ))
+    assert.is_true(vim.tbl_contains(groups, "FreDirectoryIcon"))
+    assert.is_true(vim.tbl_contains(groups, "FreDirectoryPath"))
+  end)
+
 
   it("keeps node markers and rendered columns aligned within one instance", function()
     local entries = {}
