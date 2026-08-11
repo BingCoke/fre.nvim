@@ -671,7 +671,7 @@ $p = '\\?\C:\absolute\path\to\nul'
 - 启用默认目录接管后，当前 Neovim 进程中没有恢复 netrw 的公共 API。
 - `refresh({ force = true })` 和默认 `R` action 会直接丢弃未保存的 Fre buffer 草稿。
 - 原生 jumplist、buffer navigation 和普通 split duplicate 都按实际窗口支持；外部创建的 float 没有可可靠推断的 ordinary origin，需要相关 action 显式提供 `anchor_winid`。
-- ActionContext 只支持 mapping/action 的同步调用；调用方缓存后延迟执行不受支持。内置 quick-create action 会在自身输入 callback 前后执行窄值捕获和 source 重验。
+- ActionContext 只支持 mapping/action 的同步调用；调用方缓存后延迟执行不受支持。内置 quick-create action 会同步验证 source、插入草稿并进入 insert mode，不保留传入 context。
 
 ## 开发与测试
 

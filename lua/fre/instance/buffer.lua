@@ -519,8 +519,9 @@ function M:insert_draft(opts)
     )
   end
   local decoded = self:decode(inserted_row)
-  vim.api.nvim_win_set_cursor(winid, { inserted_row, decoded.path_range.end_byte })
-  return { row = inserted_row, col = decoded.path_range.end_byte }
+  local cursor_col = math.max(decoded.path_range.start_byte, decoded.path_range.end_byte - 1)
+  vim.api.nvim_win_set_cursor(winid, { inserted_row, cursor_col })
+  return { row = inserted_row, col = cursor_col }
 end
 
 local function descriptor_depends_on(descriptor, changed)

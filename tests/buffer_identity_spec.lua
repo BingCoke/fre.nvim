@@ -166,7 +166,7 @@ describe("fre stable row identity", function()
     assert.are.equal(existing.path_range.start_byte, decoded.path_range.start_byte)
     assert.is_true(vim.bo[instance.bufnr].modified)
     assert.are.same(
-      { anchor_row + 1, decoded.path_range.start_byte }, vim.api.nvim_win_get_cursor(winid)
+      { anchor_row + 1, decoded.path_range.end_byte - 1 }, vim.api.nvim_win_get_cursor(winid)
     )
     vim.api.nvim__redraw({ flush = true })
     for column = 1, #decoded.marker do

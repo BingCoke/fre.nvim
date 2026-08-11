@@ -107,7 +107,7 @@ local function insert_draft(ctx, base)
     proposed_path = proposed_path,
     winid = ctx.winid,
   })
-  vim.api.nvim_win_call(ctx.winid, function() vim.cmd("startinsert!") end)
+  vim.cmd("startinsert!")
   return inserted
 end
 
