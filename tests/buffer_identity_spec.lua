@@ -249,6 +249,17 @@ describe("fre stable row identity", function()
     ))
     assert.is_true(vim.tbl_contains(groups, "FreDirectoryIcon"))
     assert.is_true(vim.tbl_contains(groups, "FreDirectoryPath"))
+
+    local hidden_directory = instance:insert_draft({
+      after_row = directory.row, proposed_path = ".cache/", winid = winid,
+      projection_kind = "file",
+    })
+    local hidden_groups = vim.tbl_map(function(item) return item.hl_group end, row.decorations(
+      instance.buffer, hidden_directory.row, lines(instance)[hidden_directory.row]
+    ))
+    assert.is_true(vim.tbl_contains(hidden_groups, "FreFileIcon"))
+    assert.is_true(vim.tbl_contains(hidden_groups, "FreHiddenDirectory"))
+    assert.is_false(vim.tbl_contains(hidden_groups, "FreHiddenFile"))
   end)
 
 

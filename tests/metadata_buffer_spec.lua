@@ -482,50 +482,84 @@ describe("fre metadata buffer rows", function()
     end
   end)
 
-  it("renders Oil-like directory and hidden path highlights", function()
+  it("renders hierarchical path segments and neutral hidden entries", function()
     local instance = ready({
       [".env"] = "x",
       [".cache/inside.txt"] = "x",
-      ["src/child.txt"] = "x",
+      ["src/components/ui/button.lua"] = "x",
       ["plain.txt"] = "x",
-    }, { hidden_file = true, expanded = { ".cache", "src" } })
+    }, {
+      hidden_file = true,
+      expanded = { ".cache", "src", "src/components", "src/components/ui" },
+    })
     instance:open({ position = "current" })
 
-    local function path_mark(row)
-      local decoded = assert(instance.buffer:decode(row))
+    local path_groups = {
+      FreDirectoryPath = true, FreHiddenPath = true, FreDirectoryPrefix = true,
+      FreHiddenDirectoryPrefix = true, FrePathSeparator = true,
+      FreHiddenPathSeparator = true,
+      FreHiddenFile = true, FreHiddenDirectory = true,
+    }
+    local function path_marks(row_number)
+      local decoded = assert(instance.buffer:decode(row_number))
+      local physical = lines(instance)[row_number]
+      local result = {}
       for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
         instance.bufnr, -1, 0, -1, { details = true }
       )) do
         local details = mark[4] or {}
-        if mark[2] == row - 1 and mark[3] == decoded.path_range.start_byte
-            and details.end_col == decoded.path_range.end_byte
-            and (details.hl_group == "FreDirectoryPath"
-              or details.hl_group == "FreHiddenPath") then
-          return details.hl_group
+        if mark[2] == row_number - 1 and path_groups[details.hl_group]
+            and mark[3] >= decoded.path_range.start_byte
+            and details.end_col <= decoded.path_range.end_byte then
+          result[#result + 1] = {
+            start_col = mark[3] - decoded.path_range.start_byte,
+            end_col = details.end_col - decoded.path_range.start_byte,
+            text = physical:sub(mark[3] + 1, details.end_col),
+            hl_group = details.hl_group,
+          }
         end
       end
-      return nil
+      table.sort(result, function(left, right) return left.start_col < right.start_col end)
+      return result
     end
 
-    assert.are.equal("FreHiddenPath", path_mark(1))
-    assert.are.equal("FreHiddenPath", path_mark(row_for(instance, ".env")))
-    assert.are.equal("FreHiddenPath", path_mark(row_for(instance, ".cache")))
-    assert.are.equal("FreHiddenPath", path_mark(row_for(instance, ".cache/inside.txt")))
-    assert.are.equal("FreDirectoryPath", path_mark(row_for(instance, "src")))
-    assert.is_nil(path_mark(row_for(instance, "src/child.txt")))
-    assert.is_nil(path_mark(row_for(instance, "plain.txt")))
+    assert.are.same({
+      { start_col = 0, end_col = 3, text = "../", hl_group = "FreHiddenPath" },
+    }, path_marks(1))
+    assert.are.same({
+      { start_col = 0, end_col = 4, text = ".env", hl_group = "FreHiddenFile" },
+    }, path_marks(row_for(instance, ".env")))
+    assert.are.same({
+      { start_col = 0, end_col = 6, text = ".cache", hl_group = "FreHiddenDirectory" },
+      { start_col = 6, end_col = 7, text = "/", hl_group = "FreHiddenPathSeparator" },
+    }, path_marks(row_for(instance, ".cache")))
+    assert.are.same({
+      { start_col = 0, end_col = 6, text = ".cache", hl_group = "FreHiddenDirectoryPrefix" },
+      { start_col = 6, end_col = 7, text = "/", hl_group = "FreHiddenPathSeparator" },
+    }, path_marks(row_for(instance, ".cache/inside.txt")))
+    assert.are.same({
+      { start_col = 0, end_col = 3, text = "src", hl_group = "FreDirectoryPrefix" },
+      { start_col = 3, end_col = 4, text = "/", hl_group = "FrePathSeparator" },
+      { start_col = 4, end_col = 14, text = "components", hl_group = "FreDirectoryPrefix" },
+      { start_col = 14, end_col = 15, text = "/", hl_group = "FrePathSeparator" },
+      { start_col = 15, end_col = 17, text = "ui", hl_group = "FreDirectoryPrefix" },
+      { start_col = 17, end_col = 18, text = "/", hl_group = "FrePathSeparator" },
+    }, path_marks(row_for(instance, "src/components/ui/button.lua")))
+    assert.are.same({}, path_marks(row_for(instance, "plain.txt")))
 
     local hidden_row = row_for(instance, ".env")
-    vim.api.nvim_win_set_cursor(0, { hidden_row, instance.buffer:decode(hidden_row).path_range.start_byte })
+    vim.api.nvim_win_set_cursor(
+      0, { hidden_row, instance.buffer:decode(hidden_row).path_range.start_byte }
+    )
     vim.cmd.normal({ args = { "yyp" }, bang = true })
     assert.is_true(vim.wait(1000, function()
       local count = 0
       for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(
         instance.bufnr, -1, 0, -1, { details = true }
       )) do
-        if mark[4].hl_group == "FreHiddenPath" then count = count + 1 end
+        if mark[4].hl_group == "FreHiddenFile" then count = count + 1 end
       end
-      return count == 5
+      return count == 2
     end, 10))
   end)
 
@@ -555,8 +589,8 @@ describe("fre metadata buffer rows", function()
       )) do
         local details = mark[4] or {}
         if mark[2] == entry_row - 1 and mark[3] == path_start
-            and (details.hl_group == "FreDirectoryPath"
-              or details.hl_group == "FreHiddenPath") then
+            and (details.hl_group == "FreHiddenFile"
+              or details.hl_group == "FreHiddenDirectory") then
           return details.hl_group
         end
       end
@@ -566,7 +600,7 @@ describe("fre metadata buffer rows", function()
     set_line(instance, entry_row, prefix .. ".hidden")
     assert.is_true(vim.wait(1000, function()
       return not instance.buffer.highlight_update_scheduled
-        and path_group() == "FreHiddenPath"
+        and path_group() == "FreHiddenFile"
     end, 10))
     assert.are.equal(0, parse_calls)
 
@@ -605,12 +639,32 @@ describe("fre metadata buffer rows", function()
     local template = assert(prepared.row_templates[node.id])
     local edited_path = "visible\\.hidden\\file.txt"
     local line = prepared.lines[2]:sub(1, template.path_range.start_byte) .. edited_path
-    assert.are.same({ {
-      start_col = template.path_range.start_byte,
-      end_col = template.path_range.start_byte + #edited_path,
-      text = edited_path,
-      hl_group = "FreHiddenPath",
-    } }, row.decorations(fake, 2, line))
+    assert.are.same({
+      {
+        start_col = template.path_range.start_byte,
+        end_col = template.path_range.start_byte + #"visible",
+        text = "visible",
+        hl_group = "FreDirectoryPrefix",
+      },
+      {
+        start_col = template.path_range.start_byte + #"visible",
+        end_col = template.path_range.start_byte + #"visible\\",
+        text = "\\",
+        hl_group = "FrePathSeparator",
+      },
+      {
+        start_col = template.path_range.start_byte + #"visible\\",
+        end_col = template.path_range.start_byte + #"visible\\.hidden",
+        text = ".hidden",
+        hl_group = "FreHiddenDirectoryPrefix",
+      },
+      {
+        start_col = template.path_range.start_byte + #"visible\\.hidden",
+        end_col = template.path_range.start_byte + #"visible\\.hidden\\",
+        text = "\\",
+        hl_group = "FreHiddenPathSeparator",
+      },
+    }, row.decorations(fake, 2, line))
   end)
   it("keeps exact provider highlights through copy move delete undo and redo", function()
     vim.api.nvim_set_hl(0, "FreTestIcon", { fg = "#ff3366" })

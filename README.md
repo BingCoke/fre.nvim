@@ -415,6 +415,52 @@ actions.split_select(ctx, {
 
 Descriptor `enable`、`hidden_columns`、configured/enabled/hidden/visible 状态、custom descriptor 契约和公开查询的完整说明见 [COLUMNS.md](COLUMNS.md)。
 
+## 路径高亮
+
+Fre 保留完整、可编辑的相对路径文本，但会把 path 字段分段高亮，使多层目录更容易辨认。祖先目录和分隔符使用弱化颜色，当前 basename 使用条目类型对应的颜色；普通文件 basename 不设置专用 highlight group，直接继承 `Normal`。
+
+| Highlight group | 作用 | 默认值 |
+| --- | --- | --- |
+| `FreDirectoryPrefix` | 普通祖先目录片段 | link 到 `Comment` |
+| `FreHiddenDirectoryPrefix` | basename 以 `.` 开头的祖先目录片段 | `#707868` |
+| `FrePathSeparator` | 普通目录片段后的 `/` 或 `\` | link 到 `NonText` |
+| `FreHiddenPathSeparator` | 隐藏目录片段后的 `/` 或 `\` | `#596054` |
+| `FreDirectoryPath` | 当前普通目录 basename，以及根导航 `/` | link 到 `Directory` |
+| `FreHiddenFile` | 当前隐藏文件 basename | `#b8c0a9` |
+| `FreHiddenDirectory` | 当前隐藏目录 basename | `#b8c0a9` |
+| `FreHiddenPath` | 父目录导航行 `../` | link 到 `Comment` |
+
+例如 `src/.config/nvim/init.lua` 会依次使用 `FreDirectoryPrefix`、`FrePathSeparator`、`FreHiddenDirectoryPrefix`、`FreHiddenPathSeparator`、`FreDirectoryPrefix`、`FrePathSeparator`；最后的普通文件名 `init.lua` 使用 `Normal`。路径文本、复制内容和 `:write` 解析不会因高亮而改变。
+
+可以在 colorscheme 加载后直接覆盖这些 group。使用 link 能跟随 colorscheme，并避免写死终端或 GUI 颜色：
+
+```lua
+local function set_fre_highlights()
+  vim.api.nvim_set_hl(0, "FreDirectoryPrefix", { link = "Comment" })
+  vim.api.nvim_set_hl(0, "FreHiddenDirectoryPrefix", { link = "DiagnosticHint" })
+  vim.api.nvim_set_hl(0, "FrePathSeparator", { link = "NonText" })
+  vim.api.nvim_set_hl(0, "FreHiddenPathSeparator", { link = "DiagnosticHint" })
+  vim.api.nvim_set_hl(0, "FreDirectoryPath", { link = "Directory", bold = true })
+  vim.api.nvim_set_hl(0, "FreHiddenFile", { link = "Comment" })
+  vim.api.nvim_set_hl(0, "FreHiddenDirectory", { link = "Directory" })
+  vim.api.nvim_set_hl(0, "FreHiddenPath", { link = "Comment" })
+end
+
+set_fre_highlights()
+vim.api.nvim_create_autocmd("ColorScheme", {
+  callback = set_fre_highlights,
+})
+```
+
+也可以不用 link，直接指定颜色和样式：
+
+```lua
+vim.api.nvim_set_hl(0, "FreHiddenFile", { fg = "#a6adc8" })
+vim.api.nvim_set_hl(0, "FreHiddenDirectory", { fg = "#a6adc8", bold = true })
+```
+
+Fre 注册默认 group 时使用 `default = true`，因此不会覆盖用户已经定义的同名 group。colorscheme 切换可能清除或重建 highlight；需要跨 colorscheme 保留自定义时，应使用上面的 `ColorScheme` autocmd 重新应用。
+
 ## Lua API
 
 顶层模块：

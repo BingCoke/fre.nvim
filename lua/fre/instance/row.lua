@@ -177,19 +177,71 @@ local function navigation_callback_entry(source, navigation_kind, tree)
   return entry
 end
 
-local function has_hidden_path_segment(relative_path)
-  for segment in relative_path:gmatch("[^/\\]+") do
-    if segment:sub(1, 1) == "." then return true end
+local function path_decorations(relative_path, kind, navigation_kind, offset)
+  if type(relative_path) ~= "string" or relative_path == "" then return {} end
+  offset = offset or 0
+  if navigation_kind == "parent" then
+    return { {
+      start_col = offset, end_col = offset + #relative_path,
+      text = relative_path, hl_group = "FreHiddenPath",
+    } }
   end
-  return false
-end
+  if navigation_kind == "root" then
+    return { {
+      start_col = offset, end_col = offset + #relative_path,
+      text = relative_path, hl_group = "FreDirectoryPath",
+    } }
+  end
 
-local function path_highlight(relative_path, kind, navigation_kind)
-  if navigation_kind == "parent" then return "FreHiddenPath" end
-  if navigation_kind == "root" then return "FreDirectoryPath" end
-  if has_hidden_path_segment(relative_path) then return "FreHiddenPath" end
-  if kind == "directory" then return "FreDirectoryPath" end
-  return nil
+  local result = {}
+  local content_end = #relative_path
+  if relative_path:sub(-1) == "/" or relative_path:sub(-1) == "\\" then
+    content_end = content_end - 1
+  end
+  local last_separator = relative_path:sub(1, content_end):match(".*()[/\\]")
+  local current_start = last_separator and last_separator + 1 or 1
+
+  local function add(start_index, end_index, hl_group)
+    if end_index > start_index then
+      result[#result + 1] = {
+        start_col = offset + start_index - 1,
+        end_col = offset + end_index - 1,
+        text = relative_path:sub(start_index, end_index - 1),
+        hl_group = hl_group,
+      }
+    end
+  end
+
+  local cursor = 1
+  while cursor < current_start do
+    local separator = relative_path:find("[/\\]", cursor)
+    if not separator or separator >= current_start then break end
+    local segment = relative_path:sub(cursor, separator - 1)
+    local hidden = segment:sub(1, 1) == "."
+    if segment ~= "" then
+      add(cursor, separator, hidden
+        and "FreHiddenDirectoryPrefix" or "FreDirectoryPrefix")
+    end
+    add(separator, separator + 1, hidden
+      and "FreHiddenPathSeparator" or "FrePathSeparator")
+    cursor = separator + 1
+  end
+
+  local current = relative_path:sub(current_start, content_end)
+  if current ~= "" then
+    local group
+    if current:sub(1, 1) == "." then
+      group = kind == "directory" and "FreHiddenDirectory" or "FreHiddenFile"
+    elseif kind == "directory" then
+      group = "FreDirectoryPath"
+    end
+    if group then add(current_start, content_end + 1, group) end
+  end
+  if content_end < #relative_path then
+    add(#relative_path, #relative_path + 1, current:sub(1, 1) == "."
+      and "FreHiddenPathSeparator" or "FrePathSeparator")
+  end
+  return result
 end
 
 function M.draft_item(buffer, proposed_path, projection_kind)
@@ -209,7 +261,7 @@ function M.draft_item(buffer, proposed_path, projection_kind)
     node_id = nil,
     callback_entry = entry,
     path = proposed_path,
-    path_highlight = path_highlight(proposed_path, kind, nil),
+    path_kind = target_kind,
     synthetic = true,
     draft = true,
     projection_kind = kind,
@@ -602,14 +654,10 @@ local function draft_decorations(buffer, row_number, line)
       end
     end
   end
-  local group = path_highlight(decoded.proposed_path, item.node.kind, nil)
-  if group and decoded.path_range.end_byte > decoded.path_range.start_byte then
-    add_unchanged_decoration(result, line, {
-      start_col = decoded.path_range.start_byte,
-      end_col = decoded.path_range.end_byte,
-      text = decoded.proposed_path,
-      hl_group = group,
-    })
+  for _, decoration in ipairs(path_decorations(
+      decoded.proposed_path, item.path_kind, nil, decoded.path_range.start_byte
+  )) do
+    add_unchanged_decoration(result, line, decoration)
   end
   return result
 end
@@ -620,14 +668,7 @@ function M.decorations(buffer, row_number, line)
   if line:sub(1, 1) ~= US then
     local proposed_path, path_range = trim_range(line, 0)
     local kind = proposed_path:sub(-1) == "/" and "directory" or nil
-    local group = path_highlight(proposed_path, kind, nil)
-    if not group or path_range.end_byte <= path_range.start_byte then return {} end
-    return { {
-      start_col = path_range.start_byte,
-      end_col = path_range.end_byte,
-      text = proposed_path,
-      hl_group = group,
-    } }
+    return path_decorations(proposed_path, kind, nil, path_range.start_byte)
   end
 
   local identity = M.decode_marker(buffer, row_number, line)
@@ -660,7 +701,9 @@ function M.decorations(buffer, row_number, line)
   local suffix = line:sub(identity.marker_end + 1)
   local resolved = resolve_layout(descriptors, suffix, identity.marker_end, layout)
   if not resolved then
-    add_unchanged_decoration(result, line, template.path_highlight)
+    for _, decoration in ipairs(template.path_decorations or {}) do
+      add_unchanged_decoration(result, line, decoration)
+    end
     return result
   end
 
@@ -668,14 +711,8 @@ function M.decorations(buffer, row_number, line)
   local proposed_path, path_range = trim_range(
     suffix:sub(resolved.consumed + 1), path_offset
   )
-  local group = path_highlight(proposed_path, node.kind, navigation_kind)
-  if group and path_range.end_byte > path_range.start_byte then
-    result[#result + 1] = {
-      start_col = path_range.start_byte,
-      end_col = path_range.end_byte,
-      text = proposed_path,
-      hl_group = group,
-    }
+  for _, decoration in ipairs(path_decorations(proposed_path, node.kind, navigation_kind, path_range.start_byte)) do
+    add_unchanged_decoration(result, line, decoration)
   end
   return result
 end
@@ -866,9 +903,6 @@ function M.project_items(buffer, projection, render_path, tree)
       node_id = navigation_kind and 0 or node.id,
       callback_entry = callback_entry,
       path = rendered_path,
-      path_highlight = path_highlight(
-        callback_entry.relative_path, callback_entry.kind, navigation_kind
-      ),
       synthetic = navigation_kind ~= nil,
       navigation_kind = navigation_kind,
     }
@@ -953,19 +987,19 @@ function M.prepare(buffer, projection, rendered, descriptors, widths, opts)
     if #physical > 0 then suffix = table.concat(physical, " ") .. " " .. suffix end
     lines[row_number] = marker_text .. suffix
     template.path_range = { start_byte = offset, end_byte = offset + #item.path }
-    if item.path_highlight and #item.path > 0 then
-      highlights[#highlights + 1] = {
-        row = row_number - 1,
-        start_col = offset,
-        end_col = offset + #item.path,
-        hl_group = item.path_highlight,
-      }
-      template.path_highlight = {
-        start_col = offset,
-        end_col = offset + #item.path,
-        text = item.path,
-        hl_group = item.path_highlight,
-      }
+    if #item.path > 0 then
+      local decorations = path_decorations(
+        item.path, item.path_kind or item.node.kind, item.navigation_kind, offset
+      )
+      template.path_decorations = decorations
+      for _, decoration in ipairs(decorations) do
+        highlights[#highlights + 1] = {
+          row = row_number - 1,
+          start_col = decoration.start_col,
+          end_col = decoration.end_col,
+          hl_group = decoration.hl_group,
+        }
+      end
     end
     template.line = lines[row_number]
     if not item.draft then row_templates[item.node_id] = template end
