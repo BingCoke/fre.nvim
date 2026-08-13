@@ -106,6 +106,7 @@ local function insert_draft(ctx, base)
     after_row = ctx.row,
     proposed_path = proposed_path,
     winid = ctx.winid,
+    projection_kind = "file",
   })
   vim.cmd("startinsert!")
   return inserted

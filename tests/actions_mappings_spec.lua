@@ -290,7 +290,21 @@ describe("fre ticket 17 actions and mappings", function()
   end)
 
   it("inserts child-relative and root-relative drafts ready for filename completion", function()
-    local instance = ready({ ["src"] = true, ["keep.txt"] = "k" })
+    local kind_token = columns.custom({
+      id = "kind_token",
+      metadata = { "kind" },
+      render = function(entry) return entry.kind == "file" and "F" or "D" end,
+      parse = function(suffix, ctx)
+        local value, rest = suffix:match("^(%S+) +(.*)$")
+        local expected = ctx.metadata.kind == "file" and "F" or "D"
+        if value ~= expected then error("expected " .. expected .. ", got " .. tostring(value)) end
+        return value, rest
+      end,
+      equals = function() return true end,
+    })
+    local instance = ready({ ["src"] = true, ["keep.txt"] = "k" }, {
+      columns = { columns.icon({ provider = "ascii" }), kind_token },
+    })
     local winid = open_current(instance)
 
     local directory_row = row_for(instance, "src")
@@ -300,6 +314,8 @@ describe("fre ticket 17 actions and mappings", function()
     local child = assert(instance.buffer:decode(directory_row + 1))
     assert.is_true(child.draft)
     assert.are.equal("src/child.txt", child.proposed_path)
+    assert.are.equal("f", child.column_values.icon)
+    assert.are.equal("F", child.column_values.kind_token)
 
     local root_anchor = row_for(instance, "keep.txt")
     vim.api.nvim_win_set_cursor(winid, { root_anchor, 0 })
@@ -308,6 +324,22 @@ describe("fre ticket 17 actions and mappings", function()
     local root_draft = assert(instance.buffer:decode(root_anchor + 1))
     assert.is_true(root_draft.draft)
     assert.are.equal("root.txt", root_draft.proposed_path)
+    assert.are.equal("f", root_draft.column_values.icon)
+    assert.are.equal("F", root_draft.column_values.kind_token)
+
+    directory_row = row_for(instance, "src")
+    vim.api.nvim_win_set_cursor(winid, { directory_row, 0 })
+    local directory_keys = vim.api.nvim_replace_termcodes("]nnewdir/<Esc>", true, false, true)
+    vim.api.nvim_feedkeys(directory_keys, "mx", false)
+    local directory_draft = assert(instance.buffer:decode(directory_row + 1))
+    assert.are.equal("src/newdir/", directory_draft.proposed_path)
+    assert.are.equal("f", directory_draft.column_values.icon)
+    assert.are.equal("F", directory_draft.column_values.kind_token)
+    local directory_operation
+    for _, operation in ipairs(instance:prepare().operations) do
+      if operation.path == fixture:path("src/newdir") then directory_operation = operation end
+    end
+    assert.are.equal("create_directory", assert(directory_operation).type)
   end)
 
   it("toggles every configured non-icon column through the default gC mapping", function()

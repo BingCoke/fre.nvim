@@ -6,7 +6,8 @@ local M = {}
 
 local US = string.char(31)
 local PREFIX = US .. "fre:"
-local DRAFT_IDENTITY_BYTE = "D"
+local DRAFT_KIND_BYTES = { directory = "D", file = "F" }
+local DRAFT_BYTE_KINDS = { D = "directory", F = "file" }
 local PARSER_GUARD = US .. "fre-parser-guard" .. US
 local MAX_EXACT_INTEGER = 9007199254740991
 
@@ -69,13 +70,15 @@ function M.marker(_, instance_id, node_id, node_width)
     .. format_aligned_node_id(node_id, node_width) .. US
 end
 
-function M.draft_marker(_, instance_id, node_width)
+function M.draft_marker(_, instance_id, node_width, projection_kind)
   validate_marker_instance(instance_id)
   if type(node_width) ~= "number" or node_width % 1 ~= 0 or node_width < 1 then
     fail("draft marker width must be a positive integer", 3)
   end
+  local identity_byte = DRAFT_KIND_BYTES[projection_kind]
+  if not identity_byte then fail("draft projection kind must be file or directory", 3) end
   return PREFIX .. tostring(#instance_id) .. ":" .. instance_id .. ":"
-    .. string.rep(DRAFT_IDENTITY_BYTE, node_width) .. US
+    .. string.rep(identity_byte, node_width) .. US
 end
 
 function M.decode_marker(_, row_number, line)
@@ -101,13 +104,14 @@ function M.decode_marker(_, row_number, line)
   local marker_end = line:find(US, node_start, true)
   if not marker_end then fail_row(row_number, "malformed reserved row marker") end
   local node_text = line:sub(node_start, marker_end - 1)
-  local draft = node_text ~= ""
-    and node_text == string.rep(DRAFT_IDENTITY_BYTE, #node_text)
+  local projection_kind = DRAFT_BYTE_KINDS[node_text:sub(1, 1)]
+  local draft = projection_kind ~= nil
+    and node_text == string.rep(DRAFT_KIND_BYTES[projection_kind], #node_text)
   local node_id
   if not draft then node_id = decode_aligned_node_id(node_text, row_number) end
   local marker_text = line:sub(1, marker_end)
   local canonical = draft
-    and M.draft_marker(nil, instance_id, #node_text)
+    and M.draft_marker(nil, instance_id, #node_text, projection_kind)
     or M.marker(nil, instance_id, node_id, #node_text)
   if marker_text ~= canonical then
     fail_row(row_number, "non-canonical row marker")
@@ -117,6 +121,7 @@ function M.decode_marker(_, row_number, line)
     instance_id = instance_id,
     node_id = node_id,
     draft = draft,
+    projection_kind = projection_kind,
     marker = marker_text,
     raw_marker_text = marker_text,
   }
@@ -187,9 +192,10 @@ local function path_highlight(relative_path, kind, navigation_kind)
   return nil
 end
 
-function M.draft_item(buffer, proposed_path)
-  local kind = proposed_path:sub(-1) == "/" and "directory" or "file"
-  local relative = kind == "directory" and proposed_path:sub(1, -2) or proposed_path
+function M.draft_item(buffer, proposed_path, projection_kind)
+  local target_kind = proposed_path:sub(-1) == "/" and "directory" or "file"
+  local kind = projection_kind or target_kind
+  local relative = target_kind == "directory" and proposed_path:sub(1, -2) or proposed_path
   local entry = {
     instance_id = buffer.id,
     node_id = nil,
@@ -206,6 +212,7 @@ function M.draft_item(buffer, proposed_path)
     path_highlight = path_highlight(proposed_path, kind, nil),
     synthetic = true,
     draft = true,
+    projection_kind = kind,
   }
 end
 
@@ -394,7 +401,9 @@ local function decode_draft(buffer, row_number, line, decoded_marker, opts)
   local proposed_path, path_range = trim_range(
     suffix:sub(resolved.consumed + 1), decoded_marker.marker_end + resolved.consumed
   )
-  local item_ok, item = pcall(M.draft_item, buffer, proposed_path)
+  local item_ok, item = pcall(
+    M.draft_item, buffer, proposed_path, decoded_marker.projection_kind
+  )
   if not item_ok then fail_row(row_number, "invalid draft path: " .. tostring(item)) end
   local parsed = parse_columns(
     row_number, buffer, item.node, suffix, decoded_marker.marker_end, {
@@ -410,6 +419,7 @@ local function decode_draft(buffer, row_number, line, decoded_marker, opts)
     row_kind = "new",
     marked = true,
     draft = true,
+    projection_kind = decoded_marker.projection_kind,
     synthetic = true,
     line = line,
     marker = decoded_marker.marker,
@@ -567,7 +577,7 @@ local function draft_decorations(buffer, row_number, line)
     validate_metadata = false,
   })
   if not ok or not decoded or not decoded.draft then return {} end
-  local item = M.draft_item(buffer, decoded.proposed_path)
+  local item = M.draft_item(buffer, decoded.proposed_path, decoded.projection_kind)
   local descriptors = buffer.visible_columns or {}
   local widths = buffer.view and buffer.view.column_widths or {}
   local result = {}
@@ -881,7 +891,9 @@ function M.prepare(buffer, projection, rendered, descriptors, widths, opts)
   local lines, baseline, highlights, row_templates = {}, {}, {}, {}
   for row_number, item in ipairs(rendered) do
     local marker_text = item.draft
-      and M.draft_marker(buffer, buffer.id, marker_node_width)
+      and M.draft_marker(
+        buffer, buffer.id, marker_node_width, item.projection_kind
+      )
       or M.marker(buffer, buffer.id, item.node_id, marker_node_width)
     local physical = {}
     local template = {

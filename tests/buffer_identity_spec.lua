@@ -131,13 +131,14 @@ describe("fre stable row identity", function()
     local instance = ready(entries)
     local existing = assert(instance.buffer:decode(row_for(instance, "file-01.txt")))
     local draft_marker = row.draft_marker(
-      nil, instance.id, #tostring(instance.tree:latest_node_id())
+      nil, instance.id, #tostring(instance.tree:latest_node_id()), "file"
     )
     local decoded = row.decode_marker(nil, 1, draft_marker .. "src/a.ts")
 
     assert.are.equal(#existing.marker, #draft_marker)
     assert.are.equal(instance.id, decoded.instance_id)
     assert.is_true(decoded.draft)
+    assert.are.equal("file", decoded.projection_kind)
     assert.is_nil(decoded.node_id)
     assert.are.equal(draft_marker, decoded.marker)
   end)

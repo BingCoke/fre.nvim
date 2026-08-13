@@ -471,7 +471,7 @@ function M:insert_draft(opts)
     fail("draft target window is not valid", 3)
   end
 
-  local item = row.draft_item(self, proposed_path)
+  local item = row.draft_item(self, proposed_path, opts.projection_kind)
   local descriptors = self.visible_columns
   local widths = self.view.column_widths or {}
   if #widths ~= #descriptors then fail("draft columns require a committed layout", 3) end

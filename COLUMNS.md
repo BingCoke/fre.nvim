@@ -35,7 +35,7 @@ columns.mtime({ format = "%Y-%m-%d", align = "right" })
 
 `size` 使用 `lstat.size` 和十进制单位；`mtime` 使用 descriptor 的 `format`。permissions、size、mtime 和可导航 custom column 在 buffer 中可以选择和临时编辑，但写入准备阶段会重新解析并验证其语义只读值。
 
-快速创建草稿沿用当前 visible descriptor 顺序、已提交投影宽度、padding 和 alignment。`icon` 根据目标 basename 与 file/directory kind 渲染；permissions、size 和 mtime 在没有 filesystem truth 时显示 `-`，不会复制 anchor 行的 metadata。若 custom descriptor 的草稿文本超过当前已提交宽度，创建会明确失败，不会截断字段或在 modified buffer 上重投影。
+快速创建草稿沿用当前 visible descriptor 顺序、已提交投影宽度、padding 和 alignment。`]n` / `]N` 的预填 path 还不是最终目标，因此初始 `icon` 和 kind-dependent custom columns 按 file 草稿渲染；permissions、size 和 mtime 在没有 filesystem truth 时显示 `-`，不会复制 anchor 行的 metadata。若 custom descriptor 的草稿文本超过当前已提交宽度，创建会明确失败，不会截断字段或在 modified buffer 上重投影。
 
 ## Custom Descriptors
 
@@ -77,7 +77,7 @@ Callback context 的 `column_index` 与 `is_last` 相对 Instance 构建时固�
 
 导航行使用相同的 visible column 顺序和投影宽度。其 callback context 包含 `synthetic = true` 和 `navigation_kind = "parent" | "root"`，并提供 callback-only directory Entry；`instance:get_entry(1)` 仍返回 `nil`。
 
-快速创建草稿调用同一组 `render(entry, ctx)` 和 `parse(suffix, ctx)`，但不会用 `equals` 把展示列当作已存在的 filesystem metadata 约束。其 context 包含 `synthetic = true`、`draft = true`，不含 `navigation_kind`；`ctx.metadata` 只保留目标 `kind`，`mode`、`size`、`mtime` 为 `nil`。callback Entry 包含当前 Instance identity、目标 absolute/root-relative path、basename 和推断的 file/directory kind，但 `node_id = nil`。descriptor 不应把 synthetic draft 当作已存在的 filesystem snapshot；用户之后修改 path 时，创建目标以 path 为准，成功写入/reconcile 后全部 columns 才按真实 filesystem truth 重投影。
+快速创建草稿调用同一组 `render(entry, ctx)` 和 `parse(suffix, ctx)`，但不会用 `equals` 把展示列当作已存在的 filesystem metadata 约束。其 context 包含 `synthetic = true`、`draft = true`，不含 `navigation_kind`；`ctx.metadata` 只保留投影 `kind`，`mode`、`size`、`mtime` 为 `nil`。callback Entry 包含当前 Instance identity、absolute/root-relative path、basename 和投影 kind，但 `node_id = nil`。quick-create 把未完成的目录前缀投影为 file 草稿，并在 draft marker 中保留该投影 kind，使后续 parse 与物理 columns 使用同一 context；filesystem create kind 则始终由最终 path 是否带尾 `/` 独立决定。descriptor 不应把 synthetic draft 当作已存在的 filesystem snapshot；成功写入/reconcile 后全部 columns 才按真实 filesystem truth 重投影。
 
 ## 构建期配置
 

@@ -112,7 +112,7 @@ standalone Instance 不需要 `require("fre").setup()`，仍支持加载、窗�
 
 ## 编辑文件系统
 
-Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末尾的可编辑路径。首次显示、进入父目录和 `reveal()` 会把光标放在路径起点；之后普通、可视和插入模式可以进入 permissions、size、mtime 及可导航的自定义元数据，但不能进入隐藏身份或行首 icon。新增未标记行仍可从第 0 列编辑。快速创建会立即插入带有当前 visible columns、目标 icon 和 metadata 占位值的草稿，把光标放到预填目录前缀末尾并进入 insert mode，等待直接补全文件名；它仍只是未写入的 buffer 文本。元数据可以选择、yank 和暂时修改，但语义只读。
+Fre 行包含真实的元数据列、隐藏的稳定身份标记和固定在末尾的可编辑路径。首次显示、进入父目录和 `reveal()` 会把光标放在路径起点；之后普通、可视和插入模式可以进入 permissions、size、mtime 及可导航的自定义元数据，但不能进入隐藏身份或行首 icon。新增未标记行仍可从第 0 列编辑。快速创建会立即插入带有当前 visible columns、file icon 和 metadata 占位值的草稿，把光标放到预填目录前缀末尾并进入 insert mode，等待直接补全文件名；最终 path 仍可用尾 `/` 表示目录，写入成功后 icon 与其他 columns 会按 filesystem truth 重投影。元数据可以选择、yank 和暂时修改，但语义只读。
 
 | 目标 | Buffer 操作 |
 | --- | --- |
