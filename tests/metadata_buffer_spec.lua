@@ -482,7 +482,7 @@ describe("fre metadata buffer rows", function()
     end
   end)
 
-  it("renders hierarchical path segments and neutral hidden entries", function()
+  it("renders hierarchical paths and distinguishes hidden files from directories", function()
     local instance = ready({
       [".env"] = "x",
       [".cache/inside.txt"] = "x",
@@ -493,6 +493,10 @@ describe("fre metadata buffer rows", function()
       expanded = { ".cache", "src", "src/components", "src/components/ui" },
     })
     instance:open({ position = "current" })
+    local hidden_file_hl = vim.api.nvim_get_hl(0, { name = "FreHiddenFile" })
+    local hidden_directory_hl = vim.api.nvim_get_hl(0, { name = "FreHiddenDirectory" })
+    assert.are.equal("Comment", hidden_file_hl.link)
+    assert.are.equal("Directory", hidden_directory_hl.link)
 
     local path_groups = {
       FreDirectoryPath = true, FreHiddenPath = true, FreDirectoryPrefix = true,
